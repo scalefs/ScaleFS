@@ -1,5 +1,5 @@
 # ScaleFS&trade;
-ScaleFS is an open-source file system framework and volume manager.
+ScaleFS is an open-source file system and volume manager.
 
 # Overview
 ScaleFS is designed to provide reliable and dynamically-resizable data storage.
