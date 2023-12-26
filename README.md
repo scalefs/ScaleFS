@@ -1,7 +1,7 @@
 # ScaleFS&trade;
 ScaleFS is an open-source file system framework and volume manager.
 
-# Goal
+# Overview
 ScaleFS is designed to provide reliable and dynamically-resizable data storage.
 
 A ScaleFS deployment is essentially a configurable file system.  A principal goal is to allow live migrations to revised file system configurations.
@@ -22,7 +22,7 @@ A ScaleFS deployment is essentially a configurable file system.  A principal goa
 - Support for shielded magnetic recording (SMR) hard disks
 - Initial file system driver and management applications run on Windows
 
-# Usage overview
+# Usage
 - Configuration options for multiple-disk pools
   - Choose the number of failover disks (0 to n-1)
   - Optimize for storage space or performance (or choose an in-between balance)
@@ -32,6 +32,7 @@ A ScaleFS deployment is essentially a configurable file system.  A principal goa
 - Disks can be removed from the pool at any time (either reducing the capacity of the pool or its number of failover disks)
 - If a disk fails, a user can replace the disk (or choose to reduce the capacity of the disk pool or its number of failover disks)
 - Support for dedicated caches and dedicated metadata volumes is planned for the future
+- Configure volumes and disk pools using the ScaleFS Manager (GUI) or the scalefs command-line tool
 
 # Legal notice
 ScaleFS is a trademark of ScaleFS LLC, the organization that maintains the ScaleFS open source project.
