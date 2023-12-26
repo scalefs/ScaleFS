@@ -32,7 +32,7 @@ A ScaleFS deployment is essentially a configurable file system.  A principal goa
 - Additional disks can be added to increase pool capacity
 - Smaller-capacity disks can be replaced with larger-capacity disks to increase pool capacity
 - Disks can be removed from the pool at any time (either reducing the capacity of the pool or its number of failover disks)
-- If a disk fails, a user can replace the disk (or choose to reduce the capacity of the disk pool or its number of failover disks)
+- If a disk fails, a user can replace the disk (or choose to reduce the capacity of the disk pool or the maximum number of disks that can fail)
 - Support for dedicated caches and dedicated metadata volumes is planned for the future
 
 # Legal notice
