@@ -15,18 +15,18 @@ A ScaleFS deployment is essentially a configurable file system.  A principal goa
 - Optional real-time parity checks on every read
 - Dynamically add, remove and replace physical disks
 - Increase or decrease the capacity of a disk pool at any time
-- Increase or decrease the number of redundant disks at any time
+- Increase or decrease the maximum number of disks that can fail at any time
 - Both single-disk and multiple-disk pool deployments are supported (and live migration between the two)
 - Use internal drives or external single- and multi-drive stations
 - Disk pools can be moved between computers
-- C-compatible libraries to enable the creation of additional data recovery tools
+- C-compatible libraries enable the creation of additional data recovery tools
 - Support for shielded magnetic recording (SMR) hard disks
 - Initial file system driver and management applications run on Windows
 
 # Usage
 - Configure volumes and disk pools using the ScaleFS Manager (GUI) or the scalefs command-line tool
 - Configuration options for multiple-disk pools
-  - Choose the number of redundant disks (0 to n-1)
+  - Choose the maximum number of disks that can fail (0 to n-1)
   - Optimize for storage space or performance (or choose an in-between balance)
   - Modify the configuration at any time
 - Additional disks can be added to increase pool capacity
