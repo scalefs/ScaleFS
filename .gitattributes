@@ -1,0 +1,4 @@
+# Shell scripts run on Linux hosts straight from checkouts and
+# archives; CRLF is a syntax error to bash. Everything else follows
+# the platform default.
+*.sh text eol=lf

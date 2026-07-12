@@ -1,0 +1,27 @@
+[package]
+name = "scalefs-daemon"
+description = "scalefsd — the ScaleFS management daemon: owns pools, mounts, and background jobs; serves the versioned IPC protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "scalefsd"
+path = "src/main.rs"
+
+[dependencies]
+scalefs-core = { path = "../scalefs-core" }
+scalefs-ipc = { path = "../scalefs-ipc" }
+scalefs-mount = { path = "../scalefs-mount" }
+
+[dev-dependencies]
+# The real-process chaos harness (tests/chaos.rs) drives SMB load through
+# the in-tree TCP client; dev-only, so nothing the daemon ships depends
+# on it. (Enabling the feature here also turns it on for the daemon's own
+# integration tests, which is fine — dev-only.)
+scalefs-mount = { path = "../scalefs-mount", features = ["testclient"] }
+
+[lints]
+workspace = true

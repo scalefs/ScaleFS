@@ -1,0 +1,11 @@
+[package]
+name = "scalefs-core"
+description = "Portable ScaleFS storage engine: on-disk format, block devices, checksums, and the copy-on-write pool engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

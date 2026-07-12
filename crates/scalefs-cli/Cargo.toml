@@ -1,0 +1,23 @@
+[package]
+name = "scalefs-cli"
+description = "scalefs — the cross-platform ScaleFS command-line tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "scalefs"
+path = "src/main.rs"
+
+[dependencies]
+scalefs-core = { path = "../scalefs-core" }
+scalefs-ipc = { path = "../scalefs-ipc" }
+
+[dev-dependencies]
+# The daemon-command tests run an in-process scalefsd.
+scalefs-daemon = { path = "../scalefs-daemon" }
+
+[lints]
+workspace = true

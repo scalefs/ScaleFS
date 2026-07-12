@@ -1,0 +1,24 @@
+[package]
+name = "scalefs-mount"
+description = "OS mount front ends for ScaleFS (Linux FUSE, SMB3 loopback, macOS FSKit bridge, Windows kernel bridge)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+scalefs-core = { path = "../scalefs-core" }
+# The audited crypto for the network-facing SMB speaker (AES-CMAC
+# signing, SHA-2, HMAC); see docs/dependency-policy.md. `prebuilt-nasm`
+# supplies the x86-64 assembly objects so the build needs no NASM.
+aws-lc-rs = { version = "1.17.1", features = ["prebuilt-nasm"] }
+
+[features]
+# Exposes the in-tree SMB client (`smb::testclient`) to dependents' test
+# code — the daemon's real-process chaos harness drives load through it.
+# Dev/test only: a normal build (and the shipped daemon) never enables it.
+testclient = []
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "scalefs-ffi"
+description = "C-compatible ABI for ScaleFS recovery and management tooling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+scalefs-core = { path = "../scalefs-core" }
+# The strict in-tree JSON (scalefs-ipc is dependency-free); structured
+# ABI results are JSON strings.
+scalefs-ipc = { path = "../scalefs-ipc" }
+
+# This crate hosts the C ABI boundary, so exported symbols require the
+# `unsafe` attribute forms that the workspace otherwise denies.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

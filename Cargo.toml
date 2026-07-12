@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/scalefs-core",
+    "crates/scalefs-ipc",
+    "crates/scalefs-mount",
+    "crates/scalefs-daemon",
+    "crates/scalefs-cli",
+    "crates/scalefs-ffi",
+]
+
+[workspace.package]
+version = "1.0.0-preview.1"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scalefs/scalefs"
+
+[workspace.lints.rust]
+# `deny` (not `forbid`) so the narrowly-scoped hardware-checksum and FFI
+# modules can opt in with an explicit, commented `#[allow(unsafe_code)]`.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
