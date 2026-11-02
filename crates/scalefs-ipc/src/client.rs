@@ -1,5 +1,4 @@
-
-use crate::endpoint::{Endpoint, Stream, connect};
+use crate::endpoint::{Endpoint, Stream, connect, connect_limited};
 use crate::frame::{read_frame, write_frame};
 use crate::json::Value;
 use crate::proto::{Request, Response, check_daemon_hello, client_hello};
@@ -29,7 +28,15 @@ pub struct Client {
 
 impl Client {
     pub fn connect(endpoint: &Endpoint, timeout: Duration) -> Result<Client, String> {
-        let stream = connect(endpoint, timeout).map_err(|error| {
+        Client::over(endpoint, connect(endpoint, timeout))
+    }
+
+    pub fn connect_limited(endpoint: &Endpoint, timeout: Duration) -> Result<Client, String> {
+        Client::over(endpoint, connect_limited(endpoint, timeout))
+    }
+
+    fn over(endpoint: &Endpoint, stream: std::io::Result<Stream>) -> Result<Client, String> {
+        let stream = stream.map_err(|error| {
             format!("cannot reach the daemon at {}: {error}", endpoint.as_str())
         })?;
         match stream.server_is_trusted() {

@@ -1,4 +1,3 @@
-
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -31,6 +30,10 @@ pub trait BlockDevice {
     fn actuator_ranges(&self) -> Vec<std::ops::Range<u64>> {
         Vec::new()
     }
+
+    fn sector_size(&self) -> u32 {
+        512
+    }
 }
 
 impl<D: BlockDevice + ?Sized> BlockDevice for &D {
@@ -53,6 +56,10 @@ impl<D: BlockDevice + ?Sized> BlockDevice for &D {
     fn actuator_ranges(&self) -> Vec<std::ops::Range<u64>> {
         (**self).actuator_ranges()
     }
+
+    fn sector_size(&self) -> u32 {
+        (**self).sector_size()
+    }
 }
 
 impl<D: BlockDevice + ?Sized> BlockDevice for &mut D {
@@ -74,6 +81,10 @@ impl<D: BlockDevice + ?Sized> BlockDevice for &mut D {
 
     fn actuator_ranges(&self) -> Vec<std::ops::Range<u64>> {
         (**self).actuator_ranges()
+    }
+
+    fn sector_size(&self) -> u32 {
+        (**self).sector_size()
     }
 }
 
@@ -101,6 +112,10 @@ impl<D: BlockDevice> BlockDevice for Arc<D> {
 
     fn actuator_ranges(&self) -> Vec<std::ops::Range<u64>> {
         (**self).actuator_ranges()
+    }
+
+    fn sector_size(&self) -> u32 {
+        (**self).sector_size()
     }
 }
 
@@ -136,7 +151,90 @@ impl<D: BlockDevice> BlockDevice for ReadOnly<D> {
     fn actuator_ranges(&self) -> Vec<std::ops::Range<u64>> {
         self.0.actuator_ranges()
     }
+
+    fn sector_size(&self) -> u32 {
+        self.0.sector_size()
+    }
 }
+
+#[derive(Debug, Clone)]
+pub struct PartitionView<D> {
+    inner: D,
+    start: u64,
+    len: u64,
+}
+
+impl<D: BlockDevice> PartitionView<D> {
+    pub fn new(inner: D, start: u64, len: u64) -> Result<Self> {
+        let end = start
+            .checked_add(len)
+            .ok_or(ScaleFsError::Corrupt("partition overflows the device"))?;
+        if end > inner.len() {
+            return Err(ScaleFsError::Corrupt(
+                "partition reaches past the device end",
+            ));
+        }
+        Ok(Self { inner, start, len })
+    }
+
+    pub fn into_inner(self) -> D {
+        self.inner
+    }
+
+    pub fn inner(&self) -> &D {
+        &self.inner
+    }
+
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+}
+
+impl<D: BlockDevice> BlockDevice for PartitionView<D> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        check_bounds(offset, buf.len(), self.len)?;
+        self.inner.read_at(self.start + offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        check_bounds(offset, data.len(), self.len)?;
+        self.inner.write_at(self.start + offset, data)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
+    }
+
+    fn flush_group(devices: &[&Self]) -> Result<()> {
+        let inner: Vec<&D> = devices.iter().map(|view| &view.inner).collect();
+        D::flush_group(&inner)
+    }
+
+    fn actuator_ranges(&self) -> Vec<std::ops::Range<u64>> {
+        self.inner
+            .actuator_ranges()
+            .into_iter()
+            .filter_map(|range| {
+                let start = range.start.max(self.start) - self.start;
+                let end = range
+                    .end
+                    .min(self.start + self.len)
+                    .saturating_sub(self.start);
+                (start < end).then_some(start..end)
+            })
+            .collect()
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+}
+
+impl<D: SharedDevice> SharedDevice for PartitionView<D> {}
 
 pub(crate) fn check_bounds(offset: u64, len: usize, device_len: u64) -> Result<()> {
     let len = len as u64;

@@ -1,4 +1,3 @@
-
 use super::fileops::{
     self, CloseRequest, CreateRequest, FileId, FileMeta, QueryDirectoryRequest, QueryInfoRequest,
     ReadRequest, RenameInfo, SetInfoRequest, WriteRequest, action, attr, disposition, file_class,
@@ -15,8 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const STORED_ATTR_MASK: u32 =
-    attr::READONLY | 0x0000_0002  | 0x0000_0004  | attr::ARCHIVE;
+const STORED_ATTR_MASK: u32 = attr::READONLY | 0x0000_0002 | 0x0000_0004 | attr::ARCHIVE;
 
 #[derive(Debug, Clone)]
 pub struct ShareConfig {
@@ -59,6 +57,9 @@ pub struct SmbShare<D: SharedDevice> {
     files: Mutex<BTreeMap<FileId, Arc<OpenFile>>>,
     next_file: AtomicU64,
     last_create: Mutex<Option<FileId>>,
+    trees: Mutex<BTreeMap<u32, u8>>,
+    setup_attempts: AtomicU32,
+    connection_throttle: ntlm::AuthThrottle,
 }
 
 const SESSION_ID: u64 = 0x4653_0000_0000_0001;
@@ -81,6 +82,9 @@ impl<D: SharedDevice> SmbShare<D> {
             files: Mutex::new(BTreeMap::new()),
             next_file: AtomicU64::new(0),
             last_create: Mutex::new(None),
+            trees: Mutex::new(BTreeMap::new()),
+            setup_attempts: AtomicU32::new(0),
+            connection_throttle: ntlm::AuthThrottle::default(),
         }
     }
 
@@ -91,7 +95,6 @@ impl<D: SharedDevice> SmbShare<D> {
     fn file(&self, id: FileId) -> Option<Arc<OpenFile>> {
         self.files().get(&id).cloned()
     }
-
 
     fn negotiate(&self) -> Response {
         let security_buffer = spnego::negotiate_security_buffer();
@@ -107,7 +110,7 @@ impl<D: SharedDevice> SmbShare<D> {
     }
 
     fn session_setup(&self, body: &[u8]) -> Response {
-        if !self.config.throttle.gate() {
+        if !self.connection_throttle.gate() || !self.config.throttle.gate() {
             return Response::error(status::LOGON_FAILURE);
         }
         let Some(token) = security_buffer_of(body) else {
@@ -119,7 +122,16 @@ impl<D: SharedDevice> SmbShare<D> {
         let exchange = self.ntlm.lock().expect("ntlm exchange").take();
         match exchange {
             None => {
-                let server = ntlm::Server::new(self.nonces.challenge, &self.config.target);
+                let challenge = if self.setup_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    self.nonces.challenge
+                } else {
+                    let mut fresh = [0u8; 8];
+                    if aws_lc_rs::rand::fill(&mut fresh).is_err() {
+                        return Response::error(status::LOGON_FAILURE);
+                    }
+                    fresh
+                };
+                let server = ntlm::Server::new(challenge, &self.config.target);
                 let challenge = server.challenge_message();
                 let wrapped = spnego::challenge_security_buffer(&challenge);
                 *self.ntlm.lock().expect("ntlm exchange") = Some(server);
@@ -130,6 +142,7 @@ impl<D: SharedDevice> SmbShare<D> {
             }
             Some(server) => match server.verify(&ntlmssp, &self.config.credential) {
                 Ok(authenticated) => {
+                    self.connection_throttle.record_success();
                     self.config.throttle.record_success();
                     let token = spnego::accept_complete_buffer();
                     let mut response = session_setup_body(&token);
@@ -138,6 +151,7 @@ impl<D: SharedDevice> SmbShare<D> {
                     response
                 }
                 Err(_) => {
+                    self.connection_throttle.record_failure();
                     self.config.throttle.record_failure();
                     Response::error(status::LOGON_FAILURE)
                 }
@@ -159,11 +173,51 @@ impl<D: SharedDevice> SmbShare<D> {
             return Response::error(status::BAD_NETWORK_NAME);
         };
         let tree_id = self.next_tree_id.fetch_add(1, Ordering::Relaxed);
+        self.trees
+            .lock()
+            .expect("tree table")
+            .insert(tree_id, share_type);
         let mut response = Response::ok(tree_connect_body(share_type));
         response.tree_id = Some(tree_id);
         response
     }
 
+    fn tree_disconnect(&self, tree_id: u32) -> Response {
+        match self.trees.lock().expect("tree table").remove(&tree_id) {
+            Some(_) => Response::ok(small_body(4)),
+            None => Response::error(status::NETWORK_NAME_DELETED),
+        }
+    }
+
+    fn logoff(&self) -> Response {
+        self.release_all();
+        self.trees.lock().expect("tree table").clear();
+        Response::ok(small_body(4))
+    }
+
+    fn tree_connected(&self, tree_id: u32) -> bool {
+        self.trees
+            .lock()
+            .expect("tree table")
+            .contains_key(&tree_id)
+    }
+
+    fn release_all(&self) {
+        let read_only = self.read_only();
+        let files = std::mem::take(&mut *self.files());
+        for file in files.values() {
+            if !read_only
+                && file.delete_on_close.load(Ordering::SeqCst)
+                && let Ok(naming) = file.naming.lock()
+                && !naming.name.is_empty()
+            {
+                let _ =
+                    self.core
+                        .unlink_handle(naming.parent, &naming.name, file.inode, file.is_dir);
+            }
+            self.core.release(file.inode);
+        }
+    }
 
     fn allocate_file_id(&self) -> FileId {
         let n = (self.next_file.fetch_add(1, Ordering::Relaxed) + 1).to_le_bytes();
@@ -687,9 +741,21 @@ impl<D: SharedDevice> Handler for SmbShare<D> {
             command::NEGOTIATE => self.negotiate(),
             command::SESSION_SETUP => self.session_setup(body),
             command::TREE_CONNECT => self.tree_connect(body),
-            command::TREE_DISCONNECT => Response::ok(small_body(4)),
-            command::LOGOFF => Response::ok(small_body(4)),
+            command::TREE_DISCONNECT => self.tree_disconnect(header.tree_id),
+            command::LOGOFF => self.logoff(),
             command::ECHO => Response::ok(small_body(4)),
+            command::CREATE
+            | command::CLOSE
+            | command::READ
+            | command::WRITE
+            | command::FLUSH
+            | command::QUERY_DIRECTORY
+            | command::QUERY_INFO
+            | command::SET_INFO
+                if !self.tree_connected(header.tree_id) =>
+            {
+                Response::error(status::NETWORK_NAME_DELETED)
+            }
             command::CREATE => self.create(body),
             command::CLOSE => self.close(body),
             command::READ => self.read(body),
@@ -705,19 +771,7 @@ impl<D: SharedDevice> Handler for SmbShare<D> {
 
 impl<D: SharedDevice> Drop for SmbShare<D> {
     fn drop(&mut self) {
-        let read_only = self.read_only();
-        for file in self.files.get_mut().expect("smb handle table").values() {
-            if !read_only
-                && file.delete_on_close.load(Ordering::SeqCst)
-                && let Ok(naming) = file.naming.lock()
-                && !naming.name.is_empty()
-            {
-                let _ =
-                    self.core
-                        .unlink_handle(naming.parent, &naming.name, file.inode, file.is_dir);
-            }
-            self.core.release(file.inode);
-        }
+        self.release_all();
     }
 }
 
@@ -740,19 +794,60 @@ fn nt_status(error: MountError) -> u32 {
 }
 
 fn glob_matches(pattern: &str, name: &str) -> bool {
-    fn inner(pattern: &[char], name: &[char]) -> bool {
-        match pattern.split_first() {
-            None => name.is_empty(),
-            Some(('*', rest)) => (0..=name.len()).any(|skip| inner(rest, &name[skip..])),
-            Some(('?', rest)) => !name.is_empty() && inner(rest, &name[1..]),
-            Some((c, rest)) => name
-                .split_first()
-                .is_some_and(|(n, name_rest)| n.eq_ignore_ascii_case(c) && inner(rest, name_rest)),
-        }
-    }
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
-    inner(&pattern, &name)
+    let mut memo = vec![None; (pattern.len() + 1) * (name.len() + 1)];
+    dos_match(&pattern, &name, 0, 0, &mut memo)
+}
+
+fn null_match(pattern: &[char]) -> bool {
+    pattern.iter().all(|c| matches!(c, '*' | '<' | '"' | '>'))
+}
+
+fn dos_match(p: &[char], n: &[char], pi: usize, ni: usize, memo: &mut [Option<bool>]) -> bool {
+    let key = pi * (n.len() + 1) + ni;
+    if let Some(known) = memo[key] {
+        return known;
+    }
+    let rest = pi + 1;
+    let result = match p.get(pi) {
+        None => ni == n.len(),
+        Some('*') => (ni..=n.len()).any(|k| dos_match(p, n, rest, k, memo)),
+        Some('?') => ni < n.len() && dos_match(p, n, rest, ni + 1, memo),
+        Some('<') => {
+            let mut k = ni;
+            loop {
+                if dos_match(p, n, rest, k, memo) {
+                    break true;
+                }
+                match n.get(k) {
+                    None => break false,
+                    Some('.') if !n[k + 1..].contains(&'.') => {
+                        break dos_match(p, n, rest, k + 1, memo);
+                    }
+                    Some(_) => k += 1,
+                }
+            }
+        }
+        Some('>') => match n.get(ni) {
+            None => null_match(&p[rest..]),
+            Some('.') => {
+                (ni + 1 == n.len() && null_match(&p[rest..])) || dos_match(p, n, rest, ni, memo)
+            }
+            Some(_) => dos_match(p, n, rest, ni + 1, memo),
+        },
+        Some('"') => match n.get(ni) {
+            None => null_match(&p[rest..]),
+            Some('.') => dos_match(p, n, rest, ni + 1, memo),
+            Some(_) => false,
+        },
+        Some(c) => {
+            n.get(ni).is_some_and(|nc| nc.eq_ignore_ascii_case(c))
+                && dos_match(p, n, rest, ni + 1, memo)
+        }
+    };
+    memo[key] = Some(result);
+    result
 }
 
 fn security_buffer_of(body: &[u8]) -> Option<&[u8]> {
@@ -853,7 +948,9 @@ mod tests {
             sequential_write_required: false,
         };
         let mut pool = Pool::create(
-            Arc::new(MemoryBlockDevice::new(geometry.capacity_bytes() as usize)),
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                geometry.capacity_bytes(),
+            ) as usize)),
             CreateParams {
                 geometry,
                 pool_id: PoolId([0x77; 16]),
@@ -874,6 +971,94 @@ mod tests {
         SmbShare::new(config(), nonces(), test_core())
     }
 
+    #[test]
+    fn glob_understands_the_dos_metacharacters() {
+        assert!(glob_matches("<\"bin", "payload.bin"));
+        assert!(glob_matches("<\"BIN", "payload.bin"));
+        assert!(!glob_matches("<\"bin", "payload.binx"));
+        assert!(!glob_matches("<\"bin", "bin"));
+        assert!(glob_matches("<\"*", "payload.bin"));
+        assert!(glob_matches("<\"*", "noext"));
+        assert!(glob_matches("<\"*", "two.dots.here"));
+        assert!(glob_matches("<\"", "noext"));
+        assert!(!glob_matches("<\"", "payload.bin"));
+        assert!(glob_matches("h<\"txt", "hello.txt"));
+        assert!(!glob_matches("h<\"txt", "jello.txt"));
+        assert!(glob_matches(">ello.txt", "hello.txt"));
+        assert!(!glob_matches(">ello.txt", "ello.txt"));
+        assert!(glob_matches("hello>.txt", "hello.txt"));
+        assert!(glob_matches("hello.txt>", "hello.txt"));
+        assert!(glob_matches("hello.txt>>", "hello.txt"));
+        assert!(glob_matches("<", "noext"));
+        assert!(!glob_matches("<", "a.b.c"));
+        assert!(glob_matches("<\"c", "a.b.c"));
+        assert!(!glob_matches("<\"b", "a.b.c"));
+    }
+
+    #[test]
+    fn glob_is_correct_and_never_exponential() {
+        fn oracle(pattern: &[char], name: &[char]) -> bool {
+            match pattern.split_first() {
+                None => name.is_empty(),
+                Some(('*', rest)) => (0..=name.len()).any(|skip| oracle(rest, &name[skip..])),
+                Some(('?', rest)) => !name.is_empty() && oracle(rest, &name[1..]),
+                Some((c, rest)) => name
+                    .split_first()
+                    .is_some_and(|(n, tail)| n.eq_ignore_ascii_case(c) && oracle(rest, tail)),
+            }
+        }
+        let patterns = [
+            "*",
+            "*.txt",
+            "a*",
+            "*a",
+            "a?c",
+            "??",
+            "",
+            "a*b*c",
+            "*b",
+            "A*.TXT",
+            "**x",
+            "x**",
+            "*?*",
+            "report (?).pdf",
+        ];
+        let names = [
+            "",
+            "a",
+            "abc",
+            "a.txt",
+            "A.TXT",
+            "ab",
+            "aXbYc",
+            "bbb",
+            "x",
+            "xx",
+            "report (1).pdf",
+            "report (12).pdf",
+        ];
+        for pattern in patterns {
+            for name in names {
+                let p: Vec<char> = pattern.chars().collect();
+                let n: Vec<char> = name.chars().collect();
+                assert_eq!(
+                    glob_matches(pattern, name),
+                    oracle(&p, &n),
+                    "{pattern:?} vs {name:?}"
+                );
+            }
+        }
+        let started = std::time::Instant::now();
+        assert!(!glob_matches(
+            "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b",
+            &"a".repeat(255)
+        ));
+        assert!(glob_matches(
+            "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*",
+            &"a".repeat(255)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     fn create_request(path: &str, disposition: u32, options: u32) -> Vec<u8> {
         let name = wire::to_utf16le(path);
@@ -1345,7 +1530,9 @@ mod tests {
             sequential_write_required: false,
         };
         let mut pool = Pool::create(
-            Arc::new(MemoryBlockDevice::new(geometry.capacity_bytes() as usize)),
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                geometry.capacity_bytes(),
+            ) as usize)),
             CreateParams {
                 geometry,
                 pool_id: PoolId([0x79; 16]),

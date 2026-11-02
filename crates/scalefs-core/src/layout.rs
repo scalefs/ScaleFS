@@ -1,4 +1,3 @@
-
 use crate::error::{Result, ScaleFsError};
 use crate::wire::{Cursor, put_u16, put_u32, put_u64};
 
@@ -76,6 +75,11 @@ impl Geometry {
         if self.zone_size.checked_mul(self.zone_count).is_none() {
             return Err(ScaleFsError::Corrupt("device capacity overflows"));
         }
+        if zone_summary_len(self.zone_count) > self.zone_size {
+            return Err(ScaleFsError::Corrupt(
+                "zone count too large for the zone size: the zone summary must fit in one zone",
+            ));
+        }
         Ok(self)
     }
 
@@ -86,6 +90,13 @@ impl Geometry {
 
 pub fn superblock_slots(device_len: u64) -> [u64; 2] {
     [0, device_len.saturating_sub(4096) & !4095]
+}
+
+pub const ZONE_SUMMARY_ENTRY_LEN: u64 = 14;
+
+pub fn zone_summary_len(zone_count: u64) -> u64 {
+    (crate::format::RECORD_HEADER_LEN as u64 + 8)
+        .saturating_add(ZONE_SUMMARY_ENTRY_LEN.saturating_mul(zone_count))
 }
 
 pub(crate) fn encode_geometry(out: &mut Vec<u8>, geometry: Geometry) {
@@ -206,6 +217,13 @@ mod tests {
         g.zone_size = u64::MAX / 2;
         g.zone_count = 4;
         assert!(g.validate().is_err());
+
+        let mut g = valid_geometry();
+        g.zone_size = 65536;
+        g.zone_count = 5000;
+        assert!(g.validate().is_err());
+        g.zone_count = 4000;
+        assert!(g.validate().is_ok());
     }
 
     #[test]

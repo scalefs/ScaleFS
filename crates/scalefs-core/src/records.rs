@@ -1,11 +1,11 @@
-
 use crate::error::{Result, ScaleFsError};
 use crate::format::{DecodedRecord, RecordKind, decode_record, encode_record};
 use crate::layout::{
     CaseSensitivity, DeviceId, Extent, Geometry, PoolId, decode_extent, decode_geometry,
     encode_extent, encode_geometry,
 };
-use crate::wire::{Cursor, put_i64, put_u16, put_u64};
+use crate::unicode::UnicodeVersion;
+use crate::wire::{Cursor, put_i64, put_u16, put_u32, put_u64};
 
 pub const MAX_LABEL_LEN: usize = 256;
 
@@ -17,7 +17,9 @@ pub const FEATURE_RO_COMPAT_KNOWN: u64 =
     FEATURE_RO_COMPAT_SPECIAL_FILES | FEATURE_RO_COMPAT_HARDLINKS | FEATURE_RO_COMPAT_XATTRS;
 pub const FEATURE_INCOMPAT_MULTI_DEVICE: u64 = 1 << 0;
 pub const FEATURE_INCOMPAT_PARITY: u64 = 1 << 1;
-pub const FEATURE_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_MULTI_DEVICE | FEATURE_INCOMPAT_PARITY;
+pub const FEATURE_INCOMPAT_THIN_METADATA: u64 = 1 << 2;
+pub const FEATURE_INCOMPAT_KNOWN: u64 =
+    FEATURE_INCOMPAT_MULTI_DEVICE | FEATURE_INCOMPAT_PARITY | FEATURE_INCOMPAT_THIN_METADATA;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {
@@ -30,6 +32,7 @@ pub struct Superblock {
     pub feature_incompat: u64,
     pub geometry: Geometry,
     pub case_sensitivity: CaseSensitivity,
+    pub unicode_version: UnicodeVersion,
     pub dirent_hash_seed: u64,
     pub newest_commit: Option<Extent>,
     pub aux_record: Option<Extent>,
@@ -43,6 +46,17 @@ impl Superblock {
 
     pub fn unknown_incompat(&self) -> u64 {
         self.feature_incompat & !FEATURE_INCOMPAT_KNOWN
+    }
+
+    pub fn require_supported_unicode_version(&self) -> Result<()> {
+        if crate::unicode::is_supported(self.unicode_version) {
+            Ok(())
+        } else {
+            Err(ScaleFsError::UnsupportedUnicodeVersion {
+                pool: self.unicode_version,
+                newest: crate::unicode::NEWEST_SUPPORTED_UNICODE_VERSION,
+            })
+        }
     }
 }
 
@@ -62,6 +76,7 @@ pub fn encode_superblock(superblock: &Superblock) -> Result<Vec<u8>> {
     put_u64(&mut payload, superblock.feature_incompat);
     encode_geometry(&mut payload, superblock.geometry);
     payload.push(superblock.case_sensitivity.to_u8());
+    put_u32(&mut payload, superblock.unicode_version.to_u32());
     put_u64(&mut payload, superblock.dirent_hash_seed);
     match superblock.newest_commit {
         None => payload.push(0),
@@ -104,6 +119,7 @@ pub fn decode_superblock(bytes: &[u8]) -> Result<Superblock> {
     let feature_incompat = cursor.take_u64()?;
     let geometry = decode_geometry(&mut cursor)?;
     let case_sensitivity = CaseSensitivity::from_u8(cursor.take_u8()?)?;
+    let unicode_version = UnicodeVersion::from_u32(cursor.take_u32()?);
     let dirent_hash_seed = cursor.take_u64()?;
     let newest_commit = match cursor.take_u8()? {
         0 => None,
@@ -139,6 +155,7 @@ pub fn decode_superblock(bytes: &[u8]) -> Result<Superblock> {
         feature_incompat,
         geometry,
         case_sensitivity,
+        unicode_version,
         dirent_hash_seed,
         newest_commit,
         aux_record,
@@ -264,6 +281,7 @@ mod tests {
             feature_incompat: 0,
             geometry: fixture_geometry(),
             case_sensitivity: CaseSensitivity::InsensitivePreserving,
+            unicode_version: crate::unicode::V17_0_0,
             dirent_hash_seed: 0x5EED_CAFE_F00D_0001,
             newest_commit: Some(Extent {
                 device_index: 0,
@@ -438,7 +456,7 @@ mod tests {
         let encoded = encode_superblock(&fixture_superblock()).unwrap();
         assert_eq!(
             hex(&encoded),
-            "5363616c6546530001000000010000008a00000000000000a70fc5e200000000111111111111111111111111111111112222222222222222222222222222222200002a36fe9c9717070000000000000000000000000000000000000000000000000000000000000000100000001000000000000400000000000400000000000001000000010101000df0fecaed5e01000000000000000400000000001000000000000000040074616e6b"
+            "5363616c6546530001000000010000008e000000000000008ca8e6f700000000111111111111111111111111111111112222222222222222222222222222222200002a36fe9c971707000000000000000000000000000000000000000000000000000000000000000010000000100000000000040000000000040000000000000100000001010000110001000df0fecaed5e01000000000000000400000000001000000000000000040074616e6b"
         );
         assert_eq!(decode_superblock(&encoded).unwrap(), fixture_superblock());
     }
@@ -451,5 +469,37 @@ mod tests {
             "5363616c6546530001000000020000004100000000000000e39c8bf5000000000500000000000000040000000000000000002a36fe9c97170000000000100004000000000020000000000000000000000030000400000000001000000000000000"
         );
         assert_eq!(decode_commit(&encoded).unwrap(), fixture_commit());
+    }
+
+    #[test]
+    fn unicode_version_round_trips_any_value() {
+        let mut superblock = fixture_superblock();
+        superblock.unicode_version = UnicodeVersion::new(99, 0, 0);
+        let encoded = encode_superblock(&superblock).unwrap();
+        assert_eq!(decode_superblock(&encoded).unwrap(), superblock);
+    }
+
+    #[test]
+    fn refuses_unsupported_unicode_version_with_upgrade_message() {
+        fixture_superblock()
+            .require_supported_unicode_version()
+            .unwrap();
+
+        let mut superblock = fixture_superblock();
+        superblock.unicode_version = UnicodeVersion::new(99, 0, 0);
+        let err = superblock.require_supported_unicode_version().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleFsError::UnsupportedUnicodeVersion { pool, newest }
+                if pool == UnicodeVersion::new(99, 0, 0)
+                    && newest == crate::unicode::NEWEST_SUPPORTED_UNICODE_VERSION
+        ));
+        let message = err.to_string();
+        assert!(message.contains("99.0.0"), "{message}");
+        assert!(message.contains("17.0.0"), "{message}");
+        assert!(
+            message.contains("upgrade ScaleFS to mount this pool"),
+            "{message}"
+        );
     }
 }

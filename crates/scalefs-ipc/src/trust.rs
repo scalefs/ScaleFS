@@ -1,4 +1,3 @@
-
 use crate::endpoint::Stream;
 
 pub fn process_is_privileged() -> bool {

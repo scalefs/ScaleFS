@@ -1,11 +1,10 @@
-
-use crate::device::BlockDevice;
+use crate::device::{BlockDevice, PartitionView};
 use crate::error::{Result, ScaleFsError};
 use crate::format::{RecordKind, decode_record};
 use crate::layout::{CaseSensitivity, DeviceId, Extent, Geometry, PoolId, superblock_slots};
 use crate::records::{
-    Commit, FEATURE_INCOMPAT_MULTI_DEVICE, FEATURE_INCOMPAT_PARITY, Superblock, decode_commit,
-    decode_superblock, encode_commit, encode_superblock,
+    Commit, FEATURE_INCOMPAT_MULTI_DEVICE, FEATURE_INCOMPAT_PARITY, FEATURE_INCOMPAT_THIN_METADATA,
+    Superblock, decode_commit, decode_superblock, encode_commit, encode_superblock,
 };
 use crate::stripes::{ParityRecord, decode_parity_record, parity_record_len};
 use crate::topology::{MemberState, Topology, TopologyMember, decode_topology, encode_topology};
@@ -120,7 +119,7 @@ type ImportCandidate<D> = (D, Superblock, Option<(Commit, Topology)>);
 
 #[derive(Debug)]
 pub struct Pool<D: BlockDevice> {
-    pub(crate) devices: Vec<D>,
+    pub(crate) devices: Vec<PartitionView<D>>,
     pub(crate) superblocks: Vec<Superblock>,
     pub(crate) allocators: Vec<ZoneAllocator>,
     pub(crate) member_slots: Vec<Option<usize>>,
@@ -130,6 +129,9 @@ pub struct Pool<D: BlockDevice> {
     pub(crate) absent_chains: Vec<Option<TopologyMember>>,
     pub(crate) evacuating: Option<u16>,
     pub(crate) wounded: bool,
+    pub(crate) degrade_commit: bool,
+    pub(crate) live_degrade: Option<LiveDegrade>,
+    pub(crate) thin_metadata_published: bool,
     pub(crate) orphaned: Vec<DeviceId>,
     pub(crate) multi: Option<MultiState>,
     pub(crate) tree: MetadataTree,
@@ -238,11 +240,7 @@ impl<D: BlockDevice> Pool<D> {
         let mut allocators = Vec::with_capacity(members.len());
         for member in members {
             let geometry = member.geometry.validate()?;
-            if member.device.len() < geometry.capacity_bytes() {
-                return Err(ScaleFsError::InvalidArgument(
-                    "device is smaller than the requested geometry",
-                ));
-            }
+            check_member_fits(&member.device, geometry)?;
             let superblock = Superblock {
                 pool_id: params.pool_id,
                 device_id: member.device_id,
@@ -257,6 +255,7 @@ impl<D: BlockDevice> Pool<D> {
                 },
                 geometry,
                 case_sensitivity: params.case_sensitivity,
+                unicode_version: crate::unicode::NEWEST_SUPPORTED_UNICODE_VERSION,
                 dirent_hash_seed: params.dirent_hash_seed,
                 newest_commit: None,
                 aux_record: None,
@@ -265,9 +264,11 @@ impl<D: BlockDevice> Pool<D> {
             encode_superblock(&superblock)?;
             allocators.push(ZoneAllocator::new(geometry)?);
             superblocks.push(superblock);
-            let mut device = member.device;
-            blank_member_headers(&mut device)?;
-            devices.push(device);
+            devices.push(format_member_wrapper(
+                member.device,
+                params.pool_id,
+                member.device_id,
+            )?);
         }
 
         let mut tree = MetadataTree::new();
@@ -292,6 +293,7 @@ impl<D: BlockDevice> Pool<D> {
                 gid: 0,
                 nlink: 1,
                 attrs: 0,
+                bsd_flags: 0,
                 crtime_ns: params.created_at_ns,
                 mtime_ns: params.created_at_ns,
                 ctime_ns: params.created_at_ns,
@@ -317,6 +319,9 @@ impl<D: BlockDevice> Pool<D> {
             absent_chains,
             evacuating: None,
             wounded: false,
+            degrade_commit: false,
+            live_degrade: None,
+            thin_metadata_published: false,
             orphaned,
             multi: multi.then_some(MultiState {
                 generation: 1,
@@ -342,6 +347,10 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn open(device: D) -> Result<Self> {
+        Self::open_view(crate::gpt::member_view(device)?)
+    }
+
+    fn open_view(device: PartitionView<D>) -> Result<Self> {
         let mut candidates: Vec<(Superblock, Commit)> = Vec::new();
         let mut last_error = ScaleFsError::Corrupt("no valid superblock found");
 
@@ -355,6 +364,7 @@ impl<D: BlockDevice> Pool<D> {
                             "pool uses incompatible features unknown to this build",
                         ));
                     }
+                    superblock.require_supported_unicode_version()?;
                     if superblock.feature_incompat & FEATURE_INCOMPAT_MULTI_DEVICE != 0 {
                         return Err(ScaleFsError::Unsupported(
                             "pool spans multiple devices: supply every member to import it",
@@ -403,6 +413,9 @@ impl<D: BlockDevice> Pool<D> {
                         absent_chains: vec![None],
                         evacuating: None,
                         wounded: false,
+                        degrade_commit: false,
+                        live_degrade: None,
+                        thin_metadata_published: false,
                         orphaned: Vec::new(),
                         multi: None,
                         tree,
@@ -418,24 +431,28 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn open_multi(devices: Vec<D>) -> Result<Self> {
-        let mut pool = Self::open_multi_impl(devices, false)?;
+        let mut pool = Self::open_multi_impl(Self::member_views(devices)?, false)?;
         pool.apply_actuator_ranges();
         Ok(pool)
     }
 
     pub fn open_multi_degraded(devices: Vec<D>) -> Result<Self> {
-        let mut pool = Self::open_multi_impl(devices, true)?;
+        let mut pool = Self::open_multi_impl(Self::member_views(devices)?, true)?;
         pool.apply_actuator_ranges();
         Ok(pool)
     }
 
-    fn open_multi_impl(mut devices: Vec<D>, allow_degraded: bool) -> Result<Self> {
+    fn member_views(devices: Vec<D>) -> Result<Vec<PartitionView<D>>> {
+        devices.into_iter().map(crate::gpt::member_view).collect()
+    }
+
+    fn open_multi_impl(mut devices: Vec<PartitionView<D>>, allow_degraded: bool) -> Result<Self> {
         match devices.len() {
             0 => return Err(ScaleFsError::InvalidArgument("no devices supplied")),
             1 => {
                 let superblock = any_superblock(&devices[0])?;
                 if superblock.feature_incompat & FEATURE_INCOMPAT_MULTI_DEVICE == 0 {
-                    return Self::open(devices.pop().expect("length checked"));
+                    return Self::open_view(devices.pop().expect("length checked"));
                 }
             }
             _ => {}
@@ -449,6 +466,7 @@ impl<D: BlockDevice> Pool<D> {
                     "pool uses incompatible features unknown to this build",
                 ));
             }
+            superblock.require_supported_unicode_version()?;
             let chain = best_candidate(&device).ok().and_then(|(_, commit)| {
                 let aux = commit.aux_root?;
                 let bytes = read_extent_from_set(std::slice::from_ref(&device), aux).ok()?;
@@ -518,7 +536,7 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     fn assemble_view(
-        candidates: &[ImportCandidate<D>],
+        candidates: &[ImportCandidate<PartitionView<D>>],
         roster: &Topology,
         allow_degraded: bool,
     ) -> Result<Vec<Option<usize>>> {
@@ -583,11 +601,11 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     fn adopt_view(
-        candidates: Vec<ImportCandidate<D>>,
+        candidates: Vec<ImportCandidate<PartitionView<D>>>,
         roster: &Topology,
         plan: Vec<Option<usize>>,
     ) -> Result<Self> {
-        let mut taken: Vec<Option<(D, Superblock)>> = candidates
+        let mut taken: Vec<Option<(PartitionView<D>, Superblock)>> = candidates
             .into_iter()
             .map(|(device, superblock, _)| Some((device, superblock)))
             .collect();
@@ -662,7 +680,10 @@ impl<D: BlockDevice> Pool<D> {
                 (slot.is_none() && member.state == MemberState::Active).then_some(*member)
             })
             .collect();
-        Ok(Self {
+        let thin_metadata_published = superblocks
+            .iter()
+            .any(|superblock| superblock.feature_incompat & FEATURE_INCOMPAT_THIN_METADATA != 0);
+        let pool = Self {
             devices: ordered_devices,
             superblocks,
             allocators,
@@ -685,6 +706,9 @@ impl<D: BlockDevice> Pool<D> {
             absent_chains,
             evacuating: None,
             wounded: false,
+            degrade_commit: false,
+            live_degrade: None,
+            thin_metadata_published,
             orphaned,
             multi: Some(MultiState {
                 generation: roster.topology_generation,
@@ -703,7 +727,8 @@ impl<D: BlockDevice> Pool<D> {
             probe_staleness: PARTICIPATION_STALENESS,
             suspects: std::sync::Mutex::new(HashSet::new()),
             commit_in_flight: false,
-        })
+        };
+        Ok(pool)
     }
 
     pub fn orphaned_members(&self) -> &[DeviceId] {
@@ -753,7 +778,7 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     fn load(
-        device: &D,
+        device: &PartitionView<D>,
         superblock: &Superblock,
         commit: &Commit,
     ) -> Result<(ZoneAllocator, MetadataTree)> {
@@ -771,14 +796,127 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn commit(&mut self, purpose: AllocPurpose, created_at_ns: i64) -> Result<u64> {
-        let plan = self.plan_commit_impl(purpose, created_at_ns)?;
+        self.commit_impl(purpose, created_at_ns)
+            .map_err(|failure| failure.error)
+    }
+
+    fn commit_impl(
+        &mut self,
+        purpose: AllocPurpose,
+        created_at_ns: i64,
+    ) -> std::result::Result<u64, CommitFailure> {
+        let plan = self
+            .plan_commit_impl(purpose, created_at_ns)
+            .map_err(|error| CommitFailure {
+                error,
+                suspect: None,
+            })?;
         match execute_commit(&self.devices, &plan) {
             Ok(()) => Ok(self.publish_commit_impl(plan)),
             Err(failure) => {
                 self.abandon_commit_impl(plan, failure.suspect);
-                Err(failure.error)
+                Err(failure)
             }
         }
+    }
+
+    pub fn commit_or_degrade(
+        &mut self,
+        purpose: AllocPurpose,
+        created_at_ns: i64,
+    ) -> Result<CommitOutcome> {
+        match self.commit_impl(purpose, created_at_ns) {
+            Ok(tx_id) => Ok(CommitOutcome::Committed { tx_id }),
+            Err(failure) if self.wounded => self.recover_abandoned(failure, purpose, created_at_ns),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    fn recover_abandoned(
+        &mut self,
+        failure: CommitFailure,
+        purpose: AllocPurpose,
+        created_at_ns: i64,
+    ) -> Result<CommitOutcome> {
+        debug_assert!(self.wounded, "recovery runs on a wounded pool");
+        let Some(member) = failure.suspect else {
+            return Err(failure.error);
+        };
+        if !self.live_degrade_possible(member) {
+            return Err(failure.error);
+        }
+        self.wounded = false;
+        let retry = match self.commit_impl(purpose, created_at_ns) {
+            Ok(tx_id) => return Ok(CommitOutcome::Committed { tx_id }),
+            Err(retry) => retry,
+        };
+        if retry.suspect != Some(member) {
+            return Err(retry.error);
+        }
+        let device_id = self.member_ids[usize::from(member)];
+        self.detach_member_in_place(member);
+        self.degrade_commit = true;
+        self.wounded = false;
+        let outcome = self.commit_impl(purpose, created_at_ns);
+        self.degrade_commit = false;
+        match outcome {
+            Ok(tx_id) => {
+                self.read_only = true;
+                let degrade = LiveDegrade {
+                    member,
+                    device_id,
+                    tx_id,
+                };
+                self.live_degrade = Some(degrade.clone());
+                Ok(CommitOutcome::Degraded(degrade))
+            }
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    fn live_degrade_possible(&self, member: u16) -> bool {
+        let Some(state) = &self.multi else {
+            return false;
+        };
+        if self.read_only || self.member_slot(member).is_none() {
+            return false;
+        }
+        let tolerated = if state.parity_width > 0 {
+            usize::from(state.parity_width.min(state.mirror_width.saturating_sub(1)))
+        } else {
+            usize::from(state.mirror_width.saturating_sub(1))
+        };
+        self.missing_members().len() < tolerated
+    }
+
+    fn detach_member_in_place(&mut self, member: u16) {
+        let index = usize::from(member);
+        let position = self.member_slots[index]
+            .take()
+            .expect("only a present member can be detached in place");
+        drop(self.devices.remove(position));
+        self.superblocks.remove(position);
+        self.allocators.remove(position);
+        for slot in self.member_slots.iter_mut().flatten() {
+            if *slot > position {
+                *slot -= 1;
+            }
+        }
+        self.apply_actuator_ranges();
+        self.absent_chains[index] = Some(self.last_roster_members[index]);
+        self.dirty_members.remove(&member);
+        self.suspects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&member);
+        if self.evacuating == Some(member) {
+            self.evacuating = None;
+        }
+        self.force_full_commit = true;
+    }
+
+    pub fn live_degrade(&self) -> Option<&LiveDegrade> {
+        self.live_degrade.as_ref()
     }
 
     fn plan_commit_impl(
@@ -885,6 +1023,25 @@ impl<D: BlockDevice> Pool<D> {
             (RECORD_ENVELOPE_LEN + 32 + 100 * members_total + 20 * usize::from(mirror_width))
                 as u64;
 
+        let present = self.member_slots.iter().flatten().count() as u16;
+        let page_copies = if self.degrade_commit {
+            mirror_width.min(present).max(1)
+        } else {
+            mirror_width
+        };
+        let thin_metadata = page_copies < mirror_width;
+        let force_full = if thin_metadata != self.thin_metadata_published {
+            for superblock in &mut self.superblocks {
+                if thin_metadata {
+                    superblock.feature_incompat |= FEATURE_INCOMPAT_THIN_METADATA;
+                } else {
+                    superblock.feature_incompat &= !FEATURE_INCOMPAT_THIN_METADATA;
+                }
+            }
+            true
+        } else {
+            force_full
+        };
         let tree = &mut self.tree;
         let allocators = &mut self.allocators;
         let member_slots = &self.member_slots;
@@ -896,7 +1053,7 @@ impl<D: BlockDevice> Pool<D> {
                 ZoneClass::Metadata,
                 len,
                 purpose,
-                mirror_width,
+                page_copies,
                 &exclude,
             )?
             .into_iter()
@@ -1166,6 +1323,9 @@ impl<D: BlockDevice> Pool<D> {
 
         Ok(PlannedCommit {
             tx_id,
+            purpose,
+            created_at_ns,
+            thin_metadata,
             participating,
             stage_pages_and_summaries,
             stage_commit_records,
@@ -1183,6 +1343,7 @@ impl<D: BlockDevice> Pool<D> {
     fn publish_commit_impl(&mut self, plan: PlannedCommit) -> u64 {
         self.commit_in_flight = false;
         self.committed_tx = plan.tx_id;
+        self.thin_metadata_published = plan.thin_metadata;
         self.last_metadata_root = plan.root_replicas;
         if let Some(members) = plan.roster_members {
             self.last_roster_members = members;
@@ -1513,6 +1674,20 @@ impl<D: BlockDevice> Pool<D> {
         self.wounded
     }
 
+    pub fn ensure_mutable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(ScaleFsError::Unsupported(
+                "pool is read-only: mutations are not permitted",
+            ));
+        }
+        if self.wounded {
+            return Err(ScaleFsError::Unsupported(
+                "a commit failed while writing: reopen the pool before mutating again",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn tree(&self) -> &MetadataTree {
         &self.tree
     }
@@ -1778,11 +1953,7 @@ impl<D: BlockDevice> Pool<D> {
             ));
         }
         let geometry = spec.geometry.validate()?;
-        if spec.device.len() < geometry.capacity_bytes() {
-            return Err(ScaleFsError::InvalidArgument(
-                "device is smaller than the requested geometry",
-            ));
-        }
+        check_member_fits(&spec.device, geometry)?;
         if self
             .superblocks
             .iter()
@@ -1815,14 +1986,14 @@ impl<D: BlockDevice> Pool<D> {
             feature_incompat: template.feature_incompat | FEATURE_INCOMPAT_MULTI_DEVICE,
             geometry,
             case_sensitivity: template.case_sensitivity,
+            unicode_version: template.unicode_version,
             dirent_hash_seed: template.dirent_hash_seed,
             newest_commit: None,
             aux_record: None,
             label: template.label.clone(),
         };
         let bytes = encode_superblock(&superblock)?;
-        let mut device = spec.device;
-        blank_member_headers(&mut device)?;
+        let device = format_member_wrapper(spec.device, template.pool_id, spec.device_id)?;
         for offset in superblock_slots(device.len()) {
             write_padded(&device, offset, &bytes, SUPERBLOCK_PAD)?;
         }
@@ -2682,8 +2853,136 @@ impl<D: BlockDevice> Pool<D> {
             let len = ((device.len() - offset).min(4096)) as usize;
             device.write_at(offset, &zeros[..len])?;
         }
+        let device = device.into_inner();
+        for offset in (0..MEMBER_WRAPPER_BLANK.min(device.len())).step_by(4096) {
+            let len = ((device.len() - offset).min(4096)) as usize;
+            device.write_at(offset, &zeros[..len])?;
+        }
+        let tail = device.len().saturating_sub(MEMBER_WRAPPER_BLANK);
+        for offset in (tail..device.len()).step_by(4096) {
+            let len = ((device.len() - offset).min(4096)) as usize;
+            device.write_at(offset, &zeros[..len])?;
+        }
         device.flush()?;
         Ok(device)
+    }
+
+    pub fn retire_member(&mut self, member: u16, now_ns: i64) -> Result<RebuildReport> {
+        self.force_full_commit = true;
+        if usize::from(member) >= self.member_slots.len() {
+            return Err(ScaleFsError::InvalidArgument("no such member"));
+        }
+        if self.member_slot(member).is_some() {
+            return Err(ScaleFsError::InvalidArgument(
+                "only an absent member can be retired; remove present ones",
+            ));
+        }
+        if self.removed[usize::from(member)] {
+            return Err(ScaleFsError::InvalidArgument("member is already retired"));
+        }
+        if self.parity_width() > 0 {
+            return Err(ScaleFsError::Unsupported(
+                "parity pools cannot retire members yet; replace the missing member instead",
+            ));
+        }
+        let absent_active = self
+            .member_slots
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| slot.is_none() && !self.removed[*index])
+            .count();
+        if absent_active != 1 {
+            return Err(ScaleFsError::Unsupported(
+                "retire heals from surviving copies; every other member must be present",
+            ));
+        }
+        let present = self.member_slots.iter().flatten().count();
+        if present < usize::from(self.mirror_width()) || present == 0 {
+            return Err(ScaleFsError::InvalidArgument(
+                "too few members would remain for the pool's mirror width",
+            ));
+        }
+        if self
+            .superblocks
+            .iter()
+            .any(|superblock| superblock.unknown_ro_compat() != 0)
+        {
+            return Err(ScaleFsError::Unsupported(
+                "pool has unknown read-only-compatible features; \
+                 a newer scalefs is required to change its membership",
+            ));
+        }
+
+        let needed: u64 = self
+            .references_onto_member(member)?
+            .iter()
+            .map(|(_, extent)| extent.length)
+            .sum();
+        let free_elsewhere: u64 = self
+            .allocators
+            .iter()
+            .map(|allocator| allocator.free_usable_zone_count() * allocator.geometry().zone_size)
+            .sum();
+        if needed > free_elsewhere {
+            return Err(ScaleFsError::OutOfSpace);
+        }
+
+        let was_read_only = self.read_only;
+        self.read_only = false;
+        let mut report = match self.rebuild(now_ns) {
+            Ok(report) => report,
+            Err(err) => {
+                self.read_only = was_read_only;
+                return Err(err);
+            }
+        };
+
+        match self.references_onto_member(member) {
+            Ok(remaining) if remaining.is_empty() => {}
+            Ok(_) => {
+                self.read_only = was_read_only;
+                return Err(ScaleFsError::Corrupt(
+                    "records still reference the retiring member after the heal",
+                ));
+            }
+            Err(err) => {
+                self.read_only = was_read_only;
+                return Err(err);
+            }
+        }
+
+        self.force_full_commit = true;
+
+        let generation = self.multi.as_ref().map_or(1, |state| state.generation) + 1;
+        let previous_chain = self.absent_chains[usize::from(member)].take();
+        self.removed[usize::from(member)] = true;
+        for existing in &mut self.superblocks {
+            existing.topology_generation = generation;
+        }
+        if let Some(state) = &mut self.multi {
+            state.generation = generation;
+        }
+        if let Err(err) = self.commit(AllocPurpose::Normal, now_ns) {
+            self.removed[usize::from(member)] = false;
+            self.absent_chains[usize::from(member)] = previous_chain;
+            let old_generation = generation - 1;
+            for existing in &mut self.superblocks {
+                existing.topology_generation = old_generation;
+            }
+            if let Some(state) = &mut self.multi {
+                state.generation = old_generation;
+            }
+            self.read_only = was_read_only;
+            return Err(err);
+        }
+
+        self.read_only = self.is_degraded()
+            || self
+                .superblocks
+                .iter()
+                .any(|superblock| superblock.unknown_ro_compat() != 0);
+        report.tx_id = self.committed_tx;
+        Ok(report)
     }
 
     fn assert_member_clean(&self, member: u16) -> Result<()> {
@@ -2730,11 +3029,7 @@ impl<D: BlockDevice> Pool<D> {
             return Err(ScaleFsError::InvalidArgument("too many pool members"));
         }
         let geometry = spec.geometry.validate()?;
-        if spec.device.len() < geometry.capacity_bytes() {
-            return Err(ScaleFsError::InvalidArgument(
-                "device is smaller than the requested geometry",
-            ));
-        }
+        check_member_fits(&spec.device, geometry)?;
         if self
             .superblocks
             .iter()
@@ -2757,14 +3052,14 @@ impl<D: BlockDevice> Pool<D> {
             feature_incompat: template.feature_incompat | FEATURE_INCOMPAT_MULTI_DEVICE,
             geometry,
             case_sensitivity: template.case_sensitivity,
+            unicode_version: template.unicode_version,
             dirent_hash_seed: template.dirent_hash_seed,
             newest_commit: None,
             aux_record: None,
             label: template.label.clone(),
         };
         let bytes = encode_superblock(&superblock)?;
-        let mut device = spec.device;
-        blank_member_headers(&mut device)?;
+        let device = format_member_wrapper(spec.device, template.pool_id, spec.device_id)?;
         for offset in superblock_slots(device.len()) {
             write_padded(&device, offset, &bytes, SUPERBLOCK_PAD)?;
         }
@@ -3508,7 +3803,11 @@ impl<D: BlockDevice> Pool<D> {
 impl<D: BlockDevice> Pool<D> {
     pub(crate) fn into_device(self) -> D {
         assert_eq!(self.devices.len(), 1, "pool has one member");
-        self.devices.into_iter().next().expect("length checked")
+        self.devices
+            .into_iter()
+            .next()
+            .expect("length checked")
+            .into_inner()
     }
 }
 
@@ -3530,6 +3829,9 @@ type ChainAllocations = (
 #[derive(Debug)]
 struct PlannedCommit {
     tx_id: u64,
+    purpose: AllocPurpose,
+    created_at_ns: i64,
+    thin_metadata: bool,
     participating: Vec<bool>,
     stage_pages_and_summaries: Vec<PlannedWrite>,
     stage_commit_records: Vec<PlannedWrite>,
@@ -3595,7 +3897,7 @@ fn execute_commit<D: BlockDevice>(
 
 pub struct CommitTicket<D> {
     plan: Box<PlannedCommit>,
-    devices: Vec<D>,
+    devices: Vec<PartitionView<D>>,
 }
 
 impl<D: BlockDevice> CommitTicket<D> {
@@ -3628,6 +3930,28 @@ impl<D: BlockDevice> CommitTicket<D> {
 #[derive(Debug)]
 pub struct ExecutedCommit {
     plan: Box<PlannedCommit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    Committed { tx_id: u64 },
+    Degraded(LiveDegrade),
+}
+
+impl CommitOutcome {
+    pub fn tx_id(&self) -> u64 {
+        match self {
+            CommitOutcome::Committed { tx_id } => *tx_id,
+            CommitOutcome::Degraded(degrade) => degrade.tx_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveDegrade {
+    pub member: u16,
+    pub device_id: DeviceId,
+    pub tx_id: u64,
 }
 
 #[derive(Debug)]
@@ -3664,7 +3988,7 @@ impl<D: crate::device::SharedDevice> Pool<D> {
         self.publish_commit_impl(*executed.plan)
     }
 
-    pub fn commit_abandon(&mut self, aborted: AbortedCommit) -> ScaleFsError {
+    pub fn commit_abandon(&mut self, aborted: AbortedCommit) -> Result<CommitOutcome> {
         debug_assert!(
             self.commit_in_flight,
             "abandon without a commit in flight: ticket from another pool?"
@@ -3674,14 +3998,17 @@ impl<D: crate::device::SharedDevice> Pool<D> {
             suspect,
             error,
         } = aborted;
+        let (purpose, created_at_ns) = (plan.purpose, plan.created_at_ns);
         self.abandon_commit_impl(*plan, suspect);
-        error
+        self.recover_abandoned(CommitFailure { error, suspect }, purpose, created_at_ns)
     }
 }
 
 const RECORD_ENVELOPE_LEN: usize = crate::format::RECORD_HEADER_LEN;
 
 const SUPERBLOCK_PAD: usize = 4096;
+
+const MEMBER_WRAPPER_BLANK: u64 = crate::gpt::MEMBER_PARTITION_START;
 
 const PARTICIPATION_STALENESS: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -3795,6 +4122,27 @@ fn read_extent_from_set<D: BlockDevice>(devices: &[D], extent: Extent) -> Result
     ];
     device.read_at(extent.offset, &mut bytes)?;
     Ok(bytes)
+}
+
+fn check_member_fits<D: BlockDevice>(device: &D, geometry: Geometry) -> Result<()> {
+    if crate::gpt::usable_len(device.len(), device.sector_size()) < geometry.capacity_bytes() {
+        return Err(ScaleFsError::InvalidArgument(
+            "device is smaller than the requested geometry plus its GPT wrapper",
+        ));
+    }
+    Ok(())
+}
+
+fn format_member_wrapper<D: BlockDevice>(
+    device: D,
+    pool_id: PoolId,
+    device_id: DeviceId,
+) -> Result<PartitionView<D>> {
+    let partition = crate::gpt::write_member_gpt(&device, pool_id.0, device_id.0)?;
+    let mut view = PartitionView::new(device, partition.start, partition.len)?;
+    blank_member_headers(&mut view)?;
+    view.flush()?;
+    Ok(view)
 }
 
 fn blank_member_headers<D: BlockDevice>(device: &mut D) -> Result<()> {
@@ -4012,6 +4360,7 @@ fn best_candidate<D: BlockDevice>(device: &D) -> Result<(Superblock, Commit)> {
                         "pool uses incompatible features unknown to this build",
                     ));
                 }
+                superblock.require_supported_unicode_version()?;
                 if let Some(previous) = decoded.first()
                     && (previous.pool_id != superblock.pool_id
                         || previous.device_id != superblock.device_id)
@@ -4075,7 +4424,7 @@ mod tests {
     }
 
     fn device_len() -> usize {
-        geometry().capacity_bytes() as usize
+        crate::gpt::member_image_len(geometry().capacity_bytes()) as usize
     }
 
     fn inode_key(object_id: u64) -> MetadataKey {
@@ -4094,6 +4443,7 @@ mod tests {
             gid: 0,
             nlink: 1,
             attrs: 0,
+            bsd_flags: 0,
             crtime_ns: NOW,
             mtime_ns: NOW,
             ctime_ns: NOW,
@@ -4103,15 +4453,27 @@ mod tests {
 
     fn add_test_file(pool: &mut Pool<impl BlockDevice>) {
         let case = pool.superblock().case_sensitivity;
+        let version = pool.superblock().unicode_version;
         let tree = pool.tree_mut();
         tree.insert(inode_key(2), file_inode()).unwrap();
-        dirent::add_entry(tree, SEED, case, ROOT_INODE, "f.txt", 2, EntryKind::File).unwrap();
+        dirent::add_entry(
+            tree,
+            SEED,
+            version,
+            case,
+            ROOT_INODE,
+            "f.txt",
+            2,
+            EntryKind::File,
+        )
+        .unwrap();
     }
 
     fn lookup_test_file(pool: &Pool<impl BlockDevice>) -> Option<DirEntry> {
         dirent::lookup_entry(
             pool.tree(),
             SEED,
+            pool.superblock().unicode_version,
             pool.superblock().case_sensitivity,
             ROOT_INODE,
             "f.txt",
@@ -4219,7 +4581,11 @@ mod tests {
             pool.devices[1].write_at(offset, &bytes).unwrap();
         }
 
-        let devices: Vec<MemoryBlockDevice> = pool.devices.drain(..).collect();
+        let devices: Vec<MemoryBlockDevice> = pool
+            .devices
+            .drain(..)
+            .map(PartitionView::into_inner)
+            .collect();
         let reopened = Pool::open_multi(devices).unwrap();
         assert!(
             !reopened.read_only(),
@@ -4235,19 +4601,41 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_unicode_version_refuses_opening() {
+        let pool = Pool::create(MemoryBlockDevice::new(device_len()), params()).unwrap();
+        let device = pool.into_device();
+
+        let modified = device.clone();
+        let view = crate::gpt::member_view(&modified).unwrap();
+        let bytes = read_prefix(&view, 0).unwrap();
+        let mut superblock = decode_superblock(&bytes).unwrap();
+        superblock.unicode_version = crate::unicode::UnicodeVersion::new(99, 0, 0);
+        let encoded = encode_superblock(&superblock).unwrap();
+        for offset in superblock_slots(view.len()) {
+            view.write_at(offset, &encoded).unwrap();
+        }
+
+        assert!(matches!(
+            Pool::open(modified),
+            Err(ScaleFsError::UnsupportedUnicodeVersion { .. })
+        ));
+    }
+
+    #[test]
     fn feature_masks_gate_opening() {
         let pool = Pool::create(MemoryBlockDevice::new(device_len()), params()).unwrap();
         let device = pool.into_device();
 
         let with_features = |device: &MemoryBlockDevice, ro: u64, incompat: u64| {
             let modified = device.clone();
-            let bytes = read_prefix(&modified, 0).unwrap();
+            let view = crate::gpt::member_view(&modified).unwrap();
+            let bytes = read_prefix(&view, 0).unwrap();
             let mut superblock = decode_superblock(&bytes).unwrap();
             superblock.feature_ro_compat = ro;
             superblock.feature_incompat = incompat;
             let encoded = encode_superblock(&superblock).unwrap();
-            for offset in superblock_slots(modified.len()) {
-                modified.write_at(offset, &encoded).unwrap();
+            for offset in superblock_slots(view.len()) {
+                view.write_at(offset, &encoded).unwrap();
             }
             modified
         };
@@ -4277,9 +4665,10 @@ mod tests {
 
         let wreck = |device: &MemoryBlockDevice| {
             let wrecked = device.clone();
-            let [_, tail_slot] = superblock_slots(wrecked.len());
+            let view = crate::gpt::member_view(&wrecked).unwrap();
+            let [_, tail_slot] = superblock_slots(view.len());
             let body = vec![0xFFu8; (tail_slot - 4096) as usize];
-            wrecked.write_at(4096, &body).unwrap();
+            view.write_at(4096, &body).unwrap();
             wrecked
         };
         assert!(matches!(
@@ -4327,7 +4716,7 @@ mod tests {
     fn formatting_is_crash_safe() {
         let recorder = RecordingBlockDevice::new(MemoryBlockDevice::new(device_len()));
         let pool = Pool::create(recorder, params()).unwrap();
-        let ops = pool.devices[0].ops().to_vec();
+        let ops = pool.devices[0].inner().ops().to_vec();
         let base = vec![0u8; device_len()];
 
         crash_sweep(&base, &ops, |image, _| {
@@ -4344,12 +4733,12 @@ mod tests {
     #[test]
     fn commits_are_atomic_across_every_crash_state() {
         let pool = Pool::create(MemoryBlockDevice::new(device_len()), params()).unwrap();
-        let base = pool.devices[0].bytes().to_vec();
+        let base = pool.devices[0].inner().bytes().to_vec();
 
         let mut pool = Pool::open(RecordingBlockDevice::new(pool.into_device())).unwrap();
         add_test_file(&mut pool);
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let ops = pool.devices[0].ops().to_vec();
+        let ops = pool.devices[0].inner().ops().to_vec();
         assert!(
             ops.iter().filter(|op| matches!(op, Op::Flush)).count() >= 3,
             "commit must issue its three barriers"
@@ -4380,12 +4769,12 @@ mod tests {
         let file = pool.create_file(ROOT_INODE, "a", 0o644, NOW).unwrap();
         pool.write(file, 0, b"linked payload", NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let base = pool.devices[0].bytes().to_vec();
+        let base = pool.devices[0].inner().bytes().to_vec();
         {
             let mut pool = Pool::open(RecordingBlockDevice::new(pool.into_device())).unwrap();
             pool.link(file, ROOT_INODE, "b", NOW).unwrap();
             pool.commit(AllocPurpose::Normal, NOW).unwrap();
-            let ops = pool.devices[0].ops().to_vec();
+            let ops = pool.devices[0].inner().ops().to_vec();
             let linked_tx = pool.committed_tx();
 
             crash_sweep(&base, &ops, |image, prefix| {
@@ -4416,7 +4805,7 @@ mod tests {
             let mut pool = Pool::open(MemoryBlockDevice::from_bytes(base)).unwrap();
             pool.link(file, ROOT_INODE, "b", NOW).unwrap();
             pool.commit(AllocPurpose::Normal, NOW).unwrap();
-            pool.devices[0].bytes().to_vec()
+            pool.devices[0].inner().bytes().to_vec()
         };
         let mut pool = Pool::open(RecordingBlockDevice::new(MemoryBlockDevice::from_bytes(
             linked.clone(),
@@ -4424,7 +4813,7 @@ mod tests {
         .unwrap();
         pool.unlink(ROOT_INODE, "a", NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let ops = pool.devices[0].ops().to_vec();
+        let ops = pool.devices[0].inner().ops().to_vec();
         let unlinked_tx = pool.committed_tx();
 
         crash_sweep(&linked, &ops, |image, prefix| {
@@ -4456,7 +4845,7 @@ mod tests {
         let mut pool = Pool::create(MemoryBlockDevice::new(device_len()), params()).unwrap();
         let file = pool.create_file(ROOT_INODE, "f", 0o644, NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let base = pool.devices[0].bytes().to_vec();
+        let base = pool.devices[0].inner().bytes().to_vec();
 
         let mut pool = Pool::open(RecordingBlockDevice::new(pool.into_device())).unwrap();
         pool.set_xattr(
@@ -4468,7 +4857,7 @@ mod tests {
         )
         .unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let ops = pool.devices[0].ops().to_vec();
+        let ops = pool.devices[0].inner().ops().to_vec();
         let tagged_tx = pool.committed_tx();
 
         crash_sweep(&base, &ops, |image, prefix| {
@@ -4492,7 +4881,7 @@ mod tests {
     fn staging_between_plan_and_publish_is_crash_safe() {
         use std::sync::Arc;
         let pool = Pool::create(MemoryBlockDevice::new(device_len()), params()).unwrap();
-        let base = pool.devices[0].bytes().to_vec();
+        let base = pool.devices[0].inner().bytes().to_vec();
 
         let device = Arc::new(RecordingBlockDevice::new(MemoryBlockDevice::from_bytes(
             base.clone(),
@@ -4595,7 +4984,9 @@ mod tests {
         device.fail_writes.store(true, Ordering::Relaxed);
         let aborted = ticket.execute().expect_err("armed writes must fail");
         assert!(matches!(aborted.error(), ScaleFsError::Io(_)));
-        let error = pool.commit_abandon(aborted);
+        let error = pool
+            .commit_abandon(aborted)
+            .expect_err("no redundancy: wounded");
         assert!(matches!(error, ScaleFsError::Io(_)));
 
         assert!(pool.wounded);
@@ -4611,6 +5002,17 @@ mod tests {
             matches!(refused, ScaleFsError::Unsupported(msg) if msg.contains("before writing")),
             "a wounded pool refuses new writes"
         );
+        for refused in [
+            pool.mkdir(ROOT_INODE, "late-dir", 0o755, NOW).map(|_| ()),
+            pool.truncate(2, 0, NOW),
+            pool.unlink(ROOT_INODE, "f.txt", NOW),
+            pool.rename(ROOT_INODE, "f.txt", ROOT_INODE, "g.txt", NOW),
+        ] {
+            assert!(
+                matches!(refused, Err(ScaleFsError::Unsupported(msg)) if msg.contains("reopen")),
+                "a wounded pool refuses metadata mutations"
+            );
+        }
 
         assert!(lookup_test_file(&pool).is_some());
         drop(pool);
@@ -4625,12 +5027,12 @@ mod tests {
         let mut pool = Pool::create(MemoryBlockDevice::new(device_len()), params()).unwrap();
         add_test_file(&mut pool);
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let base = pool.devices[0].bytes().to_vec();
+        let base = pool.devices[0].inner().bytes().to_vec();
 
         let mut pool = Pool::open(RecordingBlockDevice::new(pool.into_device())).unwrap();
         pool.tree_mut().insert(inode_key(3), file_inode()).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let ops = pool.devices[0].ops().to_vec();
+        let ops = pool.devices[0].inner().ops().to_vec();
 
         crash_sweep(&base, &ops, |image, prefix| {
             let pool = Pool::open(image).unwrap_or_else(|err| {
@@ -4761,7 +5163,7 @@ mod tests {
             assert_eq!(entry.newest_commit.offset, commit_extent.offset);
         }
 
-        let stray = pool.devices.remove(0);
+        let stray = pool.devices.remove(0).into_inner();
         assert!(matches!(
             Pool::open(stray),
             Err(ScaleFsError::Unsupported(_))
@@ -4794,7 +5196,11 @@ mod tests {
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let tx = pool.committed_tx();
 
-        let mut devices = pool.devices;
+        let mut devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         devices.rotate_left(2);
         let mut pool = Pool::open_multi(devices).unwrap();
         assert_eq!(pool.committed_tx(), tx);
@@ -4807,7 +5213,11 @@ mod tests {
 
         pool.tree_mut().insert(inode_key(20), file_inode()).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let mut devices = pool.devices;
+        let mut devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         devices.rotate_left(1);
         let pool = Pool::open_multi(devices).unwrap();
         assert_eq!(pool.committed_tx(), tx + 1);
@@ -4817,7 +5227,11 @@ mod tests {
     #[test]
     fn multi_device_import_validates_the_member_set() {
         let pool = Pool::create_multi(multi_members(3), pool_params()).unwrap();
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
 
         let partial = vec![devices[0].clone(), devices[2].clone()];
         match Pool::open_multi(partial) {
@@ -4852,7 +5266,7 @@ mod tests {
         let mixed = vec![
             devices[0].clone(),
             devices[1].clone(),
-            foreign.devices.into_iter().next().unwrap(),
+            foreign.devices.into_iter().next().unwrap().into_inner(),
         ];
         assert!(matches!(
             Pool::open_multi(mixed),
@@ -4860,7 +5274,13 @@ mod tests {
         ));
 
         let solo = Pool::create_multi(multi_members(1), pool_params()).unwrap();
-        let solo = Pool::open_multi(solo.devices).unwrap();
+        let solo = Pool::open_multi(
+            solo.devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(solo.member_count(), 1);
         assert!(solo.multi.is_some());
 
@@ -4879,14 +5299,19 @@ mod tests {
         let bases: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = pool
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         let data: Vec<u8> = (0..5000usize).map(|i| (i % 240) as u8).collect();
@@ -4896,14 +5321,18 @@ mod tests {
 
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
         schedule.sort_by_key(|(seq, _, _)| *seq);
 
         let member_tx = |device: &MemoryBlockDevice| -> u64 {
-            best_candidate(device).map(|(_, c)| c.tx_id).unwrap_or(0)
+            crate::gpt::member_view(device)
+                .ok()
+                .and_then(|view| best_candidate(&view).ok())
+                .map(|(_, c)| c.tx_id)
+                .unwrap_or(0)
         };
 
         let mut states = 0usize;
@@ -4946,7 +5375,14 @@ mod tests {
                                     .insert(inode_key(30), file_inode())
                                     .unwrap();
                                 continued.commit(AllocPurpose::Normal, NOW).unwrap();
-                                let reopened = Pool::open_multi(continued.devices).unwrap();
+                                let reopened = Pool::open_multi(
+                                    continued
+                                        .devices
+                                        .into_iter()
+                                        .map(PartitionView::into_inner)
+                                        .collect(),
+                                )
+                                .unwrap();
                                 assert_eq!(reopened.committed_tx(), 3);
                                 assert!(reopened.tree().get(inode_key(30)).is_some());
                                 let entry = reopened.lookup(ROOT_INODE, "tx.bin").unwrap();
@@ -5096,7 +5532,9 @@ mod tests {
                 let mut geometry = geometry();
                 geometry.zone_count = 16;
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
                     device_id: DeviceId([0x30 + i as u8; 16]),
                     geometry,
                 }
@@ -5138,7 +5576,11 @@ mod tests {
             "expected space back on several members: {report:?}"
         );
 
-        let mut devices = pool.devices;
+        let mut devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         devices.rotate_left(1);
         let reopened = Pool::open_multi(devices).unwrap();
         let entry = reopened.lookup(ROOT_INODE, "keep.bin").unwrap();
@@ -5152,7 +5594,9 @@ mod tests {
         geometry.zone_count = 12;
         let mut params = params();
         params.geometry = geometry;
-        let device = MemoryBlockDevice::new(geometry.capacity_bytes() as usize);
+        let device = MemoryBlockDevice::new(
+            crate::gpt::member_image_len(geometry.capacity_bytes()) as usize,
+        );
         let mut pool = Pool::create(device, params).unwrap();
 
         let a: Vec<u8> = (0..90_000usize).map(|i| (i % 187) as u8).collect();
@@ -5196,14 +5640,19 @@ mod tests {
         let bases: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = pool
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         let report = pool.reclaim(NOW).unwrap();
@@ -5211,14 +5660,18 @@ mod tests {
         assert_eq!(report.tx_id, base_tx + 2);
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
         schedule.sort_by_key(|(seq, _, _)| *seq);
 
         let member_tx = |device: &MemoryBlockDevice| -> u64 {
-            best_candidate(device).map(|(_, c)| c.tx_id).unwrap_or(0)
+            crate::gpt::member_view(device)
+                .ok()
+                .and_then(|view| best_candidate(&view).ok())
+                .map(|(_, c)| c.tx_id)
+                .unwrap_or(0)
         };
 
         let mut states = 0usize;
@@ -5265,7 +5718,14 @@ mod tests {
                         }
                         let mut continued = Pool::open_multi(vec![a.clone(), b.clone()]).unwrap();
                         continued.reclaim(NOW).unwrap();
-                        let reopened = Pool::open_multi(continued.devices).unwrap();
+                        let reopened = Pool::open_multi(
+                            continued
+                                .devices
+                                .into_iter()
+                                .map(PartitionView::into_inner)
+                                .collect(),
+                        )
+                        .unwrap();
                         let entry = reopened.lookup(ROOT_INODE, "keep.bin").unwrap();
                         assert_eq!(reopened.read(entry.inode, 0, keep.len()).unwrap(), keep);
                     }
@@ -5290,11 +5750,11 @@ mod tests {
         let before: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let touched: Vec<usize> = (0..pool.devices.len())
-            .filter(|&i| pool.devices[i].bytes() != before[i].as_slice())
+            .filter(|&i| pool.devices[i].inner().bytes() != before[i].as_slice())
             .collect();
         assert!(
             touched.len() >= 2 && touched.len() <= 4,
@@ -5305,11 +5765,11 @@ mod tests {
         let before: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let touched: Vec<usize> = (0..pool.devices.len())
-            .filter(|&i| pool.devices[i].bytes() != before[i].as_slice())
+            .filter(|&i| pool.devices[i].inner().bytes() != before[i].as_slice())
             .collect();
         assert!(
             touched.len() < pool.devices.len(),
@@ -5317,7 +5777,13 @@ mod tests {
         );
 
         let tx = pool.committed_tx();
-        let reopened = Pool::open_multi(pool.devices).unwrap();
+        let reopened = Pool::open_multi(
+            pool.devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(reopened.committed_tx(), tx);
         let entry = reopened.lookup(ROOT_INODE, "one.bin").unwrap();
         assert_eq!(reopened.read(entry.inode, 0, data.len()).unwrap(), data);
@@ -5340,7 +5806,11 @@ mod tests {
         }
         let tx = pool.committed_tx();
 
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         for absent in 0..devices.len() {
             let survivors: Vec<MemoryBlockDevice> = devices
                 .iter()
@@ -5348,7 +5818,7 @@ mod tests {
                 .filter(|(i, _)| *i != absent)
                 .map(|(_, device)| device.clone())
                 .collect();
-            let degraded = Pool::open_multi_degraded(survivors)
+            let mut degraded = Pool::open_multi_degraded(survivors)
                 .unwrap_or_else(|err| panic!("import without member {absent} failed: {err}"));
             assert_eq!(
                 degraded.committed_tx(),
@@ -5356,6 +5826,10 @@ mod tests {
                 "newest roster lost with member {absent} absent"
             );
             assert!(degraded.is_degraded() && degraded.read_only());
+            assert!(matches!(
+                degraded.create_file(ROOT_INODE, "nope", 0o644, NOW),
+                Err(ScaleFsError::Unsupported(msg)) if msg.contains("read-only")
+            ));
             for (name, data) in &files {
                 let entry = degraded.lookup(ROOT_INODE, name).unwrap();
                 assert_eq!(&degraded.read(entry.inode, 0, data.len()).unwrap(), data);
@@ -5379,14 +5853,19 @@ mod tests {
         let bases: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = pool
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         pool.probe_staleness = std::time::Duration::MAX;
@@ -5397,7 +5876,7 @@ mod tests {
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         let mut wrote: Vec<bool> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            let ops: Vec<(u64, Op)> = device.sequenced_ops();
+            let ops: Vec<(u64, Op)> = device.inner().sequenced_ops();
             wrote.push(!ops.is_empty());
             for (seq, op) in ops {
                 schedule.push((seq, member, op));
@@ -5473,14 +5952,19 @@ mod tests {
         let bases: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = pool
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         pool.probe_staleness = std::time::Duration::MAX;
@@ -5491,7 +5975,7 @@ mod tests {
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         let mut wrote: Vec<bool> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            let ops: Vec<(u64, Op)> = device.sequenced_ops();
+            let ops: Vec<(u64, Op)> = device.inner().sequenced_ops();
             wrote.push(!ops.is_empty());
             for (seq, op) in ops {
                 schedule.push((seq, member, op));
@@ -5547,7 +6031,7 @@ mod tests {
         let devices: Vec<MemoryBlockDevice> = pool
             .devices
             .into_iter()
-            .map(RecordingBlockDevice::into_inner)
+            .map(|view| view.into_inner().into_inner())
             .collect();
         for absent in 0..devices.len() {
             let survivors: Vec<MemoryBlockDevice> = devices
@@ -5607,7 +6091,7 @@ mod tests {
             device: MemoryBlockDevice::new({
                 let mut geometry = geometry();
                 geometry.zone_count = 16;
-                geometry.capacity_bytes() as usize
+                crate::gpt::member_image_len(geometry.capacity_bytes()) as usize
             }),
             device_id: DeviceId([0x77; 16]),
             geometry: {
@@ -5639,18 +6123,24 @@ mod tests {
         let before: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
         let tx = pool.commit(AllocPurpose::Normal, NOW).unwrap();
         assert_eq!(tx, pool.committed_tx());
         let touched: Vec<usize> = (0..pool.devices.len())
-            .filter(|&i| pool.devices[i].bytes() != before[i].as_slice())
+            .filter(|&i| pool.devices[i].inner().bytes() != before[i].as_slice())
             .collect();
         assert!(
             !touched.is_empty() && touched.len() < pool.devices.len(),
             "an empty commit touches the root replicas only: {touched:?}"
         );
-        let reopened = Pool::open_multi(pool.devices).unwrap();
+        let reopened = Pool::open_multi(
+            pool.devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(reopened.committed_tx(), tx);
     }
 
@@ -5668,9 +6158,12 @@ mod tests {
                 self.inner.read_at(offset, buf)
             }
             fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
-                assert_eq!(offset % self.block, 0, "unaligned write offset {offset}");
+                let wrapper = offset < crate::gpt::MEMBER_PARTITION_START
+                    || offset >= self.inner.len() - 33 * 512;
+                let unit = if wrapper { 512 } else { self.block };
+                assert_eq!(offset % unit, 0, "unaligned write offset {offset}");
                 assert_eq!(
-                    data.len() as u64 % self.block,
+                    data.len() as u64 % unit,
                     0,
                     "unaligned write length {} at {offset}",
                     data.len()
@@ -5688,7 +6181,9 @@ mod tests {
                 geometry.zone_count = 16;
                 MemberSpec {
                     device: AlignmentChecking {
-                        inner: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                        inner: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                            geometry.capacity_bytes(),
+                        ) as usize),
                         block: u64::from(geometry.logical_block_size),
                     },
                     device_id: DeviceId([0x50 + i as u8; 16]),
@@ -5757,9 +6252,12 @@ mod tests {
                 self.inner.read_at(offset, buf)
             }
             fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
-                assert_eq!(offset % self.block, 0, "unaligned write offset {offset}");
+                let wrapper = offset < crate::gpt::MEMBER_PARTITION_START
+                    || offset >= self.inner.len() - 33 * 512;
+                let unit = if wrapper { 512 } else { self.block };
+                assert_eq!(offset % unit, 0, "unaligned write offset {offset}");
                 assert_eq!(
-                    data.len() as u64 % self.block,
+                    data.len() as u64 % unit,
                     0,
                     "unaligned write length {} at {offset}",
                     data.len()
@@ -5777,7 +6275,9 @@ mod tests {
                 geometry.zone_count = 16;
                 MemberSpec {
                     device: AlignmentChecking {
-                        inner: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                        inner: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                            geometry.capacity_bytes(),
+                        ) as usize),
                         block: u64::from(geometry.logical_block_size),
                     },
                     device_id: DeviceId([0x60 + i as u8; 16]),
@@ -5870,7 +6370,9 @@ mod tests {
                 geometry.zone_count = 16;
                 MemberSpec {
                     device: Yankable {
-                        inner: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                        inner: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                            geometry.capacity_bytes(),
+                        ) as usize),
                         dead: std::sync::Arc::clone(&switches[i]),
                     },
                     device_id: DeviceId([0x60 + i as u8; 16]),
@@ -5920,12 +6422,12 @@ mod tests {
         let before: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.inner.bytes().to_vec())
+            .map(|device| device.inner().inner.bytes().to_vec())
             .collect();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         for (i, before) in before.iter().enumerate() {
             assert_ne!(
-                pool.devices[i].inner.bytes(),
+                pool.devices[i].inner().inner.bytes(),
                 before.as_slice(),
                 "stale member {i} was not probed"
             );
@@ -5936,11 +6438,11 @@ mod tests {
         let before: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.inner.bytes().to_vec())
+            .map(|device| device.inner().inner.bytes().to_vec())
             .collect();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let untouched: Vec<usize> = (0..pool.devices.len())
-            .filter(|&i| pool.devices[i].inner.bytes() == before[i].as_slice())
+            .filter(|&i| pool.devices[i].inner().inner.bytes() == before[i].as_slice())
             .collect();
         assert!(!untouched.is_empty(), "a small tx should skip someone");
 
@@ -6020,7 +6522,7 @@ mod tests {
             .create_file(ROOT_INODE, "orphan.bin", 0o644, NOW)
             .unwrap();
         pool.write(doomed, 0, &orphan, NOW).unwrap();
-        let mut abandoned = Pool::open(pool.devices[0].clone()).unwrap();
+        let mut abandoned = Pool::open(pool.devices[0].inner().clone()).unwrap();
         assert!(matches!(
             abandoned.lookup(ROOT_INODE, "orphan.bin"),
             Err(ScaleFsError::NotFound)
@@ -6064,7 +6566,11 @@ mod tests {
             roster.metadata_root_replicas[1].device_index,
         );
 
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         for dropped in 0..3usize {
             let survivors: Vec<MemoryBlockDevice> = devices
                 .iter()
@@ -6134,7 +6640,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index != dropped)
-                .map(|(_, device)| device.clone())
+                .map(|(_, device)| device.inner().clone())
                 .collect();
             let degraded = Pool::open_multi_degraded(survivors).unwrap();
             let entry = degraded.lookup(ROOT_INODE, "keep.bin").unwrap();
@@ -6151,14 +6657,19 @@ mod tests {
         let bases: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = pool
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         let data: Vec<u8> = (0..5000usize).map(|i| (i % 240) as u8).collect();
@@ -6168,7 +6679,7 @@ mod tests {
 
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
@@ -6246,7 +6757,7 @@ mod tests {
                 geometry.zone_count = 16;
                 MemberSpec {
                     device: std::sync::Arc::new(MemoryBlockDevice::new(
-                        geometry.capacity_bytes() as usize
+                        crate::gpt::member_image_len(geometry.capacity_bytes()) as usize,
                     )),
                     device_id: DeviceId([0x30 + i as u8; 16]),
                     geometry,
@@ -6285,7 +6796,10 @@ mod tests {
 
         let zeros = vec![0u8; corrupt_piece.length as usize];
         handles[corrupt_piece.device_index as usize]
-            .write_at(corrupt_piece.offset, &zeros)
+            .write_at(
+                crate::gpt::MEMBER_PARTITION_START + corrupt_piece.offset,
+                &zeros,
+            )
             .unwrap();
         let present: Vec<std::sync::Arc<MemoryBlockDevice>> = handles
             .iter()
@@ -6328,7 +6842,7 @@ mod tests {
 
         let zeros = vec![0u8; parity.length as usize];
         handles[parity.device_index as usize]
-            .write_at(parity.offset, &zeros)
+            .write_at(crate::gpt::MEMBER_PARTITION_START + parity.offset, &zeros)
             .unwrap();
 
         let refused = pool.references_onto_member(data_member).unwrap_err();
@@ -6400,7 +6914,9 @@ mod tests {
             .execute()
             .expect_err("an armed panic must conclude as an error");
         assert!(matches!(aborted.error(), ScaleFsError::Io(_)));
-        let error = pool.commit_abandon(aborted);
+        let error = pool
+            .commit_abandon(aborted)
+            .expect_err("no redundancy: wounded");
         assert!(matches!(error, ScaleFsError::Io(_)));
         assert!(pool.wounded);
 
@@ -6410,6 +6926,266 @@ mod tests {
             matches!(refused, ScaleFsError::Unsupported(msg) if msg.contains("reopen")),
             "the wounded refusal, never the in-flight strand"
         );
+    }
+
+    fn fault_members(
+        count: usize,
+    ) -> (
+        Vec<MemberSpec<crate::torture::FaultDevice>>,
+        Vec<crate::torture::FaultSwitch>,
+    ) {
+        let mut switches = Vec::new();
+        let members = (0..count)
+            .map(|i| {
+                let mut geometry = geometry();
+                geometry.zone_count = 16;
+                let device = crate::torture::FaultDevice::new(crate::gpt::member_image_len(
+                    geometry.capacity_bytes(),
+                ) as usize);
+                switches.push(device.switch());
+                MemberSpec {
+                    device,
+                    device_id: DeviceId([0x50 + i as u8; 16]),
+                    geometry,
+                }
+            })
+            .collect();
+        (members, switches)
+    }
+
+    #[test]
+    fn a_member_dying_before_the_commit_degrades_the_pool_and_keeps_the_writes() {
+        let (members, switches) = fault_members(2);
+        let backings: Vec<_> = members.iter().map(|m| m.device.backing()).collect();
+        let mut pool = Pool::create_multi(members, mirrored_params()).unwrap();
+        let payload: Vec<u8> = (0..70_000usize).map(|i| (i % 251) as u8).collect();
+        let file = pool.create_file(ROOT_INODE, "ack.bin", 0o644, NOW).unwrap();
+        pool.write(file, 0, &payload, NOW).unwrap();
+        let before = pool.committed_tx();
+
+        switches[1].fail();
+        let outcome = pool
+            .commit_or_degrade(AllocPurpose::Normal, NOW)
+            .expect("the commit lands on the survivor");
+        let CommitOutcome::Degraded(degrade) = outcome else {
+            panic!("expected a live degrade, got {outcome:?}");
+        };
+        assert_eq!(degrade.member, 1);
+        assert_eq!(degrade.device_id, DeviceId([0x51; 16]));
+        assert!(degrade.tx_id > before);
+        assert_eq!(pool.committed_tx(), degrade.tx_id);
+        assert!(!pool.wounded, "a recovered commit is not a wound");
+        assert!(pool.is_degraded());
+        assert_eq!(pool.missing_members(), vec![1]);
+        assert!(pool.read_only());
+        assert_eq!(pool.live_degrade(), Some(&degrade));
+        assert_ne!(
+            pool.superblock().feature_incompat & FEATURE_INCOMPAT_THIN_METADATA,
+            0
+        );
+        assert_eq!(pool.read(file, 0, payload.len()).unwrap(), payload);
+        let refused = pool.write(file, 0, b"more", NOW).unwrap_err();
+        assert!(
+            matches!(refused, ScaleFsError::Unsupported(msg) if msg.contains("read-only")),
+            "{refused:?}"
+        );
+
+        drop(pool);
+        let survivor = crate::torture::FaultDevice::over(std::sync::Arc::clone(&backings[0]));
+        let reopened = Pool::open_multi_degraded(vec![survivor]).unwrap();
+        assert_eq!(reopened.committed_tx(), degrade.tx_id);
+        assert!(reopened.is_degraded());
+        let entry = dirent::lookup_entry(
+            reopened.tree(),
+            SEED,
+            reopened.superblock().unicode_version,
+            reopened.superblock().case_sensitivity,
+            ROOT_INODE,
+            "ack.bin",
+        )
+        .expect("the write survived");
+        assert_eq!(
+            reopened.read(entry.inode, 0, payload.len()).unwrap(),
+            payload
+        );
+        drop(reopened);
+
+        let both: Vec<_> = backings
+            .iter()
+            .map(|b| crate::torture::FaultDevice::over(std::sync::Arc::clone(b)))
+            .collect();
+        let mut whole = Pool::open_multi(both).unwrap();
+        assert_eq!(whole.committed_tx(), degrade.tx_id);
+        assert!(!whole.is_degraded());
+        assert!(!whole.read_only());
+        assert_ne!(
+            whole.superblock().feature_incompat & FEATURE_INCOMPAT_THIN_METADATA,
+            0,
+            "the thin roster is still the newest view"
+        );
+        let entry = dirent::lookup_entry(
+            whole.tree(),
+            SEED,
+            whole.superblock().unicode_version,
+            whole.superblock().case_sensitivity,
+            ROOT_INODE,
+            "ack.bin",
+        )
+        .expect("the write is in the newest view");
+        assert_eq!(whole.read(entry.inode, 0, payload.len()).unwrap(), payload);
+        add_test_file(&mut whole);
+        whole.commit(AllocPurpose::Normal, NOW).unwrap();
+        for superblock in whole.superblocks() {
+            assert_eq!(
+                superblock.feature_incompat & FEATURE_INCOMPAT_THIN_METADATA,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_transient_write_failure_is_retried_before_any_degrade() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct Flaky {
+            inner: Arc<MemoryBlockDevice>,
+            remaining: Arc<AtomicUsize>,
+        }
+        impl BlockDevice for Flaky {
+            fn len(&self) -> u64 {
+                self.inner.len()
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+                self.inner.read_at(offset, buf)
+            }
+            fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+                let left = self.remaining.load(Ordering::SeqCst);
+                if left > 0 {
+                    self.remaining.store(left - 1, Ordering::SeqCst);
+                    return Err(ScaleFsError::Io(std::io::Error::other("flaky write")));
+                }
+                self.inner.write_at(offset, data)
+            }
+            fn flush(&self) -> Result<()> {
+                self.inner.flush()
+            }
+        }
+        let mut geometry = geometry();
+        geometry.zone_count = 16;
+        let len = crate::gpt::member_image_len(geometry.capacity_bytes()) as usize;
+        let flake = Arc::new(AtomicUsize::new(0));
+        let members = vec![
+            MemberSpec {
+                device: Flaky {
+                    inner: Arc::new(MemoryBlockDevice::new(len)),
+                    remaining: Arc::new(AtomicUsize::new(0)),
+                },
+                device_id: DeviceId([0x60; 16]),
+                geometry,
+            },
+            MemberSpec {
+                device: Flaky {
+                    inner: Arc::new(MemoryBlockDevice::new(len)),
+                    remaining: Arc::clone(&flake),
+                },
+                device_id: DeviceId([0x61; 16]),
+                geometry,
+            },
+        ];
+        let mut pool = Pool::create_multi(members, mirrored_params()).unwrap();
+        add_test_file(&mut pool);
+        flake.store(1, Ordering::SeqCst);
+        let outcome = pool.commit_or_degrade(AllocPurpose::Normal, NOW).unwrap();
+        assert!(
+            matches!(outcome, CommitOutcome::Committed { .. }),
+            "a transient failure commits whole after one retry, got {outcome:?}"
+        );
+        assert!(!pool.is_degraded());
+        assert!(!pool.read_only());
+        assert!(!pool.wounded);
+        assert!(pool.live_degrade().is_none());
+        assert_eq!(
+            flake.load(Ordering::SeqCst),
+            0,
+            "the one failure was consumed"
+        );
+        assert!(lookup_test_file(&pool).is_some());
+    }
+
+    #[test]
+    fn a_live_degraded_pool_is_healed_by_replace_and_rebuild() {
+        let (members, switches) = fault_members(3);
+        let mut pool = Pool::create_multi(members, mirrored_params()).unwrap();
+        let payload: Vec<u8> = (0..40_000usize).map(|i| (i % 199) as u8).collect();
+        let file = pool
+            .create_file(ROOT_INODE, "keep.bin", 0o644, NOW)
+            .unwrap();
+        pool.write(file, 0, &payload, NOW).unwrap();
+        switches[2].fail();
+        let outcome = pool.commit_or_degrade(AllocPurpose::Normal, NOW).unwrap();
+        assert!(matches!(
+            outcome,
+            CommitOutcome::Degraded(LiveDegrade { member: 2, .. })
+        ));
+        assert!(pool.read_only());
+        assert_eq!(pool.missing_members(), vec![2]);
+        assert_eq!(
+            pool.superblock().feature_incompat & FEATURE_INCOMPAT_THIN_METADATA,
+            0
+        );
+        assert_eq!(pool.read(file, 0, payload.len()).unwrap(), payload);
+
+        let again = pool.commit_or_degrade(AllocPurpose::Normal, NOW);
+        assert!(
+            matches!(again, Err(ScaleFsError::Unsupported(msg)) if msg.contains("read-only")),
+            "{again:?}"
+        );
+        assert!(!pool.wounded);
+
+        let mut geometry = geometry();
+        geometry.zone_count = 16;
+        let fresh = crate::torture::FaultDevice::new(crate::gpt::member_image_len(
+            geometry.capacity_bytes(),
+        ) as usize);
+        pool.replace_member(
+            2,
+            MemberSpec {
+                device: fresh,
+                device_id: DeviceId([0x70; 16]),
+                geometry,
+            },
+            NOW,
+        )
+        .unwrap();
+        assert!(!pool.read_only());
+        assert!(!pool.is_degraded());
+        let report = pool.rebuild(NOW).unwrap();
+        assert!(
+            report.copies_written > 0,
+            "the dead member's copies are re-mirrored"
+        );
+        assert_eq!(pool.read(file, 0, payload.len()).unwrap(), payload);
+        pool.write(file, 0, b"after heal", NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+    }
+
+    #[test]
+    fn a_failure_beyond_the_protection_policy_still_wounds() {
+        let (members, switches) = fault_members(3);
+        let mut pool = Pool::create_multi(members, mirrored_params()).unwrap();
+        add_test_file(&mut pool);
+        switches[1].fail();
+        switches[2].fail();
+        let error = pool
+            .commit_or_degrade(AllocPurpose::Normal, NOW)
+            .expect_err("two of three mirror-2 members gone exceeds the policy");
+        assert!(matches!(error, ScaleFsError::Io(_)), "{error:?}");
+        assert!(pool.wounded);
+        assert!(pool.live_degrade().is_none());
+        let refused = pool.commit(AllocPurpose::Normal, NOW).unwrap_err();
+        assert!(matches!(refused, ScaleFsError::Unsupported(msg) if msg.contains("reopen")));
     }
 
     #[test]
@@ -6436,7 +7212,11 @@ mod tests {
         );
 
         let tx = pool.committed_tx();
-        let devices: Vec<MemoryBlockDevice> = pool.devices.drain(..).collect();
+        let devices: Vec<MemoryBlockDevice> = pool
+            .devices
+            .drain(..)
+            .map(PartitionView::into_inner)
+            .collect();
         let reopened = Pool::open_multi(devices).unwrap();
         assert_eq!(reopened.committed_tx(), tx);
         assert!(lookup_test_file(&reopened).is_some());
@@ -6475,7 +7255,9 @@ mod tests {
                 geometry.zone_count = 16;
                 MemberSpec {
                     device: Arc::new(FailAfter {
-                        inner: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                        inner: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                            geometry.capacity_bytes(),
+                        ) as usize),
                         allow: AtomicI64::new(i64::MAX),
                     }),
                     device_id: DeviceId([0x30 + i as u8; 16]),
@@ -6582,7 +7364,13 @@ mod tests {
         assert_eq!(members.len(), 4, "3 data + 1 parity on distinct members");
 
         assert_eq!(pool.read(file, 0, data.len()).unwrap(), data);
-        let mut reopened = Pool::open_multi(pool.devices).unwrap();
+        let mut reopened = Pool::open_multi(
+            pool.devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(reopened.parity_width(), 1);
         assert_eq!(reopened.data_width(), 3);
         let entry = reopened.lookup(ROOT_INODE, "big.bin").unwrap();
@@ -6599,7 +7387,14 @@ mod tests {
         expect[100..1100].copy_from_slice(&fresh);
         assert_eq!(reopened.read(entry.inode, 0, expect.len()).unwrap(), expect);
         reopened.commit(AllocPurpose::Normal, NOW).unwrap();
-        let again = Pool::open_multi(reopened.devices).unwrap();
+        let again = Pool::open_multi(
+            reopened
+                .devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         let entry = again.lookup(ROOT_INODE, "big.bin").unwrap();
         assert_eq!(again.read(entry.inode, 0, expect.len()).unwrap(), expect);
     }
@@ -6653,7 +7448,11 @@ mod tests {
         pool.write(file, 0, &data, NOW).unwrap();
         pool.snapshot_create("pin", NOW).unwrap();
 
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         for absent in 0..devices.len() {
             let survivors: Vec<MemoryBlockDevice> = devices
                 .iter()
@@ -6705,7 +7504,11 @@ mod tests {
         pool.write(file, 0, &data, NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
 
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         for a in 0..devices.len() {
             for b in a + 1..devices.len() {
                 let survivors: Vec<MemoryBlockDevice> = devices
@@ -6766,7 +7569,11 @@ mod tests {
         assert_eq!(pool.read(file, 0, chunk).unwrap(), &data[..chunk]);
 
         let survivor_member = usize::from(runs[0].0.device_index);
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         let survivors: Vec<MemoryBlockDevice> = devices
             .iter()
             .enumerate()
@@ -6841,7 +7648,11 @@ mod tests {
         assert_eq!(pool.read(c, 0, chunk).unwrap(), &big[..chunk]);
         assert!(pool.scrub(false).unwrap().healthy());
 
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         for absent in 0..devices.len() {
             let survivors: Vec<MemoryBlockDevice> = devices
                 .iter()
@@ -6897,7 +7708,11 @@ mod tests {
         pool.snapshot_create("pin", NOW).unwrap();
 
         let victim = striped_runs(&pool, file)[0].0.device_index;
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         let survivors: Vec<MemoryBlockDevice> = devices
             .iter()
             .enumerate()
@@ -6913,7 +7728,9 @@ mod tests {
             .replace_member(
                 victim,
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
                     device_id: DeviceId([0x99; 16]),
                     geometry,
                 },
@@ -6937,7 +7754,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index != absent)
-                .map(|(_, device)| device.clone())
+                .map(|(_, device)| device.inner().clone())
                 .collect();
             let again = Pool::open_multi_degraded(survivors).unwrap();
             let entry = again.lookup(ROOT_INODE, "keep.bin").unwrap();
@@ -6968,7 +7785,11 @@ mod tests {
         assert_eq!(pool.read(file, 0, data.len()).unwrap(), data);
         assert!(pool.scrub(false).unwrap().healthy());
 
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         let reopened = Pool::open_multi(devices.clone()).unwrap();
         let entry = reopened.lookup(ROOT_INODE, "move.bin").unwrap();
         assert_eq!(reopened.read(entry.inode, 0, data.len()).unwrap(), data);
@@ -7002,7 +7823,11 @@ mod tests {
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
 
         let victim = striped_runs(&pool, file)[0].0.device_index;
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         let survivors: Vec<MemoryBlockDevice> = devices
             .iter()
             .enumerate()
@@ -7025,13 +7850,18 @@ mod tests {
         let bases: Vec<Vec<u8>> = degraded
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = degraded
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         let pre_tx = pool.committed_tx();
@@ -7039,7 +7869,7 @@ mod tests {
 
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
@@ -7214,14 +8044,19 @@ mod tests {
         let bases: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = pool
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         let data: Vec<u8> = (0..700usize).map(|i| (i * 31 % 251) as u8).collect();
@@ -7231,7 +8066,7 @@ mod tests {
 
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
@@ -7298,14 +8133,19 @@ mod tests {
         let bases: Vec<Vec<u8>> = pool
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = pool
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         let data: Vec<u8> = (0..chunk + 700).map(|i| (i * 31 % 251) as u8).collect();
@@ -7315,7 +8155,7 @@ mod tests {
 
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
@@ -7458,7 +8298,13 @@ mod tests {
             pool.read_extent(copies[0]).unwrap(),
             pool.read_extent(copies[1]).unwrap()
         );
-        let reopened = Pool::open_multi(pool.devices).unwrap();
+        let reopened = Pool::open_multi(
+            pool.devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         let entry = reopened.lookup(ROOT_INODE, "data.bin").unwrap();
         assert_eq!(reopened.read(entry.inode, 0, data.len()).unwrap(), data);
         assert!(reopened.snapshot_open("pin").is_ok());
@@ -7496,7 +8342,11 @@ mod tests {
         let file = pool.create_file(ROOT_INODE, "d.bin", 0o644, NOW).unwrap();
         pool.write(file, 0, &data, NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let survivors: Vec<MemoryBlockDevice> = pool.devices.drain(1..).collect::<Vec<_>>();
+        let survivors: Vec<MemoryBlockDevice> = pool
+            .devices
+            .drain(1..)
+            .map(PartitionView::into_inner)
+            .collect::<Vec<_>>();
         let mut degraded = Pool::open_multi_degraded(survivors).unwrap();
         let report = degraded.scrub(true).unwrap();
         assert!(report.copies_missing > 0, "{report:?}");
@@ -7535,7 +8385,9 @@ mod tests {
         let member = pool
             .add_member(
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
                     device_id: DeviceId([0x77; 16]),
                     geometry,
                 },
@@ -7564,7 +8416,11 @@ mod tests {
         pool.write(second, 0, &more, NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
 
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
         assert!(matches!(
             Pool::open(devices[0].clone()),
             Err(ScaleFsError::Unsupported(_))
@@ -7583,7 +8439,9 @@ mod tests {
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         pool.add_member(
             MemberSpec {
-                device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry.capacity_bytes(),
+                ) as usize),
                 device_id: DeviceId([0x78; 16]),
                 geometry,
             },
@@ -7592,7 +8450,10 @@ mod tests {
         .unwrap();
         assert_eq!(pool.member_count(), 3);
         assert_eq!(pool.mirror_width(), 2);
-        let survivors: Vec<MemoryBlockDevice> = pool.devices[1..].to_vec();
+        let survivors: Vec<MemoryBlockDevice> = pool.devices[1..]
+            .iter()
+            .map(|view| view.inner().clone())
+            .collect();
         let degraded = Pool::open_multi_degraded(survivors).unwrap();
         let entry = degraded.lookup(ROOT_INODE, "m.bin").unwrap();
         assert_eq!(degraded.read(entry.inode, 0, data.len()).unwrap(), data);
@@ -7611,7 +8472,7 @@ mod tests {
         single.write(file, 0, &data, NOW).unwrap();
         single.commit(AllocPurpose::Normal, NOW).unwrap();
         let base_tx = single.committed_tx();
-        let old_base = single.devices[0].bytes().to_vec();
+        let old_base = single.devices[0].inner().bytes().to_vec();
         let new_len = device_len();
 
         let sequence: Arc<AtomicU64> = Arc::default();
@@ -7634,7 +8495,7 @@ mod tests {
 
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
@@ -7692,14 +8553,14 @@ mod tests {
             .unwrap();
         pool.write(file, 0, &data, NOW).unwrap();
         pool.snapshot_create("pin", NOW).unwrap();
-        let old_member = pool.devices[1].clone();
+        let old_member = pool.devices[1].inner().clone();
 
         let survivors: Vec<MemoryBlockDevice> = pool
             .devices
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != 1)
-            .map(|(_, device)| device.clone())
+            .map(|(_, device)| device.inner().clone())
             .collect();
         let mut pool = Pool::open_multi_degraded(survivors).unwrap();
         assert!(pool.read_only());
@@ -7709,7 +8570,9 @@ mod tests {
         pool.replace_member(
             1,
             MemberSpec {
-                device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry.capacity_bytes(),
+                ) as usize),
                 device_id: DeviceId([0x99; 16]),
                 geometry,
             },
@@ -7737,7 +8600,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index != dropped)
-                .map(|(_, device)| device.clone())
+                .map(|(_, device)| device.inner().clone())
                 .collect();
             let degraded = Pool::open_multi_degraded(survivors).unwrap();
             let entry = degraded.lookup(ROOT_INODE, "data.bin").unwrap();
@@ -7747,7 +8610,11 @@ mod tests {
             assert_eq!(snapshot.read(entry.inode, 0, data.len()).unwrap(), data);
         }
 
-        let mut with_ghost = pool.devices.clone();
+        let mut with_ghost: Vec<MemoryBlockDevice> = pool
+            .devices
+            .iter()
+            .map(|view| view.inner().clone())
+            .collect();
         with_ghost.push(old_member);
         let haunted = Pool::open_multi(with_ghost).unwrap();
         assert_eq!(haunted.member_count(), 3);
@@ -7778,7 +8645,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != 2)
-            .map(|(_, device)| device.clone())
+            .map(|(_, device)| device.inner().clone())
             .collect();
         let mut pool = Pool::open_multi_degraded(survivors).unwrap();
         let mut geometry = geometry();
@@ -7786,7 +8653,9 @@ mod tests {
         pool.replace_member(
             2,
             MemberSpec {
-                device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry.capacity_bytes(),
+                ) as usize),
                 device_id: DeviceId([0xA7; 16]),
                 geometry,
             },
@@ -7805,7 +8674,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index != dropped)
-                .map(|(_, device)| device.clone())
+                .map(|(_, device)| device.inner().clone())
                 .collect();
             let degraded = Pool::open_multi_degraded(survivors).unwrap();
             let snapshot = degraded.snapshot_open("inner").unwrap();
@@ -7836,7 +8705,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != 1)
-            .map(|(_, device)| device.clone())
+            .map(|(_, device)| device.inner().clone())
             .collect();
         let mut degraded = Pool::open_multi_degraded(survivors).unwrap();
         let mut geometry = geometry();
@@ -7845,7 +8714,9 @@ mod tests {
             .replace_member(
                 1,
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
                     device_id: DeviceId([0x99; 16]),
                     geometry,
                 },
@@ -7855,20 +8726,25 @@ mod tests {
         let bases: Vec<Vec<u8>> = degraded
             .devices
             .iter()
-            .map(|device| device.bytes().to_vec())
+            .map(|device| device.inner().bytes().to_vec())
             .collect();
 
         let sequence: Arc<AtomicU64> = Arc::default();
         let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = degraded
             .devices
             .into_iter()
-            .map(|device| RecordingBlockDevice::with_shared_sequence(device, Arc::clone(&sequence)))
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(
+                    device.into_inner(),
+                    Arc::clone(&sequence),
+                )
+            })
             .collect();
         let mut pool = Pool::open_multi(recorders).unwrap();
         pool.rebuild(NOW).unwrap();
         let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
         for (member, device) in pool.devices.iter().enumerate() {
-            for (seq, op) in device.sequenced_ops() {
+            for (seq, op) in device.inner().sequenced_ops() {
                 schedule.push((seq, member, op.clone()));
             }
         }
@@ -7928,7 +8804,13 @@ mod tests {
 
         assert!(any_superblock(&freed).is_err());
 
-        let reopened = Pool::open_multi(pool.devices).unwrap();
+        let reopened = Pool::open_multi(
+            pool.devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(reopened.member_count(), 3);
         assert_eq!(reopened.devices.len(), 2);
         let entry = reopened.lookup(ROOT_INODE, "data.bin").unwrap();
@@ -7940,7 +8822,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index != dropped)
-                .map(|(_, device)| device.clone())
+                .map(|(_, device)| device.inner().clone())
                 .collect();
             let degraded = Pool::open_multi_degraded(survivors).unwrap();
             let entry = degraded.lookup(ROOT_INODE, "data.bin").unwrap();
@@ -7953,7 +8835,9 @@ mod tests {
         let member = pool
             .add_member(
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
                     device_id: DeviceId([0x55; 16]),
                     geometry,
                 },
@@ -8000,12 +8884,409 @@ mod tests {
 
         let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let survivors: Vec<MemoryBlockDevice> = pool.devices.drain(1..).collect();
+        let survivors: Vec<MemoryBlockDevice> = pool
+            .devices
+            .drain(1..)
+            .map(PartitionView::into_inner)
+            .collect();
         let mut degraded = Pool::open_multi_degraded(survivors).unwrap();
         assert!(matches!(
             degraded.remove_member(1, NOW),
             Err(ScaleFsError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn retire_restores_write_availability() {
+        let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
+        let keep_data: Vec<u8> = (0..48_000usize).map(|i| (i % 251) as u8).collect();
+        let gone_data: Vec<u8> = (0..24_000usize).map(|i| (i * 7 % 251) as u8).collect();
+        let dir = pool.mkdir(ROOT_INODE, "docs", 0o755, NOW).unwrap();
+        let keep = pool.create_file(dir, "keep.bin", 0o644, NOW).unwrap();
+        pool.write(keep, 0, &keep_data, NOW).unwrap();
+        pool.snapshot_create("older", NOW).unwrap();
+        let gone = pool
+            .create_file(ROOT_INODE, "gone.bin", 0o644, NOW)
+            .unwrap();
+        pool.write(gone, 0, &gone_data, NOW).unwrap();
+        pool.snapshot_create("newer", NOW).unwrap();
+        pool.unlink(ROOT_INODE, "gone.bin", NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let survivors: Vec<MemoryBlockDevice> = vec![devices[1].clone(), devices[2].clone()];
+        let mut pool = Pool::open_multi_degraded(survivors).unwrap();
+        assert_eq!(pool.missing_members(), vec![0]);
+        assert!(pool.read_only());
+        assert!(matches!(
+            pool.commit(AllocPurpose::Normal, NOW),
+            Err(ScaleFsError::Unsupported(_))
+        ));
+
+        let report = pool.retire_member(0, NOW).unwrap();
+        assert!(report.records_rebuilt > 0);
+        assert_eq!(report.tx_id, pool.committed_tx());
+        assert!(!pool.read_only());
+        assert!(!pool.is_degraded());
+
+        let docs = pool.lookup(ROOT_INODE, "docs").unwrap();
+        let entry = pool.lookup(docs.inode, "keep.bin").unwrap();
+        assert_eq!(
+            pool.read(entry.inode, 0, keep_data.len()).unwrap(),
+            keep_data
+        );
+        assert!(pool.lookup(ROOT_INODE, "gone.bin").is_err());
+        {
+            let snapshot = pool.snapshot_open("newer").unwrap();
+            let entry = snapshot.lookup(ROOT_INODE, "gone.bin").unwrap();
+            assert_eq!(
+                snapshot.read(entry.inode, 0, gone_data.len()).unwrap(),
+                gone_data
+            );
+        }
+        {
+            let snapshot = pool.snapshot_open("older").unwrap();
+            let docs = snapshot.lookup(ROOT_INODE, "docs").unwrap();
+            let entry = snapshot.lookup(docs.inode, "keep.bin").unwrap();
+            assert_eq!(
+                snapshot.read(entry.inode, 0, keep_data.len()).unwrap(),
+                keep_data
+            );
+        }
+
+        let fresh = pool
+            .create_file(ROOT_INODE, "fresh.bin", 0o644, NOW)
+            .unwrap();
+        pool.write(fresh, 0, b"post-retire bytes", NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        assert!(pool.scrub(false).unwrap().healthy());
+
+        let survivors: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let mut reopened = Pool::open_multi(survivors).unwrap();
+        assert!(!reopened.read_only());
+        let entry = reopened.lookup(ROOT_INODE, "fresh.bin").unwrap();
+        assert_eq!(
+            reopened
+                .read(entry.inode, 0, b"post-retire bytes".len())
+                .unwrap(),
+            b"post-retire bytes".to_vec()
+        );
+        let spec = roomy_members(4).pop().expect("four specs");
+        let added = reopened.add_member(spec, NOW).unwrap();
+        assert_eq!(added, 3, "retired indices are never reused");
+    }
+
+    #[test]
+    fn retire_guards_hold() {
+        let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        assert!(matches!(
+            pool.retire_member(1, NOW),
+            Err(ScaleFsError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            pool.retire_member(9, NOW),
+            Err(ScaleFsError::InvalidArgument(_))
+        ));
+
+        let mut pool = Pool::create_multi(roomy_members(2), mirrored_params()).unwrap();
+        let file = pool.create_file(ROOT_INODE, "f.bin", 0o644, NOW).unwrap();
+        pool.write(file, 0, b"bytes worth keeping", NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let mut degraded = Pool::open_multi_degraded(vec![devices[1].clone()]).unwrap();
+        assert!(matches!(
+            degraded.retire_member(0, NOW),
+            Err(ScaleFsError::InvalidArgument(_))
+        ));
+        assert!(degraded.read_only());
+        assert!(matches!(
+            degraded.commit(AllocPurpose::Normal, NOW),
+            Err(ScaleFsError::Unsupported(_))
+        ));
+        let entry = degraded.lookup(ROOT_INODE, "f.bin").unwrap();
+        assert_eq!(
+            degraded.read(entry.inode, 0, 19).unwrap(),
+            b"bytes worth keeping".to_vec()
+        );
+
+        let mut pool = Pool::create_multi(
+            roomy_members(5),
+            PoolParams {
+                mirror_width: 3,
+                ..pool_params()
+            },
+        )
+        .unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let survivors: Vec<MemoryBlockDevice> = devices[..3].to_vec();
+        let mut degraded = Pool::open_multi_degraded(survivors).unwrap();
+        assert_eq!(degraded.missing_members(), vec![3, 4]);
+        assert!(matches!(
+            degraded.retire_member(3, NOW),
+            Err(ScaleFsError::Unsupported(_))
+        ));
+
+        let mut pool = Pool::create_multi(roomy_members(4), parity_params()).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let survivors: Vec<MemoryBlockDevice> = devices[..3].to_vec();
+        let mut degraded = Pool::open_multi_degraded(survivors).unwrap();
+        assert!(matches!(
+            degraded.retire_member(3, NOW),
+            Err(ScaleFsError::Unsupported(_))
+        ));
+
+        let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let mut pool =
+            Pool::open_multi_degraded(vec![devices[1].clone(), devices[2].clone()]).unwrap();
+        pool.retire_member(0, NOW).unwrap();
+        assert!(matches!(
+            pool.retire_member(0, NOW),
+            Err(ScaleFsError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn reclaim_after_retire_without_reopen() {
+        let mut pool = Pool::create_multi(roomy_members(4), mirrored_params()).unwrap();
+        for i in 0..5 {
+            let data: Vec<u8> = (0..24_000usize).map(|b| ((b + i) % 251) as u8).collect();
+            let file = pool
+                .create_file(ROOT_INODE, &format!("f{i}.bin"), 0o644, NOW)
+                .unwrap();
+            pool.write(file, 0, &data, NOW).unwrap();
+            pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        }
+        pool.snapshot_create("pin", NOW).unwrap();
+
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let survivors: Vec<MemoryBlockDevice> = devices
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 2)
+            .map(|(_, device)| device.clone())
+            .collect();
+        let mut pool = Pool::open_multi_degraded(survivors).unwrap();
+        pool.retire_member(2, NOW).unwrap();
+        pool.reclaim(NOW).unwrap();
+        assert!(pool.scrub(false).unwrap().healthy());
+        for i in 0..5 {
+            let data: Vec<u8> = (0..24_000usize).map(|b| ((b + i) % 251) as u8).collect();
+            let entry = pool.lookup(ROOT_INODE, &format!("f{i}.bin")).unwrap();
+            assert_eq!(pool.read(entry.inode, 0, data.len()).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn retire_crash_states_recover_to_old_or_new() {
+        let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
+        let data: Vec<u8> = (0..48_000usize).map(|i| (i * 11 % 251) as u8).collect();
+        let file = pool
+            .create_file(ROOT_INODE, "keep.bin", 0o644, NOW)
+            .unwrap();
+        pool.write(file, 0, &data, NOW).unwrap();
+        pool.snapshot_create("pin", NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+
+        let survivors: Vec<MemoryBlockDevice> = vec![
+            pool.devices[1].inner().clone(),
+            pool.devices[2].inner().clone(),
+        ];
+        let bases: Vec<Vec<u8>> = survivors
+            .iter()
+            .map(|device| device.bytes().to_vec())
+            .collect();
+
+        let sequence: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+        let recorders: Vec<RecordingBlockDevice<MemoryBlockDevice>> = survivors
+            .into_iter()
+            .map(|device| {
+                RecordingBlockDevice::with_shared_sequence(device, std::sync::Arc::clone(&sequence))
+            })
+            .collect();
+        let mut recorded = Pool::open_multi_degraded(recorders).unwrap();
+        recorded.retire_member(0, NOW).unwrap();
+        let mut schedule: Vec<(u64, usize, Op)> = Vec::new();
+        for (member, device) in recorded.devices.iter().enumerate() {
+            for (seq, op) in device.inner().sequenced_ops() {
+                schedule.push((seq, member, op.clone()));
+            }
+        }
+        schedule.sort_by_key(|(seq, _, _)| *seq);
+
+        for prefix in 0..=schedule.len() {
+            let torture: Vec<TortureBlockDevice> = bases
+                .iter()
+                .map(|base| TortureBlockDevice::from_image(base.clone(), 4096))
+                .collect();
+            for (_, member, op) in &schedule[..prefix] {
+                match op {
+                    Op::Write { offset, data } => torture[*member].write_at(*offset, data).unwrap(),
+                    Op::Flush => torture[*member].flush().unwrap(),
+                }
+            }
+            for seed in 0..3u64 {
+                let images: Vec<MemoryBlockDevice> = torture
+                    .iter()
+                    .map(|device| {
+                        device.crash_image(seed.wrapping_mul(37).wrapping_add(prefix as u64))
+                    })
+                    .collect();
+                match Pool::open_multi(images.clone()) {
+                    Ok(mut whole) => {
+                        assert!(
+                            !whole.read_only(),
+                            "prefix {prefix} seed {seed}: new world must be writable"
+                        );
+                        let entry = whole.lookup(ROOT_INODE, "keep.bin").unwrap();
+                        assert_eq!(whole.read(entry.inode, 0, data.len()).unwrap(), data);
+                        {
+                            let snapshot = whole.snapshot_open("pin").unwrap();
+                            let entry = snapshot.lookup(ROOT_INODE, "keep.bin").unwrap();
+                            assert_eq!(snapshot.read(entry.inode, 0, data.len()).unwrap(), data);
+                        }
+                        assert!(whole.scrub(false).unwrap().healthy());
+                    }
+                    Err(ScaleFsError::MissingMembers { .. }) => {
+                        let mut degraded = Pool::open_multi_degraded(images).unwrap();
+                        assert!(degraded.read_only());
+                        let entry = degraded.lookup(ROOT_INODE, "keep.bin").unwrap();
+                        assert_eq!(degraded.read(entry.inode, 0, data.len()).unwrap(), data);
+                        degraded.retire_member(0, NOW).unwrap();
+                        assert!(!degraded.read_only());
+                        let entry = degraded.lookup(ROOT_INODE, "keep.bin").unwrap();
+                        assert_eq!(degraded.read(entry.inode, 0, data.len()).unwrap(), data);
+                        assert!(degraded.scrub(false).unwrap().healthy());
+                    }
+                    Err(err) => {
+                        panic!("crash state at prefix {prefix} seed {seed} failed to import: {err}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retired_drive_returns_as_stale_extra() {
+        let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
+        let data: Vec<u8> = (0..36_000usize).map(|i| (i * 3 % 251) as u8).collect();
+        let file = pool
+            .create_file(ROOT_INODE, "keep.bin", 0o644, NOW)
+            .unwrap();
+        pool.write(file, 0, &data, NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+
+        let stale = pool.devices[0].inner().clone();
+        let survivors: Vec<MemoryBlockDevice> = vec![
+            pool.devices[1].inner().clone(),
+            pool.devices[2].inner().clone(),
+        ];
+        let mut pool = Pool::open_multi_degraded(survivors).unwrap();
+        pool.retire_member(0, NOW).unwrap();
+        let fresh = pool
+            .create_file(ROOT_INODE, "fresh.bin", 0o644, NOW)
+            .unwrap();
+        pool.write(fresh, 0, b"after retirement", NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let survivors: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+
+        let all = vec![survivors[0].clone(), survivors[1].clone(), stale];
+        match Pool::open_multi(all) {
+            Ok(reopened) => {
+                assert!(!reopened.is_degraded());
+                assert!(!reopened.read_only());
+                assert_eq!(reopened.devices.len(), 2, "the stale drive is not adopted");
+                let entry = reopened.lookup(ROOT_INODE, "fresh.bin").unwrap();
+                assert_eq!(
+                    reopened
+                        .read(entry.inode, 0, b"after retirement".len())
+                        .unwrap(),
+                    b"after retirement".to_vec()
+                );
+            }
+            Err(_) => {
+                let reopened = Pool::open_multi(survivors).unwrap();
+                let entry = reopened.lookup(ROOT_INODE, "fresh.bin").unwrap();
+                assert_eq!(
+                    reopened
+                        .read(entry.inode, 0, b"after retirement".len())
+                        .unwrap(),
+                    b"after retirement".to_vec()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retire_refuses_for_space() {
+        let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
+        let data: Vec<u8> = (0..24_000usize).map(|i| (i % 251) as u8).collect();
+        let mut written = Vec::new();
+        for i in 0..1000 {
+            let name = format!("f{i}.bin");
+            let Ok(file) = pool.create_file(ROOT_INODE, &name, 0o644, NOW) else {
+                break;
+            };
+            if pool.write(file, 0, &data, NOW).is_err() {
+                break;
+            }
+            if pool.commit(AllocPurpose::Normal, NOW).is_err() {
+                break;
+            }
+            written.push(name);
+        }
+        assert!(written.len() >= 3, "fixture: the pool actually filled");
+
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
+        let mut pool =
+            Pool::open_multi_degraded(vec![devices[1].clone(), devices[2].clone()]).unwrap();
+        assert!(matches!(
+            pool.retire_member(0, NOW),
+            Err(ScaleFsError::OutOfSpace)
+        ));
+        assert!(pool.read_only());
+        let entry = pool.lookup(ROOT_INODE, &written[0]).unwrap();
+        assert_eq!(pool.read(entry.inode, 0, data.len()).unwrap(), data);
     }
 
     #[test]
@@ -8015,7 +9296,11 @@ mod tests {
         pool.write(file, 0, b"consistent", NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let tx = pool.committed_tx();
-        let devices = pool.devices;
+        let devices: Vec<_> = pool
+            .devices
+            .into_iter()
+            .map(PartitionView::into_inner)
+            .collect();
 
         let mut left =
             Pool::open_multi_degraded(vec![devices[0].clone(), devices[1].clone()]).unwrap();
@@ -8059,7 +9344,13 @@ mod tests {
         assert_eq!(pool.read(second, 0, data.len()).unwrap(), data);
         assert!(pool.scrub(false).unwrap().healthy());
 
-        let reopened = Pool::open_multi(pool.devices).unwrap();
+        let reopened = Pool::open_multi(
+            pool.devices
+                .into_iter()
+                .map(PartitionView::into_inner)
+                .collect(),
+        )
+        .unwrap();
         let entry = reopened.lookup(ROOT_INODE, "second.bin").unwrap();
         assert_eq!(reopened.read(entry.inode, 0, data.len()).unwrap(), data);
     }
@@ -8070,7 +9361,11 @@ mod tests {
         let file = pool.create_file(ROOT_INODE, "f.bin", 0o644, NOW).unwrap();
         pool.write(file, 0, b"data", NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let survivors: Vec<MemoryBlockDevice> = pool.devices.drain(1..).collect();
+        let survivors: Vec<MemoryBlockDevice> = pool
+            .devices
+            .drain(1..)
+            .map(PartitionView::into_inner)
+            .collect();
         let mut degraded = Pool::open_multi_degraded(survivors).unwrap();
         assert!(matches!(
             degraded.write(file, 0, b"nope", NOW),
@@ -8091,7 +9386,11 @@ mod tests {
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let tx = pool.committed_tx();
 
-        let survivors: Vec<MemoryBlockDevice> = pool.devices.drain(..2).collect();
+        let survivors: Vec<MemoryBlockDevice> = pool
+            .devices
+            .drain(..2)
+            .map(PartitionView::into_inner)
+            .collect();
         let mut degraded = Pool::open_multi_degraded(survivors).unwrap();
         assert_eq!(degraded.missing_members(), vec![2, 3]);
 
@@ -8101,7 +9400,9 @@ mod tests {
             .replace_member(
                 2,
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
                     device_id: DeviceId([0x99; 16]),
                     geometry,
                 },
@@ -8119,7 +9420,9 @@ mod tests {
             .replace_member(
                 3,
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
                     device_id: DeviceId([0x9A; 16]),
                     geometry,
                 },
@@ -8138,7 +9441,9 @@ mod tests {
             pool.replace_member(
                 0,
                 MemberSpec {
-                    device: MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes()
+                    ) as usize),
                     device_id: DeviceId([0x9B; 16]),
                     geometry,
                 },
@@ -8173,37 +9478,40 @@ mod tests {
         device
     }
 
-    fn assert_tables_dead(device: &MemoryBlockDevice, len: usize) {
-        let mut bytes = vec![0u8; 512];
-        device.read_at(446, &mut bytes[..66]).unwrap();
-        assert!(
-            bytes[..66].iter().all(|&byte| byte == 0),
-            "MBR entries or signature survived"
+    fn assert_member_wrapper(device: &MemoryBlockDevice, pool_id: [u8; 16], device_id: [u8; 16]) {
+        let partition = crate::gpt::find_member_partition(device)
+            .unwrap()
+            .expect("provisioning writes the member GPT");
+        assert_eq!(partition.start, crate::gpt::MEMBER_PARTITION_START);
+        assert_eq!(
+            partition.disk_guid, pool_id,
+            "disk GUID carries the pool id"
         );
-        for (name, offset) in [
-            ("GPT at 512", 512u64),
-            ("GPT at 4096", 4096),
-            ("backup GPT", len as u64 - 512),
-        ] {
-            device.read_at(offset, &mut bytes[..8]).unwrap();
-            assert!(
-                bytes[..8].iter().all(|&byte| byte == 0),
-                "{name} survived member provisioning"
-            );
-        }
+        assert_eq!(
+            partition.part_guid, device_id,
+            "partition GUID carries the device id"
+        );
+        let mut entries = vec![0u8; 64];
+        device.read_at(446, &mut entries).unwrap();
+        assert_eq!(entries[4], 0xEE, "protective MBR replaced the old table");
+        assert!(
+            entries[16..].iter().all(|&byte| byte == 0),
+            "old MBR entries survived member provisioning"
+        );
     }
 
     #[test]
-    fn member_provisioning_blanks_old_partition_tables() {
+    fn member_provisioning_replaces_old_partition_tables() {
         let len = device_len();
         let pool = Pool::create(partitioned_device(len), params()).unwrap();
-        assert_tables_dead(&pool.devices[0], len);
+        assert_member_wrapper(pool.devices[0].inner(), [0x11; 16], [0x22; 16]);
         assert_eq!(pool.superblock().label, "tank");
 
         let mut pool = Pool::create_multi(roomy_members(2), mirrored_params()).unwrap();
+        let pool_id = pool.superblock().pool_id.0;
         let mut geometry = geometry();
         geometry.zone_count = 16;
-        let dirty_len = geometry.capacity_bytes() as usize;
+        let dirty_len = crate::gpt::member_image_len(geometry.capacity_bytes()) as usize;
         pool.add_member(
             MemberSpec {
                 device: partitioned_device(dirty_len),
@@ -8213,10 +9521,14 @@ mod tests {
             NOW,
         )
         .unwrap();
-        assert_tables_dead(pool.devices.last().unwrap(), dirty_len);
+        assert_member_wrapper(pool.devices.last().unwrap().inner(), pool_id, [0x77; 16]);
 
         let pool3 = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
-        let survivors: Vec<MemoryBlockDevice> = pool3.devices[..2].to_vec();
+        let pool_id = pool3.superblock().pool_id.0;
+        let survivors: Vec<MemoryBlockDevice> = pool3.devices[..2]
+            .iter()
+            .map(|view| view.inner().clone())
+            .collect();
         let mut pool = Pool::open_multi_degraded(survivors).unwrap();
         pool.replace_member(
             2,
@@ -8228,6 +9540,6 @@ mod tests {
             NOW,
         )
         .unwrap();
-        assert_tables_dead(pool.devices.last().unwrap(), dirty_len);
+        assert_member_wrapper(pool.devices.last().unwrap().inner(), pool_id, [0x78; 16]);
     }
 }

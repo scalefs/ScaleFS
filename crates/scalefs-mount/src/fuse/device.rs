@@ -1,8 +1,9 @@
-
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[allow(unsafe_code)]
 mod ffi {
@@ -46,6 +47,9 @@ const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 const O_NONBLOCK: i32 = 0o4000;
 const POLLIN: i16 = 0x1;
+const EBUSY: i32 = 16;
+const ENOTCONN: i32 = 107;
+const STOP_POLL_MS: i32 = 500;
 
 pub const REQUEST_BUFFER: usize = (1 << 20) + 4096;
 
@@ -72,6 +76,7 @@ pub struct FuseMount {
     device: File,
     mountpoint: PathBuf,
     detached: bool,
+    stop: Arc<AtomicBool>,
 }
 
 impl FuseMount {
@@ -108,7 +113,16 @@ impl FuseMount {
             device,
             mountpoint: mountpoint.to_path_buf(),
             detached: false,
+            stop: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
     }
 
     pub fn read_request(&self, buffer: &mut [u8]) -> std::io::Result<Option<usize>> {
@@ -117,6 +131,7 @@ impl FuseMount {
                 Ok(len) => return Ok(Some(len)),
                 Err(error) => match error.raw_os_error() {
                     Some(4) => continue,
+                    Some(2) => continue,
                     Some(19) => return Ok(None),
                     _ => return Err(error),
                 },
@@ -125,10 +140,15 @@ impl FuseMount {
     }
 
     pub fn write_reply(&self, frame: &[u8]) -> std::io::Result<()> {
-        match (&self.device).write(frame) {
-            Ok(_) => Ok(()),
-            Err(error) if matches!(error.raw_os_error(), Some(2) | Some(19)) => Ok(()),
-            Err(error) => Err(error),
+        loop {
+            match (&self.device).write(frame) {
+                Ok(_) => return Ok(()),
+                Err(error) if matches!(error.raw_os_error(), Some(2) | Some(19)) => {
+                    return Ok(());
+                }
+                Err(error) if error.raw_os_error() == Some(4) => continue,
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -155,7 +175,7 @@ impl FuseMount {
         };
         loop {
             #[allow(unsafe_code)]
-            let rc = unsafe { ffi::poll(&mut pollfd, 1, -1) };
+            let rc = unsafe { ffi::poll(&mut pollfd, 1, STOP_POLL_MS) };
             if rc >= 0 {
                 return Ok(());
             }
@@ -172,6 +192,7 @@ impl FuseMount {
                 Ok(len) => return Ok(RequestRead::Ready(len)),
                 Err(error) => match error.raw_os_error() {
                     Some(4) => continue,
+                    Some(2) => continue,
                     Some(11) => return Ok(RequestRead::NotReady),
                     Some(19) => return Ok(RequestRead::Unmounted),
                     _ => return Err(error),
@@ -206,6 +227,30 @@ pub fn detach_mountpoint(mountpoint: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+pub fn unmount_mountpoint(mountpoint: &Path) -> std::io::Result<()> {
+    let target = c_string(&mountpoint.to_string_lossy())?;
+    #[allow(unsafe_code)]
+    let rc = unsafe { ffi::umount2(target.as_ptr().cast(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn is_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(EBUSY)
+}
+
+pub fn clear_stale_mount(mountpoint: &Path) -> bool {
+    match std::fs::metadata(mountpoint) {
+        Err(error) if error.raw_os_error() == Some(ENOTCONN) => {
+            let _ = detach_mountpoint(mountpoint);
+            true
+        }
+        _ => false,
+    }
 }
 
 impl Drop for FuseMount {

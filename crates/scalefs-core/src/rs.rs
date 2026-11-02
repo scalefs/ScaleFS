@@ -1,4 +1,3 @@
-
 use crate::error::{Result, ScaleFsError};
 
 pub const MAX_PARITY: usize = 3;

@@ -1,0 +1,5 @@
+# The vendored UCD extracts are byte-for-byte upstream; never convert their
+# line endings, so they stay diffable against unicode.org on every platform.
+UnicodeData-17.0.0.txt -text
+CaseFolding-17.0.0.txt -text
+NormalizationTest-17.0.0.txt -text

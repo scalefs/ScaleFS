@@ -1,4 +1,3 @@
-
 use crate::device::BlockDevice;
 #[cfg(windows)]
 use crate::error::ScaleFsError;
@@ -11,6 +10,29 @@ use std::path::Path;
 pub struct DeviceIdentity {
     pub serial: Option<String>,
     pub model: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeviceAttachment {
+    External,
+    Internal,
+    #[default]
+    Unknown,
+}
+
+pub fn classify_attachment(
+    bus_type: u32,
+    device_hotplug: bool,
+    removable_media: bool,
+) -> DeviceAttachment {
+    if device_hotplug || removable_media {
+        return DeviceAttachment::External;
+    }
+    match bus_type {
+        7 | 4 | 12 | 13 | 19 => DeviceAttachment::External,
+        1 | 2 | 3 | 6 | 8 | 9 | 10 | 11 | 16 | 17 | 18 => DeviceAttachment::Internal,
+        _ => DeviceAttachment::Unknown,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,64 +188,130 @@ fn probed(path: String, device: &RawBlockDevice) -> DiscoveredDevice {
 }
 
 fn classify<D: BlockDevice>(device: &D) -> (Contents, Option<String>) {
-    let mut samples: Vec<Vec<u8>> = Vec::new();
-    for (index, offset) in superblock_slots(device.len()).into_iter().enumerate() {
-        let want = if index == 0 { 4104 } else { 4096 };
-        let available = device.len().saturating_sub(offset).min(want);
-        if available == 0 {
-            continue;
-        }
-        let mut bytes = vec![0u8; available as usize];
-        if let Err(error) = device.read_at(offset, &mut bytes) {
+    let partition = match crate::gpt::find_member_partition(device) {
+        Ok(partition) => partition,
+        Err(crate::error::ScaleFsError::Io(error)) => {
             return (Contents::Unreadable, Some(error.to_string()));
         }
-        samples.push(bytes);
-    }
-    for bytes in &samples {
-        if let Ok(superblock) = decode_superblock(bytes) {
+        Err(error) => return (Contents::Partitioned, Some(error.to_string())),
+    };
+    if let Some(partition) = partition {
+        let view = match crate::device::PartitionView::new(device, partition.start, partition.len) {
+            Ok(view) => view,
+            Err(error) => return (Contents::Partitioned, Some(error.to_string())),
+        };
+        let mut freshest: Option<PoolProbe> = None;
+        for offset in superblock_slots(view.len()) {
+            let available = view.len().saturating_sub(offset).min(4096);
+            if available == 0 {
+                continue;
+            }
+            let mut bytes = vec![0u8; available as usize];
+            if let Err(error) = view.read_at(offset, &mut bytes) {
+                return (Contents::Unreadable, Some(error.to_string()));
+            }
+            let Ok(superblock) = decode_superblock(&bytes) else {
+                continue;
+            };
             let tx = superblock
                 .newest_commit
                 .filter(|extent| extent.length <= 64 * 1024)
                 .and_then(|extent| {
                     let mut bytes = vec![0u8; extent.length as usize];
-                    device.read_at(extent.offset, &mut bytes).ok()?;
+                    view.read_at(extent.offset, &mut bytes).ok()?;
                     crate::records::decode_commit(&bytes).ok()
                 })
                 .map_or(0, |commit| commit.tx_id);
-            return (
-                Contents::Pool(PoolProbe {
-                    pool_id: superblock.pool_id,
-                    device_id: superblock.device_id,
-                    label: superblock.label.clone(),
-                    topology_generation: superblock.topology_generation,
-                    tx,
-                    unknown_incompat: superblock.unknown_incompat() != 0,
-                }),
-                None,
-            );
+            let probe = PoolProbe {
+                pool_id: superblock.pool_id,
+                device_id: superblock.device_id,
+                label: superblock.label.clone(),
+                topology_generation: superblock.topology_generation,
+                tx,
+                unknown_incompat: superblock.unknown_incompat() != 0,
+            };
+            if freshest.as_ref().is_none_or(|best| {
+                (probe.topology_generation, probe.tx) > (best.topology_generation, best.tx)
+            }) {
+                freshest = Some(probe);
+            }
         }
+        if let Some(probe) = freshest {
+            return (Contents::Pool(probe), None);
+        }
+        return (
+            Contents::Partitioned,
+            Some("a ScaleFS-typed partition with no readable superblock".to_string()),
+        );
     }
-    if let Some(head) = samples.first() {
-        let mbr = head.len() >= 512 && head[510] == 0x55 && head[511] == 0xAA;
-        let gpt_512 = head.len() >= 520 && &head[512..520] == b"EFI PART";
-        let gpt_4096 = head.len() >= 4104 && &head[4096..4104] == b"EFI PART";
-        if mbr || gpt_512 || gpt_4096 {
-            return (Contents::Partitioned, None);
-        }
-        if samples
-            .iter()
-            .all(|bytes| bytes.iter().all(|&byte| byte == 0))
-        {
-            return (Contents::Blank, None);
-        }
-    }
-    if samples.is_empty() {
+
+    let len = device.len();
+    if len == 0 {
         return (
             Contents::Unreadable,
             Some("the device is empty".to_string()),
         );
     }
+    let mut head = vec![0u8; len.min(BLANK_SAMPLE_LEN) as usize];
+    if let Err(error) = device.read_at(0, &mut head) {
+        return (Contents::Unreadable, Some(error.to_string()));
+    }
+    let tail_start = len.saturating_sub(BLANK_SAMPLE_LEN).max(head.len() as u64);
+    let mut tail = vec![0u8; (len - tail_start) as usize];
+    if !tail.is_empty()
+        && let Err(error) = device.read_at(tail_start, &mut tail)
+    {
+        return (Contents::Unreadable, Some(error.to_string()));
+    }
+    let mbr = head.len() >= 512 && head[510] == 0x55 && head[511] == 0xAA;
+    let gpt_512 = head.len() >= 520 && &head[512..520] == b"EFI PART";
+    let gpt_4096 = head.len() >= 4104 && &head[4096..4104] == b"EFI PART";
+    if mbr || gpt_512 || gpt_4096 {
+        return (Contents::Partitioned, None);
+    }
+    if let Some(what) = foreign_signature(&head) {
+        return (Contents::Foreign, Some(what.to_string()));
+    }
+    if head.iter().chain(tail.iter()).all(|&byte| byte == 0) {
+        return (Contents::Blank, None);
+    }
     (Contents::Foreign, None)
+}
+
+pub const BLANK_SAMPLE_LEN: u64 = 1 << 20;
+
+fn foreign_signature(head: &[u8]) -> Option<&'static str> {
+    const SIGNATURES: &[(usize, &[u8], &str)] = &[
+        (0x10040, b"_BHRfS_M", "a Btrfs filesystem"),
+        (0, b"XFSB", "an XFS filesystem"),
+        (1080, &[0x53, 0xEF], "an ext2/3/4 filesystem"),
+        (1024, &[0x10, 0x20, 0xF5, 0xF2], "an F2FS filesystem"),
+        (0, b"LUKS\xba\xbe", "a LUKS encrypted volume"),
+        (512, b"LABELONE", "an LVM physical volume"),
+        (0, &[0xFC, 0x4E, 0x2B, 0xA9], "a Linux RAID (mdadm) member"),
+        (
+            4096,
+            &[0xFC, 0x4E, 0x2B, 0xA9],
+            "a Linux RAID (mdadm) member",
+        ),
+        (
+            0x20000,
+            &[0x0C, 0xB1, 0xBA, 0x00, 0, 0, 0, 0],
+            "a ZFS pool member",
+        ),
+        (
+            0x20000,
+            &[0, 0, 0, 0, 0x00, 0xBA, 0xB1, 0x0C],
+            "a ZFS pool member",
+        ),
+        (4086, b"SWAPSPACE2", "a Linux swap area"),
+        (32, b"NXSB", "an APFS container"),
+        (32769, b"CD001", "an ISO 9660 image"),
+    ];
+    SIGNATURES
+        .iter()
+        .find(|(offset, magic, _)| head.get(*offset..offset + magic.len()) == Some(*magic))
+        .map(|(_, _, what)| *what)
 }
 
 pub fn plan_import(
@@ -483,6 +571,199 @@ pub(crate) fn identity_of(_file: &std::fs::File, _path: &Path) -> DeviceIdentity
     DeviceIdentity::default()
 }
 
+pub fn attachment_of_path(path: &Path) -> DeviceAttachment {
+    attachment_of(path)
+}
+
+#[cfg(windows)]
+const IOCTL_STORAGE_GET_HOTPLUG_INFO: u32 = 0x002D_0C14;
+#[cfg(windows)]
+const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
+#[cfg(windows)]
+const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 1;
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 2;
+#[cfg(windows)]
+const FILE_SHARE_DELETE: u32 = 4;
+#[cfg(windows)]
+const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+
+#[cfg(windows)]
+fn attachment_of(path: &Path) -> DeviceAttachment {
+    if crate::raw::is_device_path(path) {
+        device_attachment(path)
+    } else {
+        file_host_attachment(path)
+    }
+}
+
+#[cfg(windows)]
+fn device_attachment(path: &Path) -> DeviceAttachment {
+    use std::os::windows::fs::OpenOptionsExt;
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    for access in [0u32, FILE_READ_ATTRIBUTES] {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .access_mode(access)
+            .share_mode(share)
+            .open(path)
+        else {
+            continue;
+        };
+        let query = [0u8; 12];
+        let mut descriptor = [0u8; 4096];
+        if crate::raw::device_io(
+            &file,
+            crate::raw::IOCTL_STORAGE_QUERY_PROPERTY,
+            &query,
+            &mut descriptor,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let (bus, removable) = descriptor_attachment_fields(&descriptor);
+        let mut hotplug = [0u8; 8];
+        let device_hotplug =
+            crate::raw::device_io(&file, IOCTL_STORAGE_GET_HOTPLUG_INFO, &[], &mut hotplug).is_ok()
+                && hotplug_is_device_hotplug(&hotplug);
+        return classify_attachment(bus, device_hotplug, removable);
+    }
+    DeviceAttachment::Unknown
+}
+
+#[cfg(windows)]
+fn file_host_attachment(path: &Path) -> DeviceAttachment {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(mount) = crate::raw::volume_path_name(path) else {
+        return DeviceAttachment::Unknown;
+    };
+    let Some(volume_guid) = crate::raw::volume_guid_name(&mount) else {
+        return DeviceAttachment::Unknown;
+    };
+    let volume = volume_guid.trim_end_matches('\\').to_string();
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let Ok(handle) = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(share)
+        .open(&volume)
+    else {
+        return DeviceAttachment::Unknown;
+    };
+    let mut number = [0u8; 12];
+    if crate::raw::device_io(&handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut number).is_ok()
+        && let Some((_, disk, _)) = parse_storage_device_number(&number)
+    {
+        return device_attachment(Path::new(&format!(r"\\.\PhysicalDrive{disk}")));
+    }
+    let mut extents = vec![0u8; 4096];
+    if crate::raw::device_io(
+        &handle,
+        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+        &[],
+        &mut extents,
+    )
+    .is_err()
+    {
+        return DeviceAttachment::Unknown;
+    }
+    let Some(disks) = parse_volume_disk_extents(&extents) else {
+        return DeviceAttachment::Unknown;
+    };
+    if disks.is_empty() {
+        return DeviceAttachment::Unknown;
+    }
+    let mut rollup = DeviceAttachment::External;
+    for disk in disks {
+        match device_attachment(Path::new(&format!(r"\\.\PhysicalDrive{disk}"))) {
+            DeviceAttachment::Internal => return DeviceAttachment::Internal,
+            DeviceAttachment::Unknown => rollup = DeviceAttachment::Unknown,
+            DeviceAttachment::External => {}
+        }
+    }
+    rollup
+}
+
+#[cfg(target_os = "linux")]
+fn attachment_of(path: &Path) -> DeviceAttachment {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return DeviceAttachment::Unknown;
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_block_device() {
+        let (major, minor) = split_dev(metadata.rdev());
+        sysfs_attachment("/sys", major, minor)
+    } else if file_type.is_file() {
+        let (major, minor) = split_dev(metadata.dev());
+        sysfs_attachment("/sys", major, minor)
+    } else {
+        DeviceAttachment::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sysfs_attachment(root: &str, major: u32, minor: u32) -> DeviceAttachment {
+    let node = std::path::PathBuf::from(format!("{root}/dev/block/{major}:{minor}"));
+    let canonical = std::fs::canonicalize(&node).unwrap_or(node);
+    let backing_file = canonical.join("loop/backing_file");
+    if let Some(backing) = read_sysfs(&backing_file.to_string_lossy()) {
+        use std::os::unix::fs::MetadataExt;
+        return match std::fs::metadata(&backing) {
+            Ok(meta) => {
+                let (major, minor) = split_dev(meta.dev());
+                sysfs_transport(root, major, minor)
+            }
+            Err(_) => DeviceAttachment::Unknown,
+        };
+    }
+    sysfs_transport_at(&canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn sysfs_transport(root: &str, major: u32, minor: u32) -> DeviceAttachment {
+    let node = std::path::PathBuf::from(format!("{root}/dev/block/{major}:{minor}"));
+    let canonical = std::fs::canonicalize(&node).unwrap_or(node);
+    sysfs_transport_at(&canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn sysfs_transport_at(canonical: &Path) -> DeviceAttachment {
+    let disk = if canonical.join("partition").exists() {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canonical.to_path_buf())
+    } else {
+        canonical.to_path_buf()
+    };
+    if read_sysfs(&disk.join("removable").to_string_lossy()).as_deref() == Some("1") {
+        return DeviceAttachment::External;
+    }
+    let text = disk.to_string_lossy();
+    if path_has_segment(&text, "usb") {
+        return DeviceAttachment::External;
+    }
+    if ["nvme", "ata", "sas", "scsi", "target", "virtio"]
+        .iter()
+        .any(|marker| path_has_segment(&text, marker))
+    {
+        return DeviceAttachment::Internal;
+    }
+    DeviceAttachment::Unknown
+}
+
+#[cfg(target_os = "linux")]
+fn path_has_segment(path: &str, prefix: &str) -> bool {
+    path.split('/').any(|segment| segment.starts_with(prefix))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn attachment_of(_path: &Path) -> DeviceAttachment {
+    DeviceAttachment::Unknown
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn identity_from_sysfs(base: &str) -> DeviceIdentity {
     let base = if Path::new(&format!("{base}/partition")).exists() {
@@ -556,6 +837,21 @@ fn parse_storage_device_descriptor(bytes: &[u8]) -> DeviceIdentity {
         (vendor, product) => vendor.or(product),
     };
     DeviceIdentity { serial, model }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn descriptor_attachment_fields(bytes: &[u8]) -> (u32, bool) {
+    let bus = bytes
+        .get(28..32)
+        .map(|field| u32::from_le_bytes(field.try_into().expect("fixed slice")))
+        .unwrap_or(0);
+    let removable = bytes.get(10).is_some_and(|&byte| byte != 0);
+    (bus, removable)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn hotplug_is_device_hotplug(bytes: &[u8]) -> bool {
+    bytes.get(6).is_some_and(|&byte| byte != 0)
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -638,7 +934,11 @@ mod tests {
 
         let solo = dir.join("solo.img");
         Pool::create(
-            crate::device::FileBlockDevice::create(&solo, geometry.capacity_bytes()).unwrap(),
+            crate::device::FileBlockDevice::create(
+                &solo,
+                crate::gpt::member_image_len(geometry.capacity_bytes()),
+            )
+            .unwrap(),
             CreateParams {
                 geometry,
                 pool_id: PoolId([0xAB; 16]),
@@ -657,8 +957,11 @@ mod tests {
             [(&mirror_a, 0x11u8), (&mirror_b, 0x12u8)]
                 .iter()
                 .map(|(path, id)| MemberSpec {
-                    device: crate::device::FileBlockDevice::create(path, geometry.capacity_bytes())
-                        .unwrap(),
+                    device: crate::device::FileBlockDevice::create(
+                        path,
+                        crate::gpt::member_image_len(geometry.capacity_bytes()),
+                    )
+                    .unwrap(),
                     device_id: DeviceId([*id; 16]),
                     geometry,
                 })
@@ -686,7 +989,10 @@ mod tests {
             }
             other => panic!("expected a pool, got {other:?}"),
         }
-        assert_eq!(solo_probe.size, Some(geometry.capacity_bytes()));
+        assert_eq!(
+            solo_probe.size,
+            Some(crate::gpt::member_image_len(geometry.capacity_bytes()))
+        );
 
         for (path, device_id) in [(&mirror_a, 0x11u8), (&mirror_b, 0x12)] {
             match &probe_path(path).contents {
@@ -724,6 +1030,55 @@ mod tests {
         let junk = dir.join("junk.img");
         std::fs::write(&junk, vec![0x5Au8; 1 << 20]).unwrap();
         assert!(matches!(probe_path(&junk).contents, Contents::Foreign));
+
+        let btrfs = dir.join("btrfs.img");
+        let mut bytes = vec![0u8; 4 << 20];
+        bytes[0x10040..0x10048].copy_from_slice(b"_BHRfS_M");
+        std::fs::write(&btrfs, &bytes).unwrap();
+        let btrfs_probe = probe_path(&btrfs);
+        assert!(
+            matches!(btrfs_probe.contents, Contents::Foreign),
+            "{btrfs_probe:?}"
+        );
+        assert!(
+            btrfs_probe
+                .error
+                .as_deref()
+                .is_some_and(|what| what.contains("Btrfs")),
+            "{btrfs_probe:?}"
+        );
+
+        let zfs = dir.join("zfs.img");
+        let mut bytes = vec![0u8; 4 << 20];
+        bytes[0x20000..0x20004].copy_from_slice(&[0x0C, 0xB1, 0xBA, 0x00]);
+        std::fs::write(&zfs, &bytes).unwrap();
+        let zfs_probe = probe_path(&zfs);
+        assert!(
+            zfs_probe
+                .error
+                .as_deref()
+                .is_some_and(|what| what.contains("ZFS")),
+            "{zfs_probe:?}"
+        );
+
+        for (name, at) in [
+            ("late-head.img", 700 * 1024),
+            ("late-tail.img", (4 << 20) - 300 * 1024),
+        ] {
+            let path = dir.join(name);
+            let mut bytes = vec![0u8; 4 << 20];
+            bytes[at] = 1;
+            std::fs::write(&path, &bytes).unwrap();
+            let probe = probe_path(&path);
+            assert!(
+                matches!(probe.contents, Contents::Foreign) && probe.error.is_none(),
+                "{name}: {probe:?}"
+            );
+        }
+
+        let big_blank = dir.join("big-blank.img");
+        std::fs::write(&big_blank, vec![0u8; 4 << 20]).unwrap();
+        assert!(matches!(probe_path(&big_blank).contents, Contents::Blank));
 
         let tiny = dir.join("tiny.img");
         std::fs::write(&tiny, vec![0x5Au8; 100]).unwrap();
@@ -914,5 +1269,140 @@ mod tests {
                 assert!(device.error.is_some(), "{}", device.path);
             }
         }
+    }
+
+    #[test]
+    fn attachment_classifier_covers_every_bus() {
+        use DeviceAttachment::*;
+        for bus in [7u32, 4, 12, 13, 19] {
+            assert_eq!(
+                classify_attachment(bus, false, false),
+                External,
+                "bus {bus}"
+            );
+        }
+        for bus in [1u32, 2, 3, 6, 8, 9, 10, 11, 16, 17, 18] {
+            assert_eq!(
+                classify_attachment(bus, false, false),
+                Internal,
+                "bus {bus}"
+            );
+        }
+        for bus in [0u32, 14, 15, 999] {
+            assert_eq!(classify_attachment(bus, false, false), Unknown, "bus {bus}");
+        }
+        assert_eq!(classify_attachment(11, true, false), External, "hotplug");
+        assert_eq!(classify_attachment(11, false, true), External, "removable");
+        assert_eq!(classify_attachment(7, true, true), External);
+    }
+
+    #[test]
+    fn attachment_fields_are_bounds_safe() {
+        use DeviceAttachment::*;
+        let mut descriptor = vec![0u8; 64];
+        descriptor[28..32].copy_from_slice(&7u32.to_le_bytes());
+        descriptor[10] = 1;
+        assert_eq!(descriptor_attachment_fields(&descriptor), (7, true));
+        let (bus, removable) = descriptor_attachment_fields(&[0u8; 8]);
+        assert_eq!((bus, removable), (0, false));
+        assert_eq!(classify_attachment(bus, false, removable), Unknown);
+        let mut hotplug = vec![0u8; 8];
+        hotplug[6] = 1;
+        assert!(hotplug_is_device_hotplug(&hotplug));
+        assert!(!hotplug_is_device_hotplug(&[0u8; 4]));
+        assert!(!hotplug_is_device_hotplug(&hotplug[..6]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sysfs_attachment_classifies_a_fake_tree() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let root = scratch_dir("sysfs-attach");
+        let sys = root.join("sys");
+        let dev_block = sys.join("dev/block");
+        std::fs::create_dir_all(&dev_block).unwrap();
+        let sys_str = sys.to_string_lossy().into_owned();
+
+        let plant = |rel: &str, major: u32, minor: u32| -> std::path::PathBuf {
+            let node = sys.join("devices").join(rel);
+            std::fs::create_dir_all(&node).unwrap();
+            let link = dev_block.join(format!("{major}:{minor}"));
+            let _ = std::fs::remove_file(&link);
+            symlink(Path::new("../..").join("devices").join(rel), &link).unwrap();
+            node
+        };
+
+        plant(
+            "pci0000:00/usb1/1-1/host6/target6:0:0/6:0:0:0/block/sdb",
+            8,
+            16,
+        );
+        assert_eq!(
+            sysfs_attachment(&sys_str, 8, 16),
+            DeviceAttachment::External
+        );
+
+        plant("pci0000:00/0000:00:1d.0/nvme/nvme0/nvme0n1", 259, 0);
+        assert_eq!(
+            sysfs_attachment(&sys_str, 259, 0),
+            DeviceAttachment::Internal
+        );
+
+        let bay = plant("pci0000:00/ata3/host2/target2:0:0/2:0:0:0/block/sdc", 8, 32);
+        std::fs::write(bay.join("removable"), "1\n").unwrap();
+        assert_eq!(
+            sysfs_attachment(&sys_str, 8, 32),
+            DeviceAttachment::External
+        );
+
+        let sata = plant("pci0000:00/ata4/host3/target3:0:0/3:0:0:0/block/sdd", 8, 48);
+        std::fs::write(sata.join("removable"), "0\n").unwrap();
+        assert_eq!(
+            sysfs_attachment(&sys_str, 8, 48),
+            DeviceAttachment::Internal
+        );
+
+        let part = sys.join("devices/pci0000:00/0000:00:1d.0/nvme/nvme0/nvme0n1/nvme0n1p1");
+        std::fs::create_dir_all(&part).unwrap();
+        std::fs::write(part.join("partition"), "1\n").unwrap();
+        let link = dev_block.join("259:1");
+        let _ = std::fs::remove_file(&link);
+        symlink(
+            Path::new("../../devices/pci0000:00/0000:00:1d.0/nvme/nvme0/nvme0n1/nvme0n1p1"),
+            &link,
+        )
+        .unwrap();
+        assert_eq!(
+            sysfs_attachment(&sys_str, 259, 1),
+            DeviceAttachment::Internal
+        );
+
+        let backing = root.join("backing.img");
+        std::fs::write(&backing, b"backing").unwrap();
+        let (bmaj, bmin) = split_dev(std::fs::metadata(&backing).unwrap().dev());
+        let (lmaj, lmin) = if (bmaj, bmin) == (7, 0) {
+            (7, 1)
+        } else {
+            (7, 0)
+        };
+        plant("pci0000:00/0000:00:1d.0/nvme/nvme9/nvme9n1", bmaj, bmin);
+        let loop_node = plant("virtual/block/loop0", lmaj, lmin);
+        std::fs::create_dir_all(loop_node.join("loop")).unwrap();
+        std::fs::write(
+            loop_node.join("loop/backing_file"),
+            format!("{}\n", backing.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            sysfs_attachment(&sys_str, lmaj, lmin),
+            DeviceAttachment::Internal
+        );
+
+        assert_eq!(
+            sysfs_attachment(&sys_str, 123, 45),
+            DeviceAttachment::Unknown
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

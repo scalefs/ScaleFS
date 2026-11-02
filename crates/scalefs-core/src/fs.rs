@@ -1,4 +1,3 @@
-
 use crate::device::BlockDevice;
 use crate::dirent;
 use crate::error::{Result, ScaleFsError};
@@ -16,6 +15,7 @@ use crate::tree::{
     MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET, MODE_SYMLINK, MODE_TYPE_MASK, MetadataKey,
     MetadataTree, MetadataValue, XATTR_VALUE_MAX, XattrEntry,
 };
+use crate::unicode::UnicodeVersion;
 use crate::zones::{AllocPurpose, ZoneClass};
 
 pub const FILE_DATA_CHUNK: usize = 32768;
@@ -217,9 +217,10 @@ pub(crate) fn read_in<D: BlockDevice>(
 }
 
 impl<D: BlockDevice> Pool<D> {
-    pub(crate) fn naming(&self) -> (u64, CaseSensitivity) {
+    pub(crate) fn naming(&self) -> (u64, UnicodeVersion, CaseSensitivity) {
         (
             self.superblocks[0].dirent_hash_seed,
+            self.superblocks[0].unicode_version,
             self.superblocks[0].case_sensitivity,
         )
     }
@@ -238,6 +239,7 @@ impl<D: BlockDevice> Pool<D> {
         object_id: u64,
         mutate: impl FnOnce(&mut InodeAttrs),
     ) -> Result<()> {
+        self.ensure_mutable()?;
         let mut attrs = self.getattr(object_id)?;
         let size_before = attrs.size;
         let type_before = attrs.mode & MODE_TYPE_MASK;
@@ -298,13 +300,19 @@ impl<D: BlockDevice> Pool<D> {
 
     pub fn lookup(&self, parent: u64, name: &str) -> Result<DirEntry> {
         self.require_dir(parent)?;
-        let (seed, case) = self.naming();
-        dirent::lookup_entry(&self.tree, seed, case, parent, name).ok_or(ScaleFsError::NotFound)
+        let (seed, version, case) = self.naming();
+        dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
+            .ok_or(ScaleFsError::NotFound)
     }
 
     pub fn readdir(&self, dir: u64) -> Result<Vec<DirEntry>> {
         self.require_dir(dir)?;
         Ok(dirent::list_entries(&self.tree, dir))
+    }
+
+    pub fn readdir_hashed(&self, dir: u64) -> Result<Vec<dirent::HashedEntry>> {
+        self.require_dir(dir)?;
+        Ok(dirent::list_entries_hashed(&self.tree, dir))
     }
 
     pub fn create_file(&mut self, parent: u64, name: &str, mode: u32, now_ns: i64) -> Result<u64> {
@@ -323,10 +331,11 @@ impl<D: BlockDevice> Pool<D> {
         kind: EntryKind,
         now_ns: i64,
     ) -> Result<u64> {
+        self.ensure_mutable()?;
         self.require_dir(parent)?;
         dirent::validate_name(name)?;
-        let (seed, case) = self.naming();
-        if dirent::lookup_entry(&self.tree, seed, case, parent, name).is_some() {
+        let (seed, version, case) = self.naming();
+        if dirent::lookup_entry(&self.tree, seed, version, case, parent, name).is_some() {
             return Err(ScaleFsError::AlreadyExists);
         }
 
@@ -354,15 +363,23 @@ impl<D: BlockDevice> Pool<D> {
                 gid: 0,
                 nlink: 1,
                 attrs,
+                bsd_flags: 0,
                 crtime_ns: now_ns,
                 mtime_ns: now_ns,
                 ctime_ns: now_ns,
                 atime_ns: now_ns,
             },
         )?;
-        if let Err(error) =
-            dirent::add_entry(&mut self.tree, seed, case, parent, name, object_id, kind)
-        {
+        if let Err(error) = dirent::add_entry(
+            &mut self.tree,
+            seed,
+            version,
+            case,
+            parent,
+            name,
+            object_id,
+            kind,
+        ) {
             self.tree.remove(inode_key(object_id));
             return Err(error);
         }
@@ -469,7 +486,7 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     fn xattr_hash(&self, name: &str) -> u64 {
-        let (seed, _) = self.naming();
+        let (seed, _, _) = self.naming();
         dirent::dirent_hash(seed, name)
     }
 
@@ -481,6 +498,7 @@ impl<D: BlockDevice> Pool<D> {
         flags: u32,
         now_ns: i64,
     ) -> Result<()> {
+        self.ensure_mutable()?;
         let mut attrs = self.getattr(object)?;
         if name.is_empty() || name.len() > 255 {
             return Err(ScaleFsError::InvalidArgument("xattr name length"));
@@ -551,6 +569,7 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn remove_xattr(&mut self, object: u64, name: &str, now_ns: i64) -> Result<()> {
+        self.ensure_mutable()?;
         let mut attrs = self.getattr(object)?;
         let key = xattr_key(object, self.xattr_hash(name));
         let Some(MetadataValue::XattrEntries(entries)) = self.tree.get(key) else {
@@ -578,6 +597,7 @@ impl<D: BlockDevice> Pool<D> {
         new_name: &str,
         now_ns: i64,
     ) -> Result<()> {
+        self.ensure_mutable()?;
         self.require_dir(new_parent)?;
         let mut attrs = self.getattr(object)?;
         if attrs.is_dir() {
@@ -586,10 +606,11 @@ impl<D: BlockDevice> Pool<D> {
         if attrs.nlink >= LINK_MAX {
             return Err(ScaleFsError::TooManyLinks);
         }
-        let (seed, case) = self.naming();
+        let (seed, version, case) = self.naming();
         dirent::add_entry(
             &mut self.tree,
             seed,
+            version,
             case,
             new_parent,
             new_name,
@@ -604,16 +625,17 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str, now_ns: i64) -> Result<()> {
+        self.ensure_mutable()?;
         self.require_dir(parent)?;
-        let (seed, case) = self.naming();
-        let entry = dirent::lookup_entry(&self.tree, seed, case, parent, name)
+        let (seed, version, case) = self.naming();
+        let entry = dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
             .ok_or(ScaleFsError::NotFound)?;
         if entry.kind == EntryKind::Directory {
             return Err(ScaleFsError::IsDirectory);
         }
 
         let attrs = self.getattr(entry.inode).ok();
-        dirent::remove_entry(&mut self.tree, seed, case, parent, name)?;
+        dirent::remove_entry(&mut self.tree, seed, version, case, parent, name)?;
         match attrs {
             Some(mut attrs) if attrs.nlink > 1 => {
                 attrs.nlink -= 1;
@@ -626,9 +648,10 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn rmdir(&mut self, parent: u64, name: &str, now_ns: i64) -> Result<()> {
+        self.ensure_mutable()?;
         self.require_dir(parent)?;
-        let (seed, case) = self.naming();
-        let entry = dirent::lookup_entry(&self.tree, seed, case, parent, name)
+        let (seed, version, case) = self.naming();
+        let entry = dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
             .ok_or(ScaleFsError::NotFound)?;
         if entry.kind != EntryKind::Directory {
             return Err(ScaleFsError::NotDirectory);
@@ -637,7 +660,7 @@ impl<D: BlockDevice> Pool<D> {
             return Err(ScaleFsError::DirectoryNotEmpty);
         }
 
-        dirent::remove_entry(&mut self.tree, seed, case, parent, name)?;
+        dirent::remove_entry(&mut self.tree, seed, version, case, parent, name)?;
         self.remove_object(entry.inode);
         self.touch_modified(parent, now_ns)
     }
@@ -673,16 +696,18 @@ impl<D: BlockDevice> Pool<D> {
         new_name: &str,
         now_ns: i64,
     ) -> Result<()> {
+        self.ensure_mutable()?;
         self.require_dir(old_parent)?;
         self.require_dir(new_parent)?;
         dirent::validate_name(new_name)?;
-        let (seed, case) = self.naming();
-        let entry = dirent::lookup_entry(&self.tree, seed, case, old_parent, old_name)
+        let (seed, version, case) = self.naming();
+        let entry = dirent::lookup_entry(&self.tree, seed, version, case, old_parent, old_name)
             .ok_or(ScaleFsError::NotFound)?;
         let same_place = old_parent == new_parent
-            && dirent::fold_name(case, old_name) == dirent::fold_name(case, new_name);
+            && dirent::fold_name(version, case, old_name)
+                == dirent::fold_name(version, case, new_name);
         if !same_place
-            && dirent::lookup_entry(&self.tree, seed, case, new_parent, new_name).is_some()
+            && dirent::lookup_entry(&self.tree, seed, version, case, new_parent, new_name).is_some()
         {
             return Err(ScaleFsError::AlreadyExists);
         }
@@ -695,10 +720,11 @@ impl<D: BlockDevice> Pool<D> {
             ));
         }
 
-        dirent::remove_entry(&mut self.tree, seed, case, old_parent, old_name)?;
+        dirent::remove_entry(&mut self.tree, seed, version, case, old_parent, old_name)?;
         dirent::add_entry(
             &mut self.tree,
             seed,
+            version,
             case,
             new_parent,
             new_name,
@@ -940,6 +966,7 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn truncate(&mut self, object_id: u64, new_size: u64, now_ns: i64) -> Result<()> {
+        self.ensure_mutable()?;
         let mut attrs = self.require_file(object_id)?;
         if new_size < attrs.size {
             self.clear_range(object_id, new_size, attrs.size)?;
@@ -951,6 +978,7 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn punch_hole(&mut self, object_id: u64, offset: u64, len: u64, now_ns: i64) -> Result<()> {
+        self.ensure_mutable()?;
         self.require_file(object_id)?;
         let end = offset
             .checked_add(len)
@@ -986,7 +1014,9 @@ mod tests {
     }
 
     fn new_pool() -> Pool<MemoryBlockDevice> {
-        let device = MemoryBlockDevice::new(geometry().capacity_bytes() as usize);
+        let device = MemoryBlockDevice::new(crate::gpt::member_image_len(
+            geometry().capacity_bytes(),
+        ) as usize);
         Pool::create(
             device,
             CreateParams {
@@ -1033,7 +1063,9 @@ mod tests {
 
     fn failing_pool() -> (std::sync::Arc<FailAfter>, Pool<std::sync::Arc<FailAfter>>) {
         let device = std::sync::Arc::new(FailAfter {
-            inner: MemoryBlockDevice::new(geometry().capacity_bytes() as usize),
+            inner: MemoryBlockDevice::new(
+                crate::gpt::member_image_len(geometry().capacity_bytes()) as usize,
+            ),
             allow: std::sync::atomic::AtomicI64::new(i64::MAX),
         });
         let pool = Pool::create(
@@ -1243,7 +1275,9 @@ mod tests {
         use crate::pool::{MemberSpec, PoolParams};
         let members: Vec<MemberSpec<MemoryBlockDevice>> = (0..4)
             .map(|i| MemberSpec {
-                device: MemoryBlockDevice::new(geometry().capacity_bytes() as usize),
+                device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry().capacity_bytes(),
+                ) as usize),
                 device_id: DeviceId([0x40 + i as u8; 16]),
                 geometry: geometry(),
             })
@@ -1442,14 +1476,14 @@ mod tests {
     #[test]
     fn file_writes_are_transactional_across_crashes() {
         let pool = new_pool();
-        let base = pool.devices[0].bytes().to_vec();
+        let base = pool.devices[0].inner().bytes().to_vec();
 
         let mut pool = Pool::open(RecordingBlockDevice::new(pool.into_device())).unwrap();
         let file = pool.create_file(ROOT_INODE, "tx.bin", 0o644, NOW).unwrap();
         let data = pattern(9000, 13);
         pool.write(file, 0, &data, NOW).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
-        let ops = pool.devices[0].ops().to_vec();
+        let ops = pool.devices[0].inner().ops().to_vec();
 
         let mut states = 0usize;
         for prefix in 0..=ops.len() {

@@ -1,4 +1,3 @@
-
 use crate::util::Opts;
 use scalefs_core::salvage::{
     AssemblyReport, CandidateKind, Damage, DeviceRole, ExtentVerdict, FileReport, PathOutcome,
@@ -7,6 +6,7 @@ use scalefs_core::salvage::{
 use scalefs_core::tree::EntryKind;
 use scalefs_core::{Geometry, ROOT_INODE, RawBlockDevice};
 use scalefs_ipc::json::{Value, object};
+use std::borrow::Cow;
 use std::io::Write;
 
 const USAGE: &str = "usage: scalefs salvage <scan|ls|get|copy-out> <device[,device...]> ... \
@@ -136,11 +136,11 @@ struct CopyTally {
 }
 
 fn cmd_copy_out(args: &[String]) -> Result<bool, String> {
-    let opts = Opts::parse(args, &["snapshots"], &["view", "manifest"])?;
+    let opts = Opts::parse(args, &["snapshots", "force"], &["view", "manifest"])?;
     let [list, dest] = &opts.positional[..] else {
         return Err(
             "usage: scalefs salvage copy-out <devices> <dest-dir> [--view <tx>] \
-             [--snapshots] [--manifest <file>]"
+             [--snapshots] [--manifest <file>] [--force]"
                 .to_string(),
         );
     };
@@ -152,6 +152,17 @@ fn cmd_copy_out(args: &[String]) -> Result<bool, String> {
     }
     let dest = std::path::Path::new(dest);
     std::fs::create_dir_all(dest).map_err(|error| format!("cannot create {dest:?}: {error}"))?;
+    if !opts.flag("force")
+        && dest
+            .read_dir()
+            .map_err(|error| format!("cannot list {dest:?}: {error}"))?
+            .next()
+            .is_some()
+    {
+        return Err(format!(
+            "{dest:?} is not empty; use --force to copy into it anyway (existing files are kept)"
+        ));
+    }
     let mut manifest: Box<dyn Write> = match opts.value("manifest") {
         Some(path) => Box::new(
             std::fs::File::create(path)
@@ -176,15 +187,18 @@ fn cmd_copy_out(args: &[String]) -> Result<bool, String> {
             .map_err(|error| error.to_string())?;
         }
         for snapshot in &snapshots {
-            let sub = dest.join(".snapshots").join(&snapshot.name);
+            let saved = host_safe_component(&snapshot.name);
+            let sub = dest.join(".snapshots").join(saved.as_ref());
             std::fs::create_dir_all(&sub)
                 .map_err(|error| format!("cannot create {sub:?}: {error}"))?;
             match session.enter_snapshot(snapshot) {
                 Ok(()) => {
                     writeln!(
                         manifest,
-                        "# snapshot '{}' (tx {})",
-                        snapshot.name, snapshot.tx_id
+                        "# snapshot '{}' (tx {}){}",
+                        manifest_text(&snapshot.name),
+                        snapshot.tx_id,
+                        saved_as_note(&snapshot.name, &saved),
                     )
                     .map_err(|error| error.to_string())?;
                     let prefix = format!(".snapshots/{}", snapshot.name);
@@ -201,8 +215,9 @@ fn cmd_copy_out(args: &[String]) -> Result<bool, String> {
                     tally.notes += 1;
                     writeln!(
                         manifest,
-                        "# snapshot '{}': no root replica decodes ({error:?})",
-                        snapshot.name,
+                        "# snapshot '{}': no root replica decodes ({})",
+                        manifest_text(&snapshot.name),
+                        manifest_text(&format!("{error:?}")),
                     )
                     .map_err(|error| error.to_string())?;
                 }
@@ -294,20 +309,44 @@ fn copy_dir(
         } else {
             format!("{prefix}/{}", entry.name)
         };
-        let target = dest.join(entry.name.as_str());
+        let shown = manifest_text(&rel);
+        let saved = host_safe_component(&entry.name);
+        if saved != entry.name {
+            tally.notes += 1;
+            writeln!(manifest, "# /{shown} saved as {saved:?}")
+                .map_err(|error| error.to_string())?;
+        }
+        let target = dest.join(saved.as_ref());
         match entry.kind {
             EntryKind::Directory => {
-                std::fs::create_dir_all(&target)
-                    .map_err(|error| format!("cannot create {target:?}: {error}"))?;
-                writeln!(manifest, "dir\t-\t/{rel}").map_err(|error| error.to_string())?;
+                match std::fs::create_dir(&target) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::AlreadyExists
+                            && std::fs::symlink_metadata(&target)
+                                .is_ok_and(|existing| existing.is_dir()) => {}
+                    Err(error) => return Err(format!("cannot create {target:?}: {error}")),
+                }
+                writeln!(manifest, "dir\t-\t/{shown}").map_err(|error| error.to_string())?;
                 copy_dir(session, entry.inode, &target, &rel, manifest, tally)?;
             }
             EntryKind::File => {
+                let created = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target);
+                let file = match created {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        tally.notes += 1;
+                        writeln!(manifest, "SKIPPED(exists)\t-\t/{shown}")
+                            .map_err(|error| error.to_string())?;
+                        continue;
+                    }
+                    Err(error) => return Err(format!("cannot create {target:?}: {error}")),
+                };
                 tally.files += 1;
-                let mut sink = std::io::BufWriter::new(
-                    std::fs::File::create(&target)
-                        .map_err(|error| format!("cannot create {target:?}: {error}"))?,
-                );
+                let mut sink = std::io::BufWriter::new(file);
                 match session.salvage_file(entry.inode, &mut sink) {
                     Ok(report) => {
                         sink.flush().map_err(|error| error.to_string())?;
@@ -323,7 +362,7 @@ fn copy_dir(
                         }
                         writeln!(
                             manifest,
-                            "{}\t{}\t/{rel}",
+                            "{}\t{}\t/{shown}",
                             rollup_text(&rollup),
                             report.size,
                         )
@@ -331,8 +370,12 @@ fn copy_dir(
                     }
                     Err(error) => {
                         tally.lost += 1;
-                        writeln!(manifest, "UNREADABLE\t-\t/{rel}\t{error:?}")
-                            .map_err(|error| error.to_string())?;
+                        writeln!(
+                            manifest,
+                            "UNREADABLE\t-\t/{shown}\t{}",
+                            manifest_text(&format!("{error:?}"))
+                        )
+                        .map_err(|error| error.to_string())?;
                     }
                 }
             }
@@ -342,17 +385,91 @@ fn copy_dir(
                     Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
                     _ => "?".to_string(),
                 };
-                writeln!(manifest, "symlink\t-\t/{rel}\t-> {note}")
-                    .map_err(|error| error.to_string())?;
+                writeln!(
+                    manifest,
+                    "symlink\t-\t/{shown}\t-> {}",
+                    manifest_text(&note)
+                )
+                .map_err(|error| error.to_string())?;
             }
             other => {
                 tally.notes += 1;
-                writeln!(manifest, "special({other:?})\t-\t/{rel}")
+                writeln!(manifest, "special({other:?})\t-\t/{shown}")
                     .map_err(|error| error.to_string())?;
             }
         }
     }
     Ok(())
+}
+
+fn host_safe_component(name: &str) -> Cow<'_, str> {
+    if cfg!(windows) {
+        windows_safe_component(name)
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+fn windows_safe_component(name: &str) -> Cow<'_, str> {
+    const DEVICES: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
+        "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+        "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    fn reserved_char(c: char) -> bool {
+        matches!(
+            c,
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '%'
+        ) || c.is_control()
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    let device = DEVICES
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved));
+    let chars: Vec<char> = name.chars().collect();
+    let last_kept = chars.iter().rposition(|c| !matches!(c, '.' | ' '));
+    let clean = !device
+        && last_kept == chars.len().checked_sub(1)
+        && !chars.iter().any(|&c| reserved_char(c));
+    if clean {
+        return Cow::Borrowed(name);
+    }
+    let mut out = String::with_capacity(name.len() + 8);
+    for (index, &c) in chars.iter().enumerate() {
+        let trailing = last_kept.is_none_or(|kept| index > kept);
+        if reserved_char(c) || trailing || (device && index == 0) {
+            let mut utf8 = [0u8; 4];
+            for byte in c.encode_utf8(&mut utf8).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+fn saved_as_note(stored: &str, saved: &str) -> String {
+    if stored == saved {
+        String::new()
+    } else {
+        format!(" (saved as {saved:?})")
+    }
+}
+
+fn manifest_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn open_session(
@@ -794,4 +911,161 @@ fn report_value(paths: &[String], report: &AssemblyReport) -> Value {
             Value::Array(report.notes.iter().cloned().map(Value::Str).collect()),
         ),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scalefs_core::{
+        AllocPurpose, CaseSensitivity, CreateParams, DeviceId, FileBlockDevice, Pool, PoolId,
+        member_image_len,
+    };
+
+    #[test]
+    fn windows_components_cannot_leave_the_destination() {
+        let hostile = [
+            "..\\evil.txt",
+            "C:\\Windows\\win.ini",
+            "\\\\server\\share\\x",
+            "name:stream",
+            "con",
+            "NUL.txt",
+            "Com1",
+            "trailing.",
+            "trailing ",
+            "tab\tname",
+            "new\nline",
+            "percent%sign",
+            "q?mark",
+            "...",
+        ];
+        for name in hostile {
+            let safe = windows_safe_component(name);
+            assert!(
+                !safe.contains(['\\', ':', '*', '?', '"', '<', '>', '|']),
+                "{name:?} -> {safe:?}"
+            );
+            assert!(!safe.ends_with(['.', ' ']), "{name:?} -> {safe:?}");
+            assert!(!safe.chars().any(char::is_control), "{name:?} -> {safe:?}");
+            let stem = safe.split('.').next().unwrap_or(&safe);
+            assert!(
+                !["CON", "NUL", "COM1"]
+                    .iter()
+                    .any(|device| stem.eq_ignore_ascii_case(device)),
+                "{name:?} -> {safe:?}"
+            );
+            let components: Vec<_> = std::path::Path::new(safe.as_ref()).components().collect();
+            assert!(
+                matches!(components[..], [std::path::Component::Normal(_)]),
+                "{name:?} -> {safe:?} is not one ordinary component"
+            );
+        }
+        assert_eq!(
+            windows_safe_component("report (final).pdf"),
+            "report (final).pdf"
+        );
+        assert_ne!(
+            windows_safe_component("a%5Cb"),
+            windows_safe_component("a\\b")
+        );
+    }
+
+    #[test]
+    fn manifest_fields_cannot_forge_lines() {
+        assert_eq!(manifest_text("plain name.txt"), "plain name.txt");
+        assert_eq!(manifest_text("a\tb\nc\rd\\e"), "a\\tb\\nc\\rd\\\\e");
+        assert_eq!(manifest_text("bell\u{7}"), "bell\\x07");
+    }
+
+    #[test]
+    fn copy_out_keeps_hostile_names_inside_the_destination() {
+        let scratch =
+            std::env::temp_dir().join(format!("scalefs-salvage-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let image = scratch.join("pool.img");
+        let geometry = Geometry {
+            logical_block_size: 4096,
+            physical_block_size: 4096,
+            zone_size: 64 * 1024,
+            zone_count: 64,
+            erase_granularity_zones: 1,
+            sequential_write_required: false,
+        };
+        let now = 1_700_000_000_000_000_000;
+        {
+            let device =
+                FileBlockDevice::create(&image, member_image_len(geometry.capacity_bytes()))
+                    .unwrap();
+            let mut pool = Pool::create(
+                device,
+                CreateParams {
+                    pool_id: PoolId([0x5A; 16]),
+                    device_id: DeviceId([0x01; 16]),
+                    geometry,
+                    case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                    dirent_hash_seed: 1,
+                    label: "hostile".to_string(),
+                    created_at_ns: now,
+                },
+            )
+            .unwrap();
+            let file = pool
+                .create_file(ROOT_INODE, "..\\evil.txt", 0o644, now)
+                .unwrap();
+            pool.write(file, 0, b"payload", now).unwrap();
+            let dir = pool.mkdir(ROOT_INODE, "con", 0o755, now).unwrap();
+            let inner = pool.create_file(dir, "inner\ttab.txt", 0o644, now).unwrap();
+            pool.write(inner, 0, b"inner", now).unwrap();
+            pool.commit(AllocPurpose::Normal, now).unwrap();
+        }
+
+        let dest = scratch.join("out");
+        let manifest_path = scratch.join("manifest.txt");
+        let image_arg = image.to_string_lossy().into_owned();
+        let dest_arg = dest.to_string_lossy().into_owned();
+        cmd_copy_out(&[
+            image_arg.clone(),
+            dest_arg.clone(),
+            "--manifest".to_string(),
+            manifest_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(!scratch.join("evil.txt").exists());
+        let top: Vec<std::fs::DirEntry> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(top.len(), 2, "{top:?}");
+        let file_entry = top
+            .iter()
+            .find(|entry| entry.file_type().unwrap().is_file())
+            .expect("the file landed in the destination");
+        let dir_entry = top
+            .iter()
+            .find(|entry| entry.file_type().unwrap().is_dir())
+            .expect("the directory landed in the destination");
+        assert_eq!(std::fs::read(file_entry.path()).unwrap(), b"payload");
+        assert_eq!(std::fs::read_dir(dir_entry.path()).unwrap().count(), 1);
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(manifest.contains("inner\\ttab.txt"), "{manifest}");
+        if cfg!(windows) {
+            assert!(manifest.contains("saved as"), "{manifest}");
+            let names: Vec<String> = top
+                .iter()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(names.iter().any(|name| name.contains("%5C")), "{names:?}");
+            assert!(
+                names.iter().any(|name| name.eq_ignore_ascii_case("%63on")),
+                "{names:?}"
+            );
+        }
+
+        assert!(cmd_copy_out(&[image_arg.clone(), dest_arg.clone()]).is_err());
+        cmd_copy_out(&[image_arg, dest_arg, "--force".to_string()]).unwrap();
+        assert_eq!(std::fs::read(file_entry.path()).unwrap(), b"payload");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }

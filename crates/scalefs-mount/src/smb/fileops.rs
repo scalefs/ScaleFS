@@ -1,4 +1,3 @@
-
 use scalefs_core::error::Result;
 use scalefs_core::wire::{Cursor, put_u16, put_u32, put_u64};
 
@@ -103,7 +102,6 @@ fn put_filetimes(out: &mut Vec<u8>, m: &FileMeta) {
     put_u64(out, m.write);
     put_u64(out, m.change);
 }
-
 
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
@@ -329,7 +327,6 @@ impl RenameInfo {
         Ok(RenameInfo { replace, name })
     }
 }
-
 
 fn slice_from_header(body: &[u8], header_offset: usize, len: usize) -> Result<&[u8]> {
     let start = header_offset.saturating_sub(super::wire::HEADER_LEN);

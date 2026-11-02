@@ -1,4 +1,3 @@
-
 use crate::json::{Value, object};
 
 pub const PROTOCOL_VERSION: u64 = 1;

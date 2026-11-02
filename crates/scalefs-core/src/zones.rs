@@ -1,4 +1,3 @@
-
 use crate::error::{Result, ScaleFsError};
 use crate::format::{RecordKind, decode_record, encode_record};
 use crate::layout::Geometry;
@@ -335,17 +334,19 @@ impl ZoneAllocator {
             let zone = &mut self.zones[z as usize];
             self.free_usable += u64::from(zone.class.take().is_some());
             zone.write_pointer = 0;
-            zone.erase_count += 1;
+            zone.erase_count = zone.erase_count.saturating_add(1);
         }
         Ok(())
     }
 
     pub fn encoded_len(&self) -> usize {
-        crate::format::RECORD_HEADER_LEN + 8 + self.zones.len() * 14
+        crate::layout::zone_summary_len(self.zones.len() as u64) as usize
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(8 + self.zones.len() * 14);
+        let mut payload = Vec::with_capacity(
+            8 + self.zones.len() * crate::layout::ZONE_SUMMARY_ENTRY_LEN as usize,
+        );
         put_u64(&mut payload, self.geometry.zone_count);
         for zone in &self.zones {
             let class_bits = match zone.class {

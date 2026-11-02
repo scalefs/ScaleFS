@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone)]
 pub struct XorShift64 {
     state: u64,

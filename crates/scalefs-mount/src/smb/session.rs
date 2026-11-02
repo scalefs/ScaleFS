@@ -1,4 +1,3 @@
-
 use super::crypto::kdf::smb3_signing_key;
 use super::crypto::sha512::Sha512;
 use super::sign;
@@ -7,11 +6,76 @@ use scalefs_core::wire::Cursor;
 
 const MESSAGE_ID_WINDOW: u64 = 512;
 
+struct SequenceWindow {
+    highest: u64,
+    seen: [u64; (2 * MESSAGE_ID_WINDOW / 64) as usize],
+}
+
+impl SequenceWindow {
+    fn new() -> SequenceWindow {
+        SequenceWindow {
+            highest: 0,
+            seen: [0; (2 * MESSAGE_ID_WINDOW / 64) as usize],
+        }
+    }
+
+    fn floor(highest: u64) -> u64 {
+        highest.saturating_add(1).saturating_sub(MESSAGE_ID_WINDOW)
+    }
+
+    fn bit(id: u64) -> (usize, u64) {
+        let index = (id % (2 * MESSAGE_ID_WINDOW)) as usize;
+        (index / 64, 1u64 << (index % 64))
+    }
+
+    fn is_seen(&self, id: u64) -> bool {
+        let (word, mask) = Self::bit(id);
+        self.seen[word] & mask != 0
+    }
+
+    fn set(&mut self, id: u64) {
+        let (word, mask) = Self::bit(id);
+        self.seen[word] |= mask;
+    }
+
+    fn clear(&mut self, id: u64) {
+        let (word, mask) = Self::bit(id);
+        self.seen[word] &= !mask;
+    }
+
+    fn accepts(&self, id: u64, charge: u16) -> bool {
+        let Some(last) = id.checked_add(u64::from(charge.max(1)) - 1) else {
+            return false;
+        };
+        id >= Self::floor(self.highest)
+            && last <= self.highest.saturating_add(MESSAGE_ID_WINDOW)
+            && (id..=last).all(|n| !self.is_seen(n))
+    }
+
+    fn claim(&mut self, id: u64, charge: u16) -> bool {
+        if !self.accepts(id, charge) {
+            return false;
+        }
+        let last = id + (u64::from(charge.max(1)) - 1);
+        for n in id..=last {
+            self.set(n);
+        }
+        if last > self.highest {
+            for n in Self::floor(self.highest)..Self::floor(last) {
+                self.clear(n);
+            }
+            self.highest = last;
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     New,
     Negotiated,
     Ready,
+    LoggedOff,
 }
 
 pub trait Handler {
@@ -64,7 +128,7 @@ pub fn error_body() -> Vec<u8> {
 
 pub struct Connection {
     phase: Phase,
-    highest_message_id: u64,
+    window: SequenceWindow,
     session_id: u64,
     preauth: [u8; 64],
     signing_key: Option<[u8; 16]>,
@@ -87,7 +151,7 @@ impl Connection {
     pub fn new() -> Connection {
         Connection {
             phase: Phase::New,
-            highest_message_id: 0,
+            window: SequenceWindow::new(),
             session_id: 0,
             preauth: [0u8; 64],
             signing_key: None,
@@ -149,7 +213,7 @@ impl Connection {
             let response = match chain_failure {
                 Some(failed) => {
                     if header.message_id != u64::MAX {
-                        self.highest_message_id = self.highest_message_id.max(header.message_id);
+                        self.window.claim(header.message_id, header.credit_charge);
                     }
                     Response::error(failed)
                 }
@@ -180,11 +244,10 @@ impl Connection {
     }
 
     fn handle_one(&mut self, header: &Header, body: &[u8], handler: &dyn Handler) -> Response {
-        if header.message_id != u64::MAX {
-            if header.message_id > self.highest_message_id + MESSAGE_ID_WINDOW {
-                return Response::error(status::INVALID_PARAMETER);
-            }
-            self.highest_message_id = self.highest_message_id.max(header.message_id);
+        if header.message_id != u64::MAX
+            && !self.window.claim(header.message_id, header.credit_charge)
+        {
+            return Response::error(status::INVALID_PARAMETER);
         }
 
         match header.command {
@@ -199,7 +262,7 @@ impl Connection {
                 response
             }
             command::SESSION_SETUP => {
-                if self.phase == Phase::New {
+                if matches!(self.phase, Phase::New | Phase::LoggedOff) {
                     return Response::error(status::INVALID_PARAMETER);
                 }
                 let response = handler.dispatch(header, body);
@@ -211,12 +274,20 @@ impl Connection {
                 }
                 response
             }
-            _ => {
-                if self.phase != Phase::Ready {
-                    return Response::error(status::ACCESS_DENIED);
+            _ => match self.phase {
+                Phase::LoggedOff => Response::error(status::USER_SESSION_DELETED),
+                Phase::New | Phase::Negotiated => Response::error(status::ACCESS_DENIED),
+                Phase::Ready if header.session_id != self.session_id => {
+                    Response::error(status::USER_SESSION_DELETED)
                 }
-                handler.dispatch(header, body)
-            }
+                Phase::Ready => {
+                    let response = handler.dispatch(header, body);
+                    if header.command == command::LOGOFF && response.status == status::SUCCESS {
+                        self.phase = Phase::LoggedOff;
+                    }
+                    response
+                }
+            },
         }
     }
 
@@ -329,7 +400,8 @@ impl Connection {
             return Route::Inline;
         }
         if header.message_id == u64::MAX
-            || header.message_id > self.highest_message_id + MESSAGE_ID_WINDOW
+            || header.session_id != self.session_id
+            || !self.window.accepts(header.message_id, header.credit_charge)
         {
             return Route::Inline;
         }
@@ -345,7 +417,7 @@ impl Connection {
                 Err(_) => return Route::Inline,
             }
         }
-        self.highest_message_id = self.highest_message_id.max(header.message_id);
+        self.window.claim(header.message_id, header.credit_charge);
         Route::Parallel(ParallelRequest {
             header,
             key,
@@ -458,12 +530,24 @@ mod tests {
         flags: u32,
         body: &[u8],
     ) -> Vec<u8> {
+        request_for_session(cmd, message_id, next_command, flags, 0x1234, body)
+    }
+
+    fn request_for_session(
+        cmd: u16,
+        message_id: u64,
+        next_command: u32,
+        flags: u32,
+        session_id: u64,
+        body: &[u8],
+    ) -> Vec<u8> {
         let header = Header {
             command: cmd,
             message_id,
             credits: 1,
             next_command,
             flags,
+            session_id,
             ..Header::default()
         };
         let mut out = Vec::new();
@@ -534,6 +618,91 @@ mod tests {
             &conn.signing_key().unwrap()
         ));
         conn.signing_key().unwrap()
+    }
+
+    #[test]
+    fn sequence_window_refuses_replays_and_tolerates_gaps() {
+        let mut window = SequenceWindow::new();
+        assert!(window.claim(0, 1));
+        assert!(!window.claim(0, 1), "a consumed id is a replay");
+        assert!(window.claim(10, 4));
+        assert!(!window.claim(11, 1));
+        assert!(!window.claim(13, 1));
+        assert!(window.claim(14, 1));
+        assert!(window.claim(20, 1));
+        assert!(window.claim(15, 1));
+        assert!(!window.claim(20 + MESSAGE_ID_WINDOW + 1, 1));
+        assert!(window.claim(20 + MESSAGE_ID_WINDOW, 1));
+        assert!(!window.claim(20, 1));
+        assert!(window.claim(21, 1));
+
+        let mut window = SequenceWindow::new();
+        for id in 0..5_000u64 {
+            assert!(window.claim(id, 1), "{id}");
+        }
+        assert!(!window.claim(4_999, 1));
+        assert!(!window.claim(4_600, 1));
+        assert!(
+            !window.claim(4_000, 1),
+            "too old to be anything but a replay"
+        );
+        assert!(window.claim(5_000, 1));
+    }
+
+    #[test]
+    fn replayed_frames_are_refused_without_dispatch() {
+        let mut conn = Connection::new();
+        let handler = Recorder::default();
+        let key = handshake(&mut conn, &handler);
+        let mut echo = request(command::ECHO, 3, 0, &[]);
+        sign_request(&mut echo, &key);
+        assert_eq!(
+            reply_status(&conn.handle(&echo, &handler).unwrap()),
+            status::SUCCESS
+        );
+        let dispatched = handler.seen().len();
+        let replay = conn.handle(&echo, &handler).unwrap();
+        assert_eq!(reply_status(&replay), status::INVALID_PARAMETER);
+        assert_eq!(
+            handler.seen().len(),
+            dispatched,
+            "a replay must not dispatch"
+        );
+    }
+
+    #[test]
+    fn foreign_session_ids_and_logged_off_sessions_are_refused() {
+        let mut conn = Connection::new();
+        let handler = Recorder::default();
+        let key = handshake(&mut conn, &handler);
+        let dispatched = handler.seen().len();
+
+        let mut foreign = request_for_session(command::ECHO, 3, 0, 0, 0x9999, &[]);
+        sign_request(&mut foreign, &key);
+        assert_eq!(
+            reply_status(&conn.handle(&foreign, &handler).unwrap()),
+            status::USER_SESSION_DELETED
+        );
+        assert_eq!(handler.seen().len(), dispatched);
+
+        let mut logoff = request(command::LOGOFF, 4, 0, &[]);
+        sign_request(&mut logoff, &key);
+        assert_eq!(
+            reply_status(&conn.handle(&logoff, &handler).unwrap()),
+            status::SUCCESS
+        );
+        let mut after = request(command::ECHO, 5, 0, &[]);
+        sign_request(&mut after, &key);
+        assert_eq!(
+            reply_status(&conn.handle(&after, &handler).unwrap()),
+            status::USER_SESSION_DELETED
+        );
+        let mut again = request(command::SESSION_SETUP, 6, 0, &[]);
+        sign_request(&mut again, &key);
+        assert_eq!(
+            reply_status(&conn.handle(&again, &handler).unwrap()),
+            status::INVALID_PARAMETER
+        );
     }
 
     #[test]

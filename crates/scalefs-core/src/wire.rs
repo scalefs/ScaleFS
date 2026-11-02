@@ -1,4 +1,3 @@
-
 use crate::error::{Result, ScaleFsError};
 
 pub fn put_u16(out: &mut Vec<u8>, value: u16) {

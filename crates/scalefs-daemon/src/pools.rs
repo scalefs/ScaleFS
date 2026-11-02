@@ -1,31 +1,85 @@
-
 use scalefs_core::{AnyBlockDevice, BlockDevice, Geometry, MemberSpec, Pool, ScaleFsError};
 use scalefs_ipc::json::{Value, object};
 use scalefs_ipc::proto::ErrorCode;
 use scalefs_mount::mountcore::MountCore;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 pub type OpError = (ErrorCode, String);
 
 type ServedDevice = Arc<AnyBlockDevice>;
-type PoolCore = Arc<MountCore<ServedDevice>>;
+pub(crate) type PoolCore = Arc<MountCore<ServedDevice>>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PoolPresentation {
+    External,
+    Fixed,
+}
+
+impl PoolPresentation {
+    pub(crate) fn from_external(external: bool) -> Self {
+        if external {
+            PoolPresentation::External
+        } else {
+            PoolPresentation::Fixed
+        }
+    }
+
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            PoolPresentation::External => "external",
+            PoolPresentation::Fixed => "fixed",
+        }
+    }
+}
 
 pub struct PoolHandle {
     pub pool: Arc<RwLock<Pool<ServedDevice>>>,
     pub core: Option<PoolCore>,
+    pub presentation: PoolPresentation,
     pub guard: ShareGuard,
 }
 
 pub struct ShareGuard {
     served: Arc<AtomicUsize>,
+    held: Arc<AtomicBool>,
+}
+
+impl ShareGuard {
+    fn claim(served: &Arc<AtomicUsize>) -> ShareGuard {
+        served.fetch_add(1, Ordering::SeqCst);
+        ShareGuard {
+            served: Arc::clone(served),
+            held: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn witness(&self) -> GuardWitness {
+        GuardWitness {
+            held: Arc::clone(&self.held),
+        }
+    }
 }
 
 impl Drop for ShareGuard {
     fn drop(&mut self) {
+        self.held.store(false, Ordering::SeqCst);
         self.served.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct GuardWitness {
+    held: Arc<AtomicBool>,
+}
+
+impl GuardWitness {
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
     }
 }
 
@@ -40,23 +94,49 @@ pub struct Registry {
 fn persist_pools(
     pools: &Mutex<BTreeMap<String, Arc<Attached>>>,
     state: &Option<Arc<crate::state::StateStore>>,
-) {
-    let Some(store) = state else { return };
-    let snapshot: Vec<crate::state::RecordedPool> = {
+) -> std::io::Result<()> {
+    let Some(store) = state else { return Ok(()) };
+    let _persist = store.persist_guard();
+    let stored = match store.load_suppressed() {
+        Ok(stored) => stored,
+        Err(error) => {
+            eprintln!(
+                "scalefsd: could not persist the pool record: the safe-removal records \
+                 already on disk cannot be read ({error})"
+            );
+            return Err(error);
+        }
+    };
+    let (rows, tombstones) = {
         let pools = pools.lock().expect("registry lock");
-        pools
-            .values()
-            .map(|entry| crate::state::RecordedPool {
+        let mut rows = Vec::new();
+        let mut tombstones = Vec::new();
+        for entry in pools.values() {
+            let record = crate::state::RecordedPool {
                 name: entry.name.clone(),
                 pool_id: entry.pool_id.clone(),
                 members: entry.members.lock().expect("member paths").clone(),
                 mounts: recorded_mounts(entry),
-            })
-            .collect()
+                eject: *entry.eject_state.lock().expect("eject state"),
+            };
+            if record.eject.is_some() {
+                tombstones.push(record);
+            } else {
+                rows.push(record);
+            }
+        }
+        tombstones.extend(stored.into_iter().filter(|tombstone| {
+            !pools
+                .values()
+                .any(|entry| entry.pool_id.eq_ignore_ascii_case(&tombstone.pool_id))
+        }));
+        (rows, tombstones)
     };
-    if let Err(error) = store.save(&snapshot) {
+    if let Err(error) = store.save(&rows, &tombstones) {
         eprintln!("scalefsd: could not persist the pool record: {error}");
+        return Err(error);
     }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -66,14 +146,54 @@ fn recorded_mounts(entry: &Arc<Attached>) -> Vec<crate::state::RecordedMount> {
         MountSlot::Mounted(_, active) => vec![crate::state::RecordedMount {
             mountpoint: active.mountpoint.display().to_string(),
             read_only: active.read_only,
+            kernel_device: None,
         }],
         _ => Vec::new(),
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn recorded_mounts(entry: &Arc<Attached>) -> Vec<crate::state::RecordedMount> {
+    entry
+        .serve_mount
+        .lock()
+        .expect("serve mount")
+        .clone()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn recorded_mounts(_entry: &Arc<Attached>) -> Vec<crate::state::RecordedMount> {
     Vec::new()
+}
+
+#[cfg(windows)]
+fn reactivated_letter(
+    tombstone: &crate::state::RecordedPool,
+) -> Option<crate::state::RecordedMount> {
+    tombstone
+        .mounts
+        .iter()
+        .find(|mount| mount.kernel_device.is_some())
+        .cloned()
+}
+
+fn report_reactivation(name: &str, tombstone: &crate::state::RecordedPool) {
+    let (phase, generation) = tombstone.eject.map_or(("prepared", 0), |eject| {
+        (eject.phase.word(), eject.generation)
+    });
+    #[cfg(windows)]
+    let letter = match reactivated_letter(tombstone) {
+        Some(mount) => format!("; its drive letter {} is kept", mount.mountpoint),
+        None => String::new(),
+    };
+    #[cfg(not(windows))]
+    let letter = "";
+    println!(
+        "scalefsd: pool '{name}' was ejected ({phase}, generation {generation}); the operator \
+         attached it again — clearing the safe-removal record{letter}"
+    );
 }
 
 impl Registry {
@@ -85,7 +205,22 @@ impl Registry {
     }
 
     fn persist(&self) {
-        persist_pools(&self.pools, &self.state);
+        let _ = persist_pools(&self.pools, &self.state);
+    }
+
+    fn persist_checked(&self) -> std::io::Result<()> {
+        persist_pools(&self.pools, &self.state)
+    }
+
+    #[cfg(windows)]
+    pub fn record_serve_mount(&self, pool: &str, record: Option<crate::state::RecordedMount>) {
+        let entry = {
+            let pools = self.pools.lock().expect("registry lock");
+            let Some(entry) = pools.get(pool) else { return };
+            Arc::clone(entry)
+        };
+        *entry.serve_mount.lock().expect("serve mount") = record;
+        self.persist();
     }
 
     pub(crate) fn attach_recorded(
@@ -93,8 +228,14 @@ impl Registry {
         name: String,
         members: &[String],
     ) -> Result<Value, OpError> {
-        self.attach_paths(name, members, false)
+        self.attach_paths(name, members, false, AttachBy::BootRestore)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttachBy {
+    Operator,
+    BootRestore,
 }
 
 struct Attached {
@@ -103,15 +244,41 @@ struct Attached {
     media: Mutex<Vec<Value>>,
     pool_id: String,
     pool: Arc<RwLock<Pool<ServedDevice>>>,
-    core: Option<PoolCore>,
+    core: OnceLock<PoolCore>,
     #[cfg(target_os = "linux")]
     mounted: Mutex<MountSlot>,
     #[cfg(target_os = "linux")]
     mount_generation: AtomicU64,
+    #[cfg(target_os = "linux")]
+    last_mount_exit: Mutex<Option<String>>,
+    #[cfg(windows)]
+    serve_mount: Mutex<Option<crate::state::RecordedMount>>,
     shares_served: Arc<AtomicUsize>,
     busy: AtomicU64,
     status: Mutex<Value>,
     wrecked: std::sync::atomic::AtomicBool,
+    presents_external: std::sync::atomic::AtomicBool,
+    eject_state: Mutex<Option<crate::state::EjectState>>,
+    next_eject_generation: AtomicU64,
+    eject_pending: std::sync::atomic::AtomicBool,
+    commits_in_flight: std::sync::atomic::AtomicUsize,
+}
+
+struct CommitInFlight {
+    entry: Arc<Attached>,
+}
+
+impl CommitInFlight {
+    fn begin(entry: Arc<Attached>) -> CommitInFlight {
+        entry.commits_in_flight.fetch_add(1, Ordering::SeqCst);
+        CommitInFlight { entry }
+    }
+}
+
+impl Drop for CommitInFlight {
+    fn drop(&mut self) {
+        self.entry.commits_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -119,6 +286,7 @@ struct ActiveMount {
     mountpoint: std::path::PathBuf,
     read_only: bool,
     worker: std::thread::JoinHandle<()>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -127,6 +295,7 @@ enum MountSlot {
     Mounting(u64),
     Mounted(u64, ActiveMount),
     Unmounting(u64),
+    Draining(u64),
     Ended(#[allow(dead_code)] u64, std::thread::JoinHandle<()>),
 }
 
@@ -143,9 +312,59 @@ fn park_ended(entry: &Attached, generation: u64) {
 }
 
 #[cfg(target_os = "linux")]
+fn park_drained(entry: &Attached, generation: u64) {
+    if let Ok(mut slot) = entry.mounted.lock()
+        && matches!(&*slot, MountSlot::Draining(g) if *g == generation)
+    {
+        *slot = MountSlot::Empty;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_off_thread(entry: &Arc<Attached>, generation: u64, state: ActiveMount) {
+    state.stop.store(true, Ordering::SeqCst);
+    let _ = scalefs_mount::fuse::device::detach_mountpoint(&state.mountpoint);
+    *entry.mounted.lock().expect("mount state") = MountSlot::Draining(generation);
+    let entry = Arc::clone(entry);
+    let worker = state.worker;
+    std::thread::spawn(move || {
+        let _ = worker.join();
+        park_drained(&entry, generation);
+    });
+}
+
+#[cfg(target_os = "linux")]
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(target_os = "linux")]
+fn bounded_join_all(handles: Vec<std::thread::JoinHandle<()>>, deadline: std::time::Duration) {
+    if handles.is_empty() {
+        return;
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    let count = handles.len();
+    for handle in handles {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done.send(());
+        });
+    }
+    drop(done);
+    let start = std::time::Instant::now();
+    for _ in 0..count {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if remaining.is_zero() || finished.recv_timeout(remaining).is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 enum UnmountRefusal {
     NotMounted,
     InProgress,
+    Busy(std::path::PathBuf),
 }
 
 #[cfg(target_os = "linux")]
@@ -235,9 +454,25 @@ impl Registry {
             _ => return Err(bad("members must be a non-empty array of image paths")()),
         };
         let degraded = degraded_flag(params)?;
-        let summary = self.attach_paths(name, &members, degraded)?;
+        let summary = self.attach_paths(name, &members, degraded, AttachBy::Operator)?;
         self.persist();
         Ok(summary)
+    }
+
+    fn stored_tombstone(&self, pool_id: &str) -> Option<crate::state::RecordedPool> {
+        let store = self.state.as_ref()?;
+        match store.load_suppressed() {
+            Ok(tombstones) => tombstones
+                .into_iter()
+                .find(|tombstone| tombstone.pool_id.eq_ignore_ascii_case(pool_id)),
+            Err(error) => {
+                eprintln!(
+                    "scalefsd: cannot read the safe-removal records ({error}); attaching \
+                     without them"
+                );
+                None
+            }
+        }
     }
 
     pub fn import(&self, params: &Value) -> Result<Value, OpError> {
@@ -273,7 +508,7 @@ impl Registry {
             None if valid_name(&plan.label) => plan.label.clone(),
             None => hex(&plan.pool_id.0[..6]),
         };
-        let mut result = self.attach_paths(name, &plan.members, degraded)?;
+        let mut result = self.attach_paths(name, &plan.members, degraded, AttachBy::Operator)?;
         self.persist();
         if !plan.duplicates.is_empty()
             && let Value::Object(entries) = &mut result
@@ -291,6 +526,7 @@ impl Registry {
         name: String,
         members: &[String],
         degraded: bool,
+        by: AttachBy,
     ) -> Result<Value, OpError> {
         {
             let pools = self.pools.lock().expect("registry lock");
@@ -313,6 +549,7 @@ impl Registry {
             }
         }
         let media: Vec<Value> = members.iter().map(|path| probe_medium(path)).collect();
+        let presents_external = media_presents_external(&media);
 
         let mut devices = Vec::with_capacity(members.len());
         for path in members {
@@ -328,21 +565,35 @@ impl Registry {
         .map_err(map_error)?;
 
         let engine_read_only = pool.read_only();
-        let mut attached = Attached {
+        let pool_id = hex(&pool.superblock().pool_id.0);
+        let tombstone = match by {
+            AttachBy::Operator => self.stored_tombstone(&pool_id),
+            AttachBy::BootRestore => None,
+        };
+        let attached = Attached {
             name: name.clone(),
             members: Mutex::new(members.to_vec()),
             media: Mutex::new(media),
-            pool_id: hex(&pool.superblock().pool_id.0),
+            pool_id,
             pool: Arc::new(RwLock::new(pool)),
-            core: None,
+            core: OnceLock::new(),
             #[cfg(target_os = "linux")]
             mounted: Mutex::new(MountSlot::Empty),
             #[cfg(target_os = "linux")]
             mount_generation: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            last_mount_exit: Mutex::new(None),
+            #[cfg(windows)]
+            serve_mount: Mutex::new(tombstone.as_ref().and_then(reactivated_letter)),
             shares_served: Arc::new(AtomicUsize::new(0)),
             busy: AtomicU64::new(0),
             status: Mutex::new(Value::Null),
             wrecked: std::sync::atomic::AtomicBool::new(false),
+            presents_external: std::sync::atomic::AtomicBool::new(presents_external),
+            eject_state: Mutex::new(None),
+            next_eject_generation: AtomicU64::new(0),
+            eject_pending: std::sync::atomic::AtomicBool::new(false),
+            commits_in_flight: std::sync::atomic::AtomicUsize::new(0),
         };
         {
             let pool = attached.pool.read().expect("pool lock");
@@ -377,10 +628,16 @@ impl Registry {
             }
         }
         if !engine_read_only {
-            attached.core = Some(Arc::new(MountCore::read_write(Arc::clone(&attached.pool))));
+            attached
+                .core
+                .get_or_init(|| Arc::new(MountCore::read_write(Arc::clone(&attached.pool))));
         }
         let summary = attached.status.lock().expect("status cache").clone();
-        pools.insert(name, Arc::new(attached));
+        pools.insert(name.clone(), Arc::new(attached));
+        drop(pools);
+        if let Some(tombstone) = &tombstone {
+            report_reactivation(&name, tombstone);
+        }
         Ok(summary)
     }
 
@@ -411,11 +668,35 @@ impl Registry {
         if !mountpoint.is_absolute() {
             return Err(bad("the mountpoint must be an absolute path")());
         }
-        if !mountpoint.is_dir() {
-            return Err((
-                ErrorCode::NotFound,
-                format!("{} is not a directory", mountpoint.display()),
-            ));
+        if scalefs_mount::fuse::device::clear_stale_mount(&mountpoint) {
+            eprintln!(
+                "scalefsd: cleared a dead FUSE mount at {} before mounting",
+                mountpoint.display(),
+            );
+        }
+        match std::fs::metadata(&mountpoint) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err((
+                    ErrorCode::NotFound,
+                    format!("{} is not a directory", mountpoint.display()),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err((
+                    ErrorCode::NotFound,
+                    format!("{} does not exist", mountpoint.display()),
+                ));
+            }
+            Err(error) => {
+                return Err((
+                    ErrorCode::Io,
+                    format!(
+                        "cannot use {} as a mountpoint: {error}",
+                        mountpoint.display()
+                    ),
+                ));
+            }
         }
         let (entry, generation, core) = {
             let pools = self.pools.lock().expect("registry lock");
@@ -434,7 +715,13 @@ impl Registry {
                     ),
                 ));
             }
-            let core = match (&entry.core, read_only) {
+            if entry.eject_pending.load(Ordering::SeqCst) {
+                return Err((
+                    ErrorCode::Conflict,
+                    format!("pool '{name}' is being ejected; it cannot be mounted"),
+                ));
+            }
+            let core = match (entry.core.get(), read_only) {
                 (Some(core), _) => Some(Arc::clone(core)),
                 (None, true) => None,
                 (None, false) => {
@@ -466,6 +753,15 @@ impl Registry {
                             format!("pool '{name}' has a mount operation in progress"),
                         ));
                     }
+                    MountSlot::Draining(_) => {
+                        return Err((
+                            ErrorCode::Conflict,
+                            format!(
+                                "pool '{name}' has a forced unmount still draining; \
+                                 try again shortly"
+                            ),
+                        ));
+                    }
                     MountSlot::Mounted(_, state) => {
                         return Err((
                             ErrorCode::Conflict,
@@ -494,6 +790,7 @@ impl Registry {
                 )
             },
         )?;
+        let stop = fuse.stop_handle();
         let worker_entry = Arc::clone(&entry);
         let worker_name = name.to_string();
         let mut slot = entry.mounted.lock().expect("mount state");
@@ -515,7 +812,19 @@ impl Registry {
                             .map(|n| n.get().min(4))
                             .unwrap_or(1)
                     });
-                let _ = scalefs_mount::fuse::session::serve(&mount, &filesystem, workers);
+                let session_exit =
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scalefs_mount::fuse::session::serve(&mount, &filesystem, workers)
+                    })) {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => {
+                            Some(format!("the mount session ended with an error: {error}"))
+                        }
+                        Err(_) => Some("the mount worker panicked".to_string()),
+                    };
+                if let Some(reason) = &session_exit {
+                    eprintln!("scalefsd: the mount of '{worker_name}' ended — {reason}");
+                }
                 if let Err(errno) = filesystem.shutdown() {
                     eprintln!(
                         "scalefsd: the flush for the ending mount of '{worker_name}' \
@@ -529,6 +838,7 @@ impl Registry {
                 {
                     *status = full_status(&worker_entry, &pool);
                 }
+                *worker_entry.last_mount_exit.lock().expect("mount exit") = session_exit;
                 mount.unmount();
                 park_ended(&worker_entry, generation);
             });
@@ -541,8 +851,10 @@ impl Registry {
                         mountpoint,
                         read_only,
                         worker,
+                        stop,
                     },
                 );
+                *entry.last_mount_exit.lock().expect("mount exit") = None;
                 claim.disarm();
                 drop(slot);
                 Ok(object(vec![
@@ -560,6 +872,7 @@ impl Registry {
     #[cfg(target_os = "linux")]
     pub fn unmount(&self, params: &Value) -> Result<Value, OpError> {
         let name = required_name(params)?;
+        let force = force_flag(params)?;
         let entry = {
             let pools = self.pools.lock().expect("registry lock");
             pools.get(&name).map(Arc::clone)
@@ -570,7 +883,7 @@ impl Registry {
                 format!("no pool is attached as '{name}'"),
             )
         })?;
-        match Self::unmount_entry(&entry) {
+        match Self::unmount_entry(&entry, force) {
             Ok(()) => {
                 self.persist();
                 Ok(Value::Null)
@@ -582,16 +895,25 @@ impl Registry {
                 ErrorCode::Conflict,
                 format!("pool '{name}' has a mount operation in progress"),
             )),
+            Err(UnmountRefusal::Busy(mountpoint)) => Err((
+                ErrorCode::Conflict,
+                format!(
+                    "pool '{name}' is mounted at {} and busy (files are open on it, \
+                     or a working directory is inside it); close them, or unmount \
+                     with force",
+                    mountpoint.display(),
+                ),
+            )),
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn unmount_entry(entry: &Arc<Attached>) -> Result<(), UnmountRefusal> {
+    fn unmount_entry(entry: &Arc<Attached>, force: bool) -> Result<(), UnmountRefusal> {
         let (generation, state) = {
             let mut slot = entry.mounted.lock().expect("mount state");
             match &*slot {
                 MountSlot::Empty => return Err(UnmountRefusal::NotMounted),
-                MountSlot::Mounting(_) | MountSlot::Unmounting(_) => {
+                MountSlot::Mounting(_) | MountSlot::Unmounting(_) | MountSlot::Draining(_) => {
                     return Err(UnmountRefusal::InProgress);
                 }
                 MountSlot::Ended(..) => {
@@ -604,11 +926,8 @@ impl Registry {
                     let _ = worker.join();
                     return Ok(());
                 }
-                MountSlot::Mounted(..) => {
-                    let generation = match &*slot {
-                        MountSlot::Mounted(generation, _) => *generation,
-                        _ => unreachable!(),
-                    };
+                MountSlot::Mounted(generation, _) => {
+                    let generation = *generation;
                     let MountSlot::Mounted(_, state) =
                         std::mem::replace(&mut *slot, MountSlot::Unmounting(generation))
                     else {
@@ -618,14 +937,37 @@ impl Registry {
                 }
             }
         };
-        let _reopen = SlotReset {
+        let mut reopen = SlotReset {
             entry: Arc::clone(entry),
             generation,
             armed: true,
         };
-        let _ = scalefs_mount::fuse::device::detach_mountpoint(&state.mountpoint);
-        let _ = state.worker.join();
-        Ok(())
+
+        if force {
+            reopen.disarm();
+            drain_off_thread(entry, generation, state);
+            return Ok(());
+        }
+
+        match scalefs_mount::fuse::device::unmount_mountpoint(&state.mountpoint) {
+            Ok(()) => {
+                let _ = state.worker.join();
+                reopen.disarm();
+                *entry.mounted.lock().expect("mount state") = MountSlot::Empty;
+                Ok(())
+            }
+            Err(error) if scalefs_mount::fuse::device::is_busy(&error) => {
+                let mountpoint = state.mountpoint.clone();
+                reopen.disarm();
+                *entry.mounted.lock().expect("mount state") = MountSlot::Mounted(generation, state);
+                Err(UnmountRefusal::Busy(mountpoint))
+            }
+            Err(_) => {
+                reopen.disarm();
+                drain_off_thread(entry, generation, state);
+                Ok(())
+            }
+        }
     }
 
     pub fn unmount_all(&self) {
@@ -635,9 +977,20 @@ impl Registry {
                 let pools = self.pools.lock().expect("registry lock");
                 pools.values().map(Arc::clone).collect()
             };
-            for entry in entries {
-                let _ = Self::unmount_entry(&entry);
+            let mut workers = Vec::new();
+            for entry in &entries {
+                let mut slot = entry.mounted.lock().expect("mount state");
+                match std::mem::replace(&mut *slot, MountSlot::Empty) {
+                    MountSlot::Mounted(_, state) => {
+                        state.stop.store(true, Ordering::SeqCst);
+                        let _ = scalefs_mount::fuse::device::detach_mountpoint(&state.mountpoint);
+                        workers.push(state.worker);
+                    }
+                    MountSlot::Ended(_, worker) => workers.push(worker),
+                    other => *slot = other,
+                }
             }
+            bounded_join_all(workers, SHUTDOWN_DRAIN_DEADLINE);
         }
     }
 
@@ -701,9 +1054,18 @@ impl Registry {
 
     pub fn detach(&self, params: &Value) -> Result<Value, OpError> {
         let name = required_name(params)?;
+        self.detach_named(&name, true)?;
+        Ok(Value::Null)
+    }
+
+    pub fn detach_quiesce(&self, name: &str) -> Result<(), OpError> {
+        self.detach_named(name, false)
+    }
+
+    fn detach_named(&self, name: &str, persist: bool) -> Result<(), OpError> {
         let entry = {
             let mut pools = self.pools.lock().expect("registry lock");
-            let Some(entry) = pools.get(&name) else {
+            let Some(entry) = pools.get(name) else {
                 return Err((
                     ErrorCode::NotFound,
                     format!("no pool is attached as '{name}'"),
@@ -729,7 +1091,7 @@ impl Registry {
                         };
                         let _ = worker.join();
                     }
-                    MountSlot::Mounting(_) | MountSlot::Unmounting(_) => {
+                    MountSlot::Mounting(_) | MountSlot::Unmounting(_) | MountSlot::Draining(_) => {
                         return Err((
                             ErrorCode::Conflict,
                             format!(
@@ -757,10 +1119,12 @@ impl Registry {
                     format!("pool '{name}' is served by {serving} SMB {plural}; remove them first"),
                 ));
             }
-            pools.remove(&name).expect("checked present")
+            pools.remove(name).expect("checked present")
         };
-        self.persist();
-        if let Some(core) = &entry.core
+        if persist {
+            self.persist();
+        }
+        if let Some(core) = entry.core.get()
             && let Err(error) = core.shutdown()
         {
             return Err((
@@ -771,7 +1135,247 @@ impl Registry {
                 ),
             ));
         }
-        Ok(Value::Null)
+        Ok(())
+    }
+
+    pub fn eject_prepare(
+        &self,
+        name: &str,
+        preparer: Option<&GuardWitness>,
+    ) -> scalefs_mount::dataplane::PrepareOutcome {
+        use scalefs_mount::dataplane::{PrepareOutcome, PrepareVerdict};
+        let (entry, already) = {
+            let pools = self.pools.lock().expect("registry lock");
+            let Some(entry) = pools.get(name) else {
+                return PrepareOutcome::nak(PrepareVerdict::Unsupported);
+            };
+            let entry = Arc::clone(entry);
+            let already = entry.eject_pending.load(Ordering::SeqCst);
+            entry.eject_pending.store(true, Ordering::SeqCst);
+            if entry.busy.load(Ordering::SeqCst) != 0 {
+                if !already {
+                    entry.eject_pending.store(false, Ordering::SeqCst);
+                }
+                return PrepareOutcome::nak(PrepareVerdict::NakBusyWithJob);
+            }
+            let served = entry.shares_served.load(Ordering::SeqCst);
+            let own = usize::from(preparer.is_some_and(GuardWitness::held));
+            let foreign_share = served.saturating_sub(own) > 0;
+            #[cfg(target_os = "linux")]
+            let foreign_mount = !matches!(
+                &*entry.mounted.lock().expect("mount slot"),
+                MountSlot::Empty
+            );
+            #[cfg(not(target_os = "linux"))]
+            let foreign_mount = false;
+            if foreign_share || foreign_mount {
+                if !already {
+                    entry.eject_pending.store(false, Ordering::SeqCst);
+                }
+                return PrepareOutcome::nak(PrepareVerdict::NakFenceHeld);
+            }
+            (entry, already)
+        };
+        if let Some(core) = entry.core.get()
+            && let Err(error) = core.commit()
+        {
+            eprintln!(
+                "scalefsd: eject prepare of '{name}' — the pool-wide FSYNC failed: {error:?}"
+            );
+            if !already {
+                entry.eject_pending.store(false, Ordering::SeqCst);
+            }
+            return PrepareOutcome::nak(PrepareVerdict::NakFsyncFailed);
+        }
+        let (generation, needs_write) = {
+            let mut state = entry.eject_state.lock().expect("eject state");
+            match (*state, already) {
+                (Some(standing), true) => (standing.generation, false),
+                (None, true) => {
+                    let generation = entry.next_eject_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    eprintln!(
+                        "scalefsd: eject prepare of '{name}' — a freeze was standing with no \
+                         durable safe-removal state; recording prepared(generation {generation}) \
+                         now"
+                    );
+                    *state = Some(crate::state::EjectState {
+                        phase: crate::state::EjectPhase::Prepared,
+                        generation,
+                    });
+                    (generation, true)
+                }
+                (Some(standing), false) => (standing.generation, false),
+                (None, false) => {
+                    let generation = entry.next_eject_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    *state = Some(crate::state::EjectState {
+                        phase: crate::state::EjectPhase::Prepared,
+                        generation,
+                    });
+                    (generation, true)
+                }
+            }
+        };
+        if needs_write && let Err(error) = self.persist_checked() {
+            eprintln!(
+                "scalefsd: eject prepare of '{name}' — the safe-removal state could not be \
+                 recorded ({error}); refusing the eject rather than granting one this daemon \
+                 would forget"
+            );
+            *entry.eject_state.lock().expect("eject state") = None;
+            if !already {
+                entry.eject_pending.store(false, Ordering::SeqCst);
+            }
+            return PrepareOutcome::nak(PrepareVerdict::NakStateWriteFailed);
+        }
+        PrepareOutcome {
+            verdict: PrepareVerdict::Ack,
+            generation,
+        }
+    }
+
+    pub fn eject_abort(&self, name: &str, generation: u64) {
+        let cleared = {
+            let pools = self.pools.lock().expect("registry lock");
+            let Some(entry) = pools.get(name) else { return };
+            if entry.commits_in_flight.load(Ordering::SeqCst) != 0 {
+                eprintln!(
+                    "scalefsd: eject abort of '{name}' (generation {generation}) IGNORED — a \
+                     commit of the removal is being evaluated; its verdict settles the barrier"
+                );
+                return;
+            }
+            let mut state = entry.eject_state.lock().expect("eject state");
+            let standing_now = *state;
+            match standing_now {
+                Some(standing) if standing.phase == crate::state::EjectPhase::Ejected => {
+                    eprintln!(
+                        "scalefsd: eject abort of '{name}' (generation {generation}) IGNORED — \
+                         the removal already committed (generation {}); the freeze stands until \
+                         the pool is detached and reattached",
+                        standing.generation,
+                    );
+                    false
+                }
+                Some(standing) if generation != 0 && standing.generation != generation => {
+                    eprintln!(
+                        "scalefsd: eject abort of '{name}' names generation {generation} but \
+                         generation {} is standing; ignoring the stale abort",
+                        standing.generation,
+                    );
+                    false
+                }
+                _ => {
+                    entry.eject_pending.store(false, Ordering::SeqCst);
+                    state.take().is_some()
+                }
+            }
+        };
+        if cleared {
+            self.persist();
+        }
+    }
+
+    pub fn eject_commit(
+        &self,
+        name: &str,
+        generation: u64,
+        committer: Option<&GuardWitness>,
+    ) -> scalefs_mount::dataplane::PrepareVerdict {
+        match self.eject_commit_close(name, generation, committer) {
+            Ok(commit) => self.eject_commit_record(commit, name, generation),
+            Err(answered) => answered,
+        }
+    }
+
+    fn eject_commit_close(
+        &self,
+        name: &str,
+        generation: u64,
+        committer: Option<&GuardWitness>,
+    ) -> Result<CommitInFlight, scalefs_mount::dataplane::PrepareVerdict> {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let pools = self.pools.lock().expect("registry lock");
+        let Some(entry) = pools.get(name) else {
+            println!(
+                "scalefsd: eject commit of '{name}' (generation {generation}) — the pool is \
+                 already detached; the removal stands"
+            );
+            return Err(PrepareVerdict::Ack);
+        };
+        let commit = CommitInFlight::begin(Arc::clone(entry));
+        let entry = &commit.entry;
+        entry.eject_pending.store(true, Ordering::SeqCst);
+        let job = entry.busy.load(Ordering::SeqCst);
+        if job != 0 {
+            eprintln!(
+                "scalefsd: eject commit of '{name}' (generation {generation}) REFUSED — job \
+                 {job} was started while the eject barrier was down; the volume is gone but \
+                 the removal is NOT confirmed"
+            );
+            return Err(PrepareVerdict::NakBusyWithJob);
+        }
+        let served = entry.shares_served.load(Ordering::SeqCst);
+        let own = usize::from(committer.is_some_and(GuardWitness::held));
+        let foreign_shares = served.saturating_sub(own);
+        #[cfg(target_os = "linux")]
+        let foreign_mount = !matches!(
+            &*entry.mounted.lock().expect("mount slot"),
+            MountSlot::Empty
+        );
+        #[cfg(not(target_os = "linux"))]
+        let foreign_mount = false;
+        if foreign_shares != 0 || foreign_mount {
+            eprintln!(
+                "scalefsd: eject commit of '{name}' (generation {generation}) REFUSED — \
+                 another surface ({foreign_shares} share guard(s){}) holds the pool, \
+                 admitted while the eject barrier was down; the volume is gone but the \
+                 removal is NOT confirmed",
+                if foreign_mount {
+                    ", a kernel mount"
+                } else {
+                    ""
+                },
+            );
+            return Err(PrepareVerdict::NakFenceHeld);
+        }
+        Ok(commit)
+    }
+
+    fn eject_commit_record(
+        &self,
+        commit: CommitInFlight,
+        name: &str,
+        generation: u64,
+    ) -> scalefs_mount::dataplane::PrepareVerdict {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let entry = &commit.entry;
+        if let Some(core) = entry.core.get()
+            && let Err(error) = core.commit()
+        {
+            eprintln!(
+                "scalefsd: eject commit of '{name}' (generation {generation}) REFUSED — the \
+                 pool-wide commit failed ({error:?}); the volume is gone but the removal is \
+                 NOT confirmed"
+            );
+            return PrepareVerdict::NakFsyncFailed;
+        }
+        *entry.eject_state.lock().expect("eject state") = Some(crate::state::EjectState {
+            phase: crate::state::EjectPhase::Ejected,
+            generation,
+        });
+        if let Err(error) = self.persist_checked() {
+            eprintln!(
+                "scalefsd: eject commit of '{name}' (generation {generation}) — the safe-removal \
+                 state could not be recorded ({error}); the dismount stands but the eject is \
+                 reported FAILED so it is not mistaken for confirmed"
+            );
+            return PrepareVerdict::NakStateWriteFailed;
+        }
+        println!(
+            "scalefsd: eject commit of '{name}' — safe removal recorded (generation \
+             {generation}); the pool will not come back until it is reattached"
+        );
+        PrepareVerdict::Ack
     }
 
     pub fn share_handle(&self, name: &str) -> Result<PoolHandle, OpError> {
@@ -791,13 +1395,19 @@ impl Registry {
                 ),
             ));
         }
-        entry.shares_served.fetch_add(1, Ordering::SeqCst);
+        if entry.eject_pending.load(Ordering::SeqCst) {
+            return Err((
+                ErrorCode::Conflict,
+                format!("pool '{name}' is being ejected; it cannot take a new surface"),
+            ));
+        }
         Ok(PoolHandle {
             pool: Arc::clone(&entry.pool),
-            core: entry.core.as_ref().map(Arc::clone),
-            guard: ShareGuard {
-                served: Arc::clone(&entry.shares_served),
-            },
+            core: entry.core.get().cloned(),
+            presentation: PoolPresentation::from_external(
+                entry.presents_external.load(Ordering::SeqCst),
+            ),
+            guard: ShareGuard::claim(&entry.shares_served),
         })
     }
 
@@ -823,6 +1433,61 @@ impl Registry {
             )
         })?;
         Ok(entry.snapshot())
+    }
+
+    pub fn eject_record(&self, params: &Value) -> Result<Value, OpError> {
+        let pool_id = match params.get("pool_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return Err(bad("'pool_id' (a nonempty string) is required")()),
+        };
+        let reply = |attached: bool, eject: Option<crate::state::EjectState>, known: bool| {
+            let (phase, generation) = match eject {
+                Some(state) => (state.phase.word(), state.generation),
+                None if known => ("none", 0),
+                None => ("unknown", 0),
+            };
+            object(vec![
+                ("pool_id", Value::Str(pool_id.to_ascii_lowercase())),
+                ("attached", Value::Bool(attached)),
+                ("phase", Value::Str(phase.to_string())),
+                ("generation", Value::Int(i128::from(generation))),
+            ])
+        };
+        let live = {
+            let pools = self.pools.lock().expect("registry lock");
+            pools
+                .values()
+                .find(|entry| entry.pool_id.eq_ignore_ascii_case(&pool_id))
+                .map(|entry| *entry.eject_state.lock().expect("eject state"))
+        };
+        if let Some(eject) = live {
+            return Ok(reply(true, eject, true));
+        }
+        let stored = match &self.state {
+            Some(store) => store.load_suppressed().map_err(|error| -> OpError {
+                (
+                    ErrorCode::Io,
+                    format!("cannot read the safe-removal records: {error}"),
+                )
+            })?,
+            None => Vec::new(),
+        };
+        Ok(
+            match stored
+                .iter()
+                .find(|tombstone| tombstone.pool_id.eq_ignore_ascii_case(&pool_id))
+            {
+                Some(tombstone) => reply(
+                    false,
+                    Some(tombstone.eject.unwrap_or(crate::state::EjectState {
+                        phase: crate::state::EjectPhase::Prepared,
+                        generation: 0,
+                    })),
+                    true,
+                ),
+                None => reply(false, None, false),
+            },
+        )
     }
 
     pub fn scrub(&self, params: &Value) -> Result<Value, OpError> {
@@ -930,7 +1595,7 @@ impl Registry {
                 now_ns(),
             )?;
             entry.adopt_member_path(&target, &identity, device_id);
-            persist_pools(&persist.0, &persist.1);
+            let _ = persist_pools(&persist.0, &persist.1);
             let mut result = vec![
                 ("replaced", Value::Int(i128::from(member))),
                 ("target", Value::Str(target.clone())),
@@ -986,7 +1651,7 @@ impl Registry {
                 now_ns(),
             )?;
             entry.adopt_member_path(&target, &identity, device_id);
-            persist_pools(&persist.0, &persist.1);
+            let _ = persist_pools(&persist.0, &persist.1);
             Ok(object(vec![
                 ("member", Value::Int(i128::from(member))),
                 ("target", Value::Str(target.clone())),
@@ -1009,9 +1674,43 @@ impl Registry {
             if let Some(id) = &device_id {
                 entry.drop_member_path(id);
             }
-            persist_pools(&persist.0, &persist.1);
+            let _ = persist_pools(&persist.0, &persist.1);
             let mut result = vec![
                 ("removed", Value::Int(i128::from(member))),
+                ("members", Value::Int(pool.member_count() as i128)),
+            ];
+            if let Some(id) = device_id {
+                result.push(("device_id", Value::Str(id)));
+            }
+            Ok(object(result))
+        })
+    }
+
+    pub fn retire(&self, params: &Value) -> Result<Value, OpError> {
+        let member = member_param(params)?.ok_or_else(bad(
+            "params need a member (an index, or a device id in hex)",
+        ))?;
+        let persist = (Arc::clone(&self.pools), self.state.clone());
+        self.start_job(params, "retire", move |pool, entry| {
+            let member = resolve_member(pool, &member)?;
+            let device_id = member_device_id(pool, member);
+            let report = pool.retire_member(member, now_ns())?;
+            if let Some(id) = &device_id {
+                entry.drop_member_path(id);
+            }
+            let _ = persist_pools(&persist.0, &persist.1);
+            let mut result = vec![
+                ("retired", Value::Int(i128::from(member))),
+                (
+                    "records_rebuilt",
+                    Value::Int(report.records_rebuilt as i128),
+                ),
+                ("copies_written", Value::Int(report.copies_written as i128)),
+                (
+                    "snapshots_rewritten",
+                    Value::Int(report.snapshots_rewritten as i128),
+                ),
+                ("tx", Value::Int(report.tx_id as i128)),
                 ("members", Value::Int(pool.member_count() as i128)),
             ];
             if let Some(id) = device_id {
@@ -1119,6 +1818,12 @@ impl Registry {
                     ),
                 ));
             }
+            if entry.eject_pending.load(Ordering::SeqCst) {
+                return Err((
+                    ErrorCode::Conflict,
+                    format!("pool '{name}' is being ejected; no new job can start"),
+                ));
+            }
             if let Err(owner) =
                 entry
                     .busy
@@ -1147,7 +1852,7 @@ impl Registry {
                     entry: Arc::clone(&entry),
                 };
                 let outcome = {
-                    let _hold = entry.core.as_ref().map(|core| core.maintenance_hold());
+                    let _hold = entry.core.get().map(|core| core.maintenance_hold());
                     let Ok(mut pool) = entry.pool.write() else {
                         *worker_job.state.lock().expect("job state") = JobState::Failed(
                             ErrorCode::Internal,
@@ -1157,19 +1862,31 @@ impl Registry {
                         );
                         return;
                     };
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let result = work(&mut pool, &entry)?;
-                        *entry.status.lock().expect("status cache") = full_status(&entry, &pool);
-                        Ok(result)
-                    }));
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> scalefs_core::Result<(Value, bool)> {
+                            let result = work(&mut pool, &entry)?;
+                            *entry.status.lock().expect("status cache") =
+                                full_status(&entry, &pool);
+                            let healed_writable = entry.core.get().is_none() && !pool.read_only();
+                            Ok((result, healed_writable))
+                        },
+                    ));
                     if outcome.is_err() {
-                        if let Some(core) = &entry.core {
+                        if let Some(core) = entry.core.get() {
                             core.poison();
                         }
                         entry.wrecked.store(true, Ordering::SeqCst);
                     }
                     outcome
                 };
+                let (outcome, healed_writable) = match outcome {
+                    Ok(Ok((result, healed))) => (Ok(Ok(result)), healed),
+                    Ok(Err(error)) => (Ok(Err(error)), false),
+                    Err(panic) => (Err(panic), false),
+                };
+                if healed_writable {
+                    entry.restore_core();
+                }
                 *worker_job.state.lock().expect("job state") = match outcome {
                     Ok(Ok(result)) => JobState::Done(result),
                     Ok(Err(error)) => {
@@ -1251,6 +1968,13 @@ impl Attached {
         }
     }
 
+    fn restore_core(&self) {
+        let core: PoolCore = Arc::new(MountCore::read_write(Arc::clone(&self.pool)));
+        if let Err(extra) = self.core.set(core) {
+            let _ = extra.shutdown();
+        }
+    }
+
     fn snapshot(&self) -> Value {
         let mut status = self.status.lock().expect("status cache").clone();
         if let Value::Object(entries) = &mut status {
@@ -1261,6 +1985,14 @@ impl Attached {
             if self.wrecked.load(std::sync::atomic::Ordering::SeqCst) {
                 entries.push(("wrecked".to_string(), Value::Bool(true)));
             }
+            if let Ok(pool) = self.pool.try_read()
+                && pool.wounded()
+            {
+                match entries.iter_mut().find(|(key, _)| key == "wounded") {
+                    Some((_, value)) => *value = Value::Bool(true),
+                    None => entries.push(("wounded".to_string(), Value::Bool(true))),
+                }
+            }
             #[cfg(target_os = "linux")]
             if let MountSlot::Mounted(_, state) = &*self.mounted.lock().expect("mount state") {
                 entries.push((
@@ -1270,6 +2002,10 @@ impl Attached {
                 if state.read_only {
                     entries.push(("mounted_read_only".to_string(), Value::Bool(true)));
                 }
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(reason) = &*self.last_mount_exit.lock().expect("mount exit") {
+                entries.push(("last_mount_exit".to_string(), Value::Str(reason.clone())));
             }
         }
         status
@@ -1308,6 +2044,16 @@ fn full_status(entry: &Attached, pool: &Pool<ServedDevice>) -> Value {
         .iter()
         .map(|allocator| allocator.geometry().capacity_bytes())
         .sum();
+    let used: u64 = pool
+        .allocators()
+        .iter()
+        .map(|allocator| {
+            allocator
+                .zones()
+                .map(|zone| zone.write_pointer)
+                .sum::<u64>()
+        })
+        .sum();
     let missing = pool.missing_members();
     let member_rows = match pool.member_rosters() {
         Ok(rosters) => match rosters.first() {
@@ -1343,6 +2089,10 @@ fn full_status(entry: &Attached, pool: &Pool<ServedDevice>) -> Value {
         .iter()
         .map(|id| Value::Str(hex(&id.0)))
         .collect();
+    let presents_external = media_presents_external(&entry.media.lock().expect("media rows"));
+    entry
+        .presents_external
+        .store(presents_external, Ordering::SeqCst);
     object(vec![
         ("name", Value::Str(entry.name.clone())),
         ("label", Value::Str(superblock.label.clone())),
@@ -1351,6 +2101,27 @@ fn full_status(entry: &Attached, pool: &Pool<ServedDevice>) -> Value {
         ("mirror", Value::Int(i128::from(pool.mirror_width()))),
         ("data", Value::Int(i128::from(pool.data_width()))),
         ("parity", Value::Int(i128::from(pool.parity_width()))),
+        (
+            "naming",
+            object(vec![
+                (
+                    "case_sensitivity",
+                    Value::Str(
+                        match superblock.case_sensitivity {
+                            scalefs_core::CaseSensitivity::Sensitive => "sensitive",
+                            scalefs_core::CaseSensitivity::InsensitivePreserving => {
+                                "insensitive_preserving"
+                            }
+                        }
+                        .to_string(),
+                    ),
+                ),
+                (
+                    "unicode_version",
+                    Value::Str(superblock.unicode_version.to_string()),
+                ),
+            ]),
+        ),
         ("members", Value::Int(pool.member_count() as i128)),
         (
             "images",
@@ -1368,9 +2139,30 @@ fn full_status(entry: &Attached, pool: &Pool<ServedDevice>) -> Value {
             "media",
             Value::Array(entry.media.lock().expect("media rows").clone()),
         ),
+        (
+            "attachment",
+            Value::Str(
+                PoolPresentation::from_external(presents_external)
+                    .word()
+                    .to_string(),
+            ),
+        ),
         ("capacity", Value::Int(i128::from(capacity))),
+        ("used", Value::Int(i128::from(used))),
         ("read_only", Value::Bool(pool.read_only())),
+        ("wounded", Value::Bool(pool.wounded())),
         ("degraded", Value::Bool(pool.is_degraded())),
+        (
+            "degraded_live",
+            match pool.live_degrade() {
+                Some(degrade) => object(vec![
+                    ("member", Value::Int(i128::from(degrade.member))),
+                    ("device_id", Value::Str(hex(&degrade.device_id.0))),
+                    ("tx", Value::Int(i128::from(degrade.tx_id))),
+                ]),
+                None => Value::Null,
+            },
+        ),
         (
             "missing",
             Value::Array(
@@ -1397,12 +2189,31 @@ fn probe_medium(path: &str) -> Value {
     if let scalefs_core::Contents::Pool(probe) = &probed.contents {
         entries.push(("device_id", Value::Str(hex(&probe.device_id.0))));
     }
+    entries.push((
+        "attachment",
+        Value::Str(attachment_word(scalefs_core::attachment_of_path(Path::new(path))).to_string()),
+    ));
     object(entries)
+}
+
+fn attachment_word(attachment: scalefs_core::DeviceAttachment) -> &'static str {
+    match attachment {
+        scalefs_core::DeviceAttachment::External => "external",
+        scalefs_core::DeviceAttachment::Internal => "internal",
+        scalefs_core::DeviceAttachment::Unknown => "unknown",
+    }
+}
+
+fn media_presents_external(media: &[Value]) -> bool {
+    !media
+        .iter()
+        .any(|row| row.get("attachment").and_then(Value::as_str) == Some("internal"))
 }
 
 struct TargetIdentity {
     serial: Option<String>,
     model: Option<String>,
+    attachment: scalefs_core::DeviceAttachment,
 }
 
 impl TargetIdentity {
@@ -1411,6 +2222,7 @@ impl TargetIdentity {
         TargetIdentity {
             serial: probed.identity.serial,
             model: probed.identity.model,
+            attachment: scalefs_core::attachment_of_path(Path::new(path)),
         }
     }
 
@@ -1423,6 +2235,10 @@ impl TargetIdentity {
             entries.push(("model", Value::Str(model.clone())));
         }
         entries.push(("device_id", Value::Str(hex(&device_id.0))));
+        entries.push((
+            "attachment",
+            Value::Str(attachment_word(self.attachment).to_string()),
+        ));
         object(entries)
     }
 }
@@ -1589,15 +2405,18 @@ fn open_target(
                 "block_size is smaller than the device's sectors",
             ));
         }
-        let geometry = member_geometry(size, spec, block)?;
+        let usable = scalefs_core::usable_len(size, device.sector_size());
+        let geometry = member_geometry(usable, spec, block)?;
         Ok((AnyBlockDevice::Raw(device), geometry))
     } else {
         let size = spec.size.ok_or(ScaleFsError::InvalidArgument(
             "size is required to create an image member",
         ))?;
-        let geometry = member_geometry(size, spec, block)?;
-        let device =
-            scalefs_core::FileBlockDevice::create(Path::new(target), geometry.capacity_bytes())?;
+        let geometry = member_geometry(scalefs_core::usable_len(size, 512), spec, block)?;
+        let device = scalefs_core::FileBlockDevice::create(
+            Path::new(target),
+            scalefs_core::member_image_len(geometry.capacity_bytes()),
+        )?;
         Ok((AnyBlockDevice::File(device), geometry))
     }
 }
@@ -1615,7 +2434,8 @@ fn refuse_accidental_overwrite(path: &str, force: bool) -> Result<(), OpError> {
         }
         return Ok(());
     }
-    let holds = match scalefs_core::probe_path(Path::new(path)).contents {
+    let probed = scalefs_core::probe_path(Path::new(path));
+    let holds = match probed.contents {
         scalefs_core::Contents::Blank | scalefs_core::Contents::Unreadable => return Ok(()),
         scalefs_core::Contents::Pool(probe) => format!(
             "a ScaleFS pool ('{}', {})",
@@ -1623,7 +2443,9 @@ fn refuse_accidental_overwrite(path: &str, force: bool) -> Result<(), OpError> {
             hex(&probe.pool_id.0)
         ),
         scalefs_core::Contents::Partitioned => "a partition table".to_string(),
-        scalefs_core::Contents::Foreign => "unrecognized data".to_string(),
+        scalefs_core::Contents::Foreign => probed
+            .error
+            .unwrap_or_else(|| "unrecognized data".to_string()),
     };
     Err((
         ErrorCode::Conflict,
@@ -1684,6 +2506,7 @@ fn code_for(error: &ScaleFsError) -> (ErrorCode, String) {
         ScaleFsError::InvalidArgument(_) => ErrorCode::BadRequest,
         ScaleFsError::NotFound => ErrorCode::NotFound,
         ScaleFsError::Unsupported(_) => ErrorCode::Unsupported,
+        ScaleFsError::UnsupportedUnicodeVersion { .. } => ErrorCode::Unsupported,
         ScaleFsError::MissingMembers { .. } => ErrorCode::Conflict,
         ScaleFsError::Io(_) => ErrorCode::Io,
         ScaleFsError::AlreadyExists
@@ -1731,8 +2554,11 @@ mod tests {
             .iter()
             .zip([0xA1u8, 0xB2])
             .map(|(path, id)| MemberSpec {
-                device: FileBlockDevice::create(Path::new(path), geometry.capacity_bytes())
-                    .unwrap(),
+                device: FileBlockDevice::create(
+                    Path::new(path),
+                    scalefs_core::member_image_len(geometry.capacity_bytes()),
+                )
+                .unwrap(),
                 device_id: DeviceId([id; 16]),
                 geometry,
             })
@@ -1773,6 +2599,756 @@ mod tests {
             .job_status(&object(vec![("id", Value::Int(i128::from(id)))]))
             .unwrap();
         status.get("state").unwrap().as_str().unwrap().to_string()
+    }
+
+    const BLIND: u64 = scalefs_mount::dataplane::eject::BLIND_GENERATION;
+
+    fn acked(registry: &Registry, pool: &str) -> scalefs_mount::dataplane::PrepareVerdict {
+        registry.eject_prepare(pool, None).verdict
+    }
+
+    fn recorded_eject(
+        store: &crate::state::StateStore,
+        pool: &str,
+    ) -> Option<crate::state::EjectState> {
+        let text = std::fs::read_to_string(store.path()).expect("the record exists");
+        let value = scalefs_ipc::json::parse(&text).expect("the record parses");
+        let named = |list: &str| -> usize {
+            value
+                .get(list)
+                .and_then(Value::as_array)
+                .unwrap_or_default()
+                .iter()
+                .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(pool))
+                .count()
+        };
+        let state = store
+            .load_suppressed()
+            .expect("the tombstones read")
+            .into_iter()
+            .find(|tombstone| tombstone.name == pool)
+            .and_then(|tombstone| tombstone.eject);
+        if state.is_some() {
+            assert_eq!(
+                named("pools"),
+                0,
+                "a tombstoned pool has no restore row: {text}"
+            );
+            assert_eq!(named("suppressed"), 1, "{text}");
+        } else {
+            assert_eq!(named("suppressed"), 0, "no stray tombstone: {text}");
+        }
+        state
+    }
+
+    fn released_witness(registry: &Registry, pool: &str) -> GuardWitness {
+        let guard = registry.share_handle(pool).expect("a guard to witness");
+        let witness = guard.guard.witness();
+        drop(guard);
+        assert!(!witness.held(), "the witness follows its guard");
+        witness
+    }
+
+    fn registry_with_recorded_pool(
+        tag: &str,
+    ) -> (Registry, Arc<crate::state::StateStore>, std::path::PathBuf) {
+        let (registry, dir) = registry_with_pool(tag);
+        let members = {
+            let pools = registry.pools.lock().expect("registry lock");
+            pools["fence"].members.lock().expect("members").clone()
+        };
+        registry.detach(&name_params()).expect("detach the scratch");
+        drop(registry);
+        let store = Arc::new(crate::state::StateStore::open(&dir.join("state")).unwrap());
+        let registry = Registry::with_state(Some(Arc::clone(&store)));
+        registry
+            .attach(&object(vec![
+                ("name", Value::Str("fence".into())),
+                (
+                    "members",
+                    Value::Array(members.into_iter().map(Value::Str).collect()),
+                ),
+            ]))
+            .expect("attach with state");
+        (registry, store, dir)
+    }
+
+    #[test]
+    fn eject_prepare_allocates_a_generation_and_records_it_before_acking() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("ejectgen");
+        assert_eq!(recorded_eject(&store, "fence"), None, "clean to start");
+
+        let first = registry.eject_prepare("fence", None);
+        assert_eq!(first.verdict, PrepareVerdict::Ack);
+        assert_ne!(first.generation, BLIND, "an ACK never carries generation 0");
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            Some(crate::state::EjectState {
+                phase: crate::state::EjectPhase::Prepared,
+                generation: first.generation,
+            }),
+        );
+
+        let again = registry.eject_prepare("fence", None);
+        assert_eq!(
+            again, first,
+            "a re-prepare is idempotent, generation and all"
+        );
+        assert_eq!(
+            recorded_eject(&store, "fence").map(|state| state.generation),
+            Some(first.generation),
+        );
+
+        registry.eject_abort("fence", first.generation);
+        assert_eq!(recorded_eject(&store, "fence"), None, "abort clears it");
+        let second = registry.eject_prepare("fence", None);
+        assert_eq!(second.verdict, PrepareVerdict::Ack);
+        assert!(
+            second.generation > first.generation,
+            "{} must follow {}",
+            second.generation,
+            first.generation,
+        );
+        registry.eject_abort("fence", BLIND);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_commit_establishes_ejected_with_nothing_prepared() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("ejectcommit");
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        drop(
+            registry
+                .share_handle("fence")
+                .expect("unfrozen before the commit"),
+        );
+
+        assert_eq!(
+            registry.eject_commit("fence", 42, None),
+            PrepareVerdict::Ack
+        );
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            Some(crate::state::EjectState {
+                phase: crate::state::EjectPhase::Ejected,
+                generation: 42,
+            }),
+        );
+        match registry.share_handle("fence") {
+            Err((ErrorCode::Conflict, m)) => assert!(m.contains("ejected"), "{m}"),
+            Err((code, m)) => panic!("expected the eject refusal, got {code:?}: {m}"),
+            Ok(_) => panic!("a committed removal must refuse new surfaces"),
+        }
+        registry.detach(&name_params()).unwrap();
+        assert_eq!(
+            registry.eject_commit("fence", 42, None),
+            PrepareVerdict::Ack
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_committed_eject_dominates_every_racing_abort() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("ejectdominates");
+        let prepared = registry.eject_prepare("fence", None);
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+        assert_eq!(
+            registry.eject_commit("fence", prepared.generation, None),
+            PrepareVerdict::Ack,
+        );
+        let committed = Some(crate::state::EjectState {
+            phase: crate::state::EjectPhase::Ejected,
+            generation: prepared.generation,
+        });
+
+        for abort in [prepared.generation, BLIND, prepared.generation + 5] {
+            registry.eject_abort("fence", abort);
+            assert_eq!(
+                recorded_eject(&store, "fence"),
+                committed,
+                "abort({abort}) must not undo a committed removal",
+            );
+            match registry.share_handle("fence") {
+                Err((ErrorCode::Conflict, m)) => assert!(m.contains("ejected"), "{m}"),
+                Err((code, m)) => panic!("abort({abort}): unexpected {code:?}: {m}"),
+                Ok(_) => panic!("abort({abort}) must not release the freeze"),
+            }
+        }
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_blind_abort_clears_any_uncommitted_prepare() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("ejectblind");
+        let prepared = registry.eject_prepare("fence", None);
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+
+        registry.eject_abort("fence", prepared.generation + 1);
+        assert!(
+            recorded_eject(&store, "fence").is_some(),
+            "a stale abort must not clear a standing prepare",
+        );
+        assert!(registry.share_handle("fence").is_err(), "still frozen");
+
+        registry.eject_abort("fence", BLIND);
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        drop(
+            registry
+                .share_handle("fence")
+                .expect("unfrozen after blind"),
+        );
+        registry.eject_abort("fence", BLIND);
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_operator_attach_clears_the_safe_removal_state() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("ejectreattach");
+        #[cfg(windows)]
+        let letter = crate::state::RecordedMount {
+            mountpoint: "S:".to_string(),
+            read_only: false,
+            kernel_device: Some(r"\\.\ScaleFsCtl".to_string()),
+        };
+        #[cfg(windows)]
+        registry.record_serve_mount("fence", Some(letter.clone()));
+        let prepared = registry.eject_prepare("fence", None);
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+        assert_eq!(
+            registry.eject_commit("fence", prepared.generation, None),
+            PrepareVerdict::Ack,
+        );
+        let members = {
+            let pools = registry.pools.lock().expect("registry lock");
+            pools["fence"].members.lock().expect("members").clone()
+        };
+        registry.detach_quiesce("fence").unwrap();
+        assert!(
+            recorded_eject(&store, "fence").is_some(),
+            "the marker must outlive the eject teardown",
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            store.load_suppressed().unwrap()[0].mounts,
+            vec![letter.clone()],
+            "the tombstone keeps the letter",
+        );
+
+        registry
+            .attach(&object(vec![
+                ("name", Value::Str("fence".into())),
+                (
+                    "members",
+                    Value::Array(members.into_iter().map(Value::Str).collect()),
+                ),
+            ]))
+            .expect("the operator reattaches");
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            None,
+            "an operator attach clears the safe-removal state",
+        );
+        let rows = store.load();
+        assert_eq!(rows.len(), 1, "the pool is a restorable row again");
+        assert_eq!(rows[0].name, "fence");
+        #[cfg(windows)]
+        assert_eq!(rows[0].mounts, vec![letter], "the letter carried over");
+        drop(
+            registry
+                .share_handle("fence")
+                .expect("a reattached pool serves again"),
+        );
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_commit_naks_a_job_admitted_while_the_barrier_was_down() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("commitbusy");
+        let serving = registry.share_handle("fence").unwrap();
+        let own = serving.guard.witness();
+        let prepared = registry.eject_prepare("fence", Some(&own));
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+        registry.eject_abort("fence", prepared.generation);
+        assert_eq!(recorded_eject(&store, "fence"), None);
+
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let started = registry
+            .start_job(&name_params(), "hold", move |_pool, _entry| {
+                let _ = released.recv();
+                Ok(Value::Null)
+            })
+            .expect("admitted while the barrier is down");
+        let id = started.get("job").unwrap().as_u64().unwrap();
+
+        for generation in [prepared.generation, BLIND] {
+            assert_eq!(
+                registry.eject_commit("fence", generation, Some(&own)),
+                PrepareVerdict::NakBusyWithJob,
+                "COMMIT({generation}) must not confirm a removal under a running job",
+            );
+        }
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        assert_eq!(job_state(&registry, id), "running", "the job is untouched");
+        assert!(matches!(
+            registry.share_handle("fence"),
+            Err((ErrorCode::Conflict, _))
+        ));
+
+        release.send(()).unwrap();
+        while job_state(&registry, id) == "running" {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut verdict = registry.eject_commit("fence", prepared.generation, Some(&own));
+        while verdict == PrepareVerdict::NakBusyWithJob {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            verdict = registry.eject_commit("fence", prepared.generation, Some(&own));
+        }
+        assert_eq!(verdict, PrepareVerdict::Ack);
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            Some(crate::state::EjectState {
+                phase: crate::state::EjectPhase::Ejected,
+                generation: prepared.generation,
+            }),
+        );
+        drop(serving);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_commit_naks_a_share_admitted_after_a_same_generation_abort() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("commitfence");
+        let serving = registry.share_handle("fence").unwrap();
+        let own = serving.guard.witness();
+        let prepared = registry.eject_prepare("fence", Some(&own));
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+        registry.eject_abort("fence", prepared.generation);
+        let foreign = registry
+            .share_handle("fence")
+            .expect("admitted while the barrier is down");
+
+        for generation in [prepared.generation, BLIND] {
+            assert_eq!(
+                registry.eject_commit("fence", generation, Some(&own)),
+                PrepareVerdict::NakFenceHeld,
+                "COMMIT({generation}) must not confirm a removal under a live share",
+            );
+        }
+        assert_eq!(recorded_eject(&store, "fence"), None, "nothing recorded");
+        assert!(
+            store.load().iter().any(|row| row.name == "fence"),
+            "still a restorable row",
+        );
+        assert!(matches!(
+            registry.share_handle("fence"),
+            Err((ErrorCode::Conflict, _))
+        ));
+
+        drop(foreign);
+        assert_eq!(
+            registry.eject_commit("fence", prepared.generation, Some(&own)),
+            PrepareVerdict::Ack,
+        );
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            Some(crate::state::EjectState {
+                phase: crate::state::EjectPhase::Ejected,
+                generation: prepared.generation,
+            }),
+        );
+        drop(serving);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_prepare_counts_foreign_fences_exactly() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("prepareexact");
+        let own = released_witness(&registry, "fence");
+        let lone = registry.share_handle("fence").unwrap();
+        assert_eq!(
+            registry.eject_prepare("fence", Some(&own)).verdict,
+            PrepareVerdict::NakFenceHeld,
+            "a released guard is not subtracted",
+        );
+        assert_eq!(
+            registry.eject_prepare("fence", None).verdict,
+            PrepareVerdict::NakFenceHeld,
+        );
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        drop(
+            registry
+                .share_handle("fence")
+                .expect("not frozen after a NAK"),
+        );
+        let witness = lone.guard.witness();
+        let prepared = registry.eject_prepare("fence", Some(&witness));
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+        assert_eq!(
+            recorded_eject(&store, "fence").map(|state| state.phase),
+            Some(crate::state::EjectPhase::Prepared),
+        );
+        registry.eject_abort("fence", prepared.generation);
+        drop(lone);
+        assert!(!witness.held());
+        let other = registry.share_handle("fence").unwrap();
+        assert_eq!(
+            registry.eject_prepare("fence", Some(&witness)).verdict,
+            PrepareVerdict::NakFenceHeld,
+        );
+        drop(other);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_commit_counts_foreign_fences_exactly() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("commitexact");
+        let own = released_witness(&registry, "fence");
+        let lone = registry.share_handle("fence").unwrap();
+        assert_eq!(
+            registry.eject_commit("fence", 7, Some(&own)),
+            PrepareVerdict::NakFenceHeld,
+            "a released guard is not subtracted",
+        );
+        assert_eq!(
+            registry.eject_commit("fence", 7, None),
+            PrepareVerdict::NakFenceHeld,
+        );
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        let witness = lone.guard.witness();
+        assert_eq!(
+            registry.eject_commit("fence", 7, Some(&witness)),
+            PrepareVerdict::Ack,
+        );
+        assert_eq!(
+            recorded_eject(&store, "fence").map(|state| state.phase),
+            Some(crate::state::EjectPhase::Ejected),
+        );
+        drop(lone);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_abort_during_a_commit_does_not_lower_the_barrier() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("commitabort");
+        let serving = registry.share_handle("fence").unwrap();
+        let own = serving.guard.witness();
+        let prepared = registry.eject_prepare("fence", Some(&own));
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+
+        let in_flight = registry
+            .eject_commit_close("fence", prepared.generation, Some(&own))
+            .unwrap_or_else(|answered| panic!("phase 1 must pass, answered {answered:?}"));
+        for generation in [prepared.generation, BLIND] {
+            registry.eject_abort("fence", generation);
+            assert!(
+                matches!(
+                    registry.share_handle("fence"),
+                    Err((ErrorCode::Conflict, _))
+                ),
+                "ABORT({generation}) during the commit must leave admission closed",
+            );
+        }
+        assert_eq!(
+            recorded_eject(&store, "fence").map(|state| state.phase),
+            Some(crate::state::EjectPhase::Prepared),
+            "the standing marker is untouched",
+        );
+        assert_eq!(
+            registry.eject_commit_record(in_flight, "fence", prepared.generation),
+            PrepareVerdict::Ack,
+        );
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            Some(crate::state::EjectState {
+                phase: crate::state::EjectPhase::Ejected,
+                generation: prepared.generation,
+            }),
+        );
+        registry.eject_abort("fence", BLIND);
+        assert!(matches!(
+            registry.share_handle("fence"),
+            Err((ErrorCode::Conflict, _))
+        ));
+        drop(serving);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn overlapping_commit_spans_keep_the_barrier_until_the_last_ends() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("commitnest");
+        let serving = registry.share_handle("fence").unwrap();
+        let own = serving.guard.witness();
+        let prepared = registry.eject_prepare("fence", Some(&own));
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+
+        let first = registry
+            .eject_commit_close("fence", prepared.generation, Some(&own))
+            .unwrap_or_else(|answered| panic!("phase 1 must pass, answered {answered:?}"));
+        let second = registry
+            .eject_commit_close("fence", prepared.generation, Some(&own))
+            .unwrap_or_else(|answered| panic!("phase 1 must pass twice, answered {answered:?}"));
+        drop(first);
+        registry.eject_abort("fence", BLIND);
+        assert!(
+            matches!(
+                registry.share_handle("fence"),
+                Err((ErrorCode::Conflict, _))
+            ),
+            "the barrier must stand while the second evaluation is in flight",
+        );
+        assert_eq!(
+            recorded_eject(&store, "fence").map(|state| state.phase),
+            Some(crate::state::EjectPhase::Prepared),
+        );
+        assert_eq!(
+            registry.eject_commit_record(second, "fence", prepared.generation),
+            PrepareVerdict::Ack,
+        );
+        assert_eq!(
+            recorded_eject(&store, "fence").map(|state| state.phase),
+            Some(crate::state::EjectPhase::Ejected),
+        );
+        drop(serving);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_commit_ends_the_span_and_the_next_abort_is_honoured() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("commitspan");
+        let serving = registry.share_handle("fence").unwrap();
+        let own = serving.guard.witness();
+        let prepared = registry.eject_prepare("fence", Some(&own));
+        assert_eq!(prepared.verdict, PrepareVerdict::Ack);
+        registry.eject_abort("fence", prepared.generation);
+        let foreign = registry
+            .share_handle("fence")
+            .expect("admitted while the barrier is down");
+        assert_eq!(
+            registry
+                .eject_commit_close("fence", prepared.generation, Some(&own))
+                .err(),
+            Some(PrepareVerdict::NakFenceHeld),
+        );
+        assert!(matches!(
+            registry.share_handle("fence"),
+            Err((ErrorCode::Conflict, _))
+        ));
+        registry.eject_abort("fence", BLIND);
+        drop(
+            registry
+                .share_handle("fence")
+                .expect("the abort after a refused commit is honoured"),
+        );
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        drop(foreign);
+        drop(serving);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_detached_ejected_pool_keeps_its_tombstone_across_other_persists() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("tombkeep");
+        let prepared = registry.eject_prepare("fence", None);
+        assert_eq!(
+            registry.eject_commit("fence", prepared.generation, None),
+            PrepareVerdict::Ack,
+        );
+        registry.detach_quiesce("fence").unwrap();
+        let committed = Some(crate::state::EjectState {
+            phase: crate::state::EjectPhase::Ejected,
+            generation: prepared.generation,
+        });
+        assert_eq!(recorded_eject(&store, "fence"), committed);
+
+        let (other_dir, other) = membership_pool("tombkeep-other");
+        registry
+            .attach(&attach_params("other", &other, false))
+            .unwrap();
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            committed,
+            "survives another attach"
+        );
+        assert_eq!(
+            store
+                .load()
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["other"],
+        );
+        registry
+            .detach(&object(vec![("name", Value::Str("other".into()))]))
+            .unwrap();
+        assert_eq!(
+            recorded_eject(&store, "fence"),
+            committed,
+            "survives another detach"
+        );
+        assert!(store.load().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(other_dir);
+    }
+
+    #[test]
+    fn boot_restore_leaves_a_tombstoned_pool_alone() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("tombboot");
+        let prepared = registry.eject_prepare("fence", None);
+        assert_eq!(
+            registry.eject_commit("fence", prepared.generation, None),
+            PrepareVerdict::Ack,
+        );
+        let members = {
+            let pools = registry.pools.lock().expect("registry lock");
+            pools["fence"].members.lock().expect("members").clone()
+        };
+        registry.detach_quiesce("fence").unwrap();
+        drop(registry);
+
+        let restarted = Registry::with_state(Some(Arc::clone(&store)));
+        crate::state::reassemble(&restarted, &store);
+        assert_eq!(
+            restarted.list().unwrap().get("pools"),
+            Some(&Value::Array(Vec::new())),
+            "a tombstoned pool is not reassembled, members present or not",
+        );
+        assert!(
+            recorded_eject(&store, "fence").is_some(),
+            "boot restore never clears a tombstone",
+        );
+        restarted
+            .attach(&attach_params("fence", &members, false))
+            .expect("the members were never opened by the restore");
+        assert_eq!(recorded_eject(&store, "fence"), None);
+        restarted.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unwritable_record_fails_the_barrier_closed() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, store, dir) = registry_with_recorded_pool("unwritable");
+        let blocker = store.path().with_extension("json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+
+        assert_eq!(
+            registry.eject_prepare("fence", None).verdict,
+            PrepareVerdict::NakStateWriteFailed,
+        );
+        drop(
+            registry
+                .share_handle("fence")
+                .expect("the failed PREPARE left no freeze behind"),
+        );
+        assert_eq!(
+            registry.eject_commit("fence", 3, None),
+            PrepareVerdict::NakStateWriteFailed,
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(recorded_eject(&store, "fence"), None, "nothing on disk");
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_prepare_freezes_then_the_lifecycle_clears() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, dir) = registry_with_pool("ejectgate");
+        assert_eq!(acked(&registry, "fence"), PrepareVerdict::Ack);
+        match registry.share_handle("fence") {
+            Err((ErrorCode::Conflict, m)) => assert!(m.contains("ejected"), "{m}"),
+            Err((code, m)) => panic!("a new surface must refuse with Conflict, got {code:?}: {m}"),
+            Ok(_) => panic!("a new surface must refuse while ejecting"),
+        }
+        match registry.scrub(&name_params()) {
+            Err((ErrorCode::Conflict, m)) => assert!(m.contains("ejected"), "{m}"),
+            other => panic!("a new job must refuse while ejecting: {other:?}"),
+        }
+        assert_eq!(acked(&registry, "fence"), PrepareVerdict::Ack);
+        registry.eject_abort("fence", BLIND);
+        drop(registry.share_handle("fence").expect("share after abort"));
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_prepare_naks_a_foreign_fence_and_a_running_job() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, dir) = registry_with_pool("ejectnak");
+        let serving = registry.share_handle("fence").unwrap();
+        let own = serving.guard.witness();
+        assert_eq!(
+            registry.eject_prepare("fence", Some(&own)).verdict,
+            PrepareVerdict::Ack
+        );
+        registry.eject_abort("fence", BLIND);
+        let foreign = registry.share_handle("fence").unwrap();
+        assert_eq!(
+            registry.eject_prepare("fence", Some(&own)).verdict,
+            PrepareVerdict::NakFenceHeld
+        );
+        drop(foreign);
+        drop(serving);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let started = registry
+            .start_job(&name_params(), "hold", move |_pool, _entry| {
+                let _ = released.recv();
+                Ok(Value::Null)
+            })
+            .unwrap();
+        let id = started.get("job").unwrap().as_u64().unwrap();
+        assert_eq!(acked(&registry, "fence"), PrepareVerdict::NakBusyWithJob);
+        release.send(()).unwrap();
+        while job_state(&registry, id) == "running" {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(acked(&registry, "fence"), PrepareVerdict::Ack);
+        registry.eject_abort("fence", BLIND);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eject_freeze_persists_until_explicitly_cleared() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        let (registry, dir) = registry_with_pool("ejectpersist");
+        assert_eq!(acked(&registry, "fence"), PrepareVerdict::Ack);
+        assert!(registry.list().is_ok());
+        assert!(registry.status(&name_params()).is_ok());
+        match registry.share_handle("fence") {
+            Err((ErrorCode::Conflict, m)) => assert!(m.contains("ejected"), "{m}"),
+            Err((code, m)) => panic!("the freeze must persist (Conflict), got {code:?}: {m}"),
+            Ok(_) => panic!("the freeze must persist"),
+        }
+        registry.eject_abort("fence", BLIND);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1841,6 +3417,58 @@ mod tests {
             detached = registry.detach(&name_params());
         }
         detached.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn status_reports_the_naming_rules() {
+        let (registry, dir) = registry_with_pool("naming");
+        let status = registry.status(&name_params()).unwrap();
+        let naming = status.get("naming").expect("naming block in status");
+        assert_eq!(
+            naming.get("case_sensitivity").unwrap().as_str(),
+            Some("insensitive_preserving"),
+        );
+        assert_eq!(
+            naming.get("unicode_version").unwrap().as_str(),
+            Some("17.0.0"),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn presentation_rollup_leans_permissive() {
+        let row = |word: &str| object(vec![("attachment", Value::Str(word.to_string()))]);
+        assert!(media_presents_external(&[]));
+        assert!(media_presents_external(&[row("external"), row("external")]));
+        assert!(!media_presents_external(&[
+            row("external"),
+            row("internal")
+        ]));
+        assert!(!media_presents_external(&[row("internal")]));
+        assert!(media_presents_external(&[row("external"), row("unknown")]));
+        assert!(media_presents_external(&[row("unknown")]));
+        assert!(media_presents_external(&[object(vec![(
+            "path",
+            Value::Str("x".into()),
+        )])]));
+    }
+
+    #[test]
+    fn status_reports_attachment() {
+        let (registry, dir) = registry_with_pool("attach-status");
+        let status = registry.status(&name_params()).unwrap();
+        let rollup = status.get("attachment").and_then(Value::as_str).unwrap();
+        assert!(matches!(rollup, "external" | "fixed"), "rollup {rollup}");
+        let media = status.get("media").and_then(Value::as_array).unwrap();
+        assert!(!media.is_empty());
+        for member in media {
+            let word = member.get("attachment").and_then(Value::as_str).unwrap();
+            assert!(
+                matches!(word, "external" | "internal" | "unknown"),
+                "member attachment {word}",
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2059,7 +3687,7 @@ mod tests {
             let pools = registry.pools.lock().unwrap();
             let entry = pools.get("fence").unwrap();
             assert!(
-                Arc::ptr_eq(core_a, entry.core.as_ref().unwrap()),
+                Arc::ptr_eq(core_a, entry.core.get().unwrap()),
                 "the registry holds the same canonical core"
             );
         }
@@ -2151,8 +3779,11 @@ mod tests {
             .iter()
             .zip([0xA1u8, 0xB2])
             .map(|(path, id)| MemberSpec {
-                device: FileBlockDevice::create(Path::new(path), geometry.capacity_bytes())
-                    .unwrap(),
+                device: FileBlockDevice::create(
+                    Path::new(path),
+                    scalefs_core::member_image_len(geometry.capacity_bytes()),
+                )
+                .unwrap(),
                 device_id: DeviceId([id; 16]),
                 geometry,
             })
@@ -2305,6 +3936,7 @@ mod tests {
                 mountpoint: std::path::PathBuf::from("/tmp/fence-mnt"),
                 read_only: false,
                 worker: dummy,
+                stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         park_ended(&entry, 1);
@@ -2333,7 +3965,11 @@ mod tests {
             .get("fence")
             .map(Arc::clone)
             .unwrap();
-        for transitional in [MountSlot::Mounting(7), MountSlot::Unmounting(7)] {
+        for transitional in [
+            MountSlot::Mounting(7),
+            MountSlot::Unmounting(7),
+            MountSlot::Draining(7),
+        ] {
             *entry.mounted.lock().unwrap() = transitional;
             match registry.detach(&name_params()) {
                 Err((ErrorCode::Conflict, message)) => {
@@ -2349,6 +3985,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn park_drained_respects_the_generation() {
+        let (registry, dir) = registry_with_pool("drained-gen");
+        let entry = registry
+            .pools
+            .lock()
+            .unwrap()
+            .get("fence")
+            .map(Arc::clone)
+            .unwrap();
+        *entry.mounted.lock().unwrap() = MountSlot::Draining(5);
+        park_drained(&entry, 4);
+        assert!(matches!(
+            &*entry.mounted.lock().unwrap(),
+            MountSlot::Draining(5)
+        ));
+        park_drained(&entry, 5);
+        assert!(matches!(&*entry.mounted.lock().unwrap(), MountSlot::Empty));
+        drop(entry);
+        registry.detach(&name_params()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_join_all_abandons_stragglers() {
+        let quick1 = std::thread::spawn(|| {});
+        let quick2 = std::thread::spawn(|| {});
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let straggler = std::thread::spawn(move || {
+            let _ = held.recv();
+        });
+        let start = std::time::Instant::now();
+        bounded_join_all(
+            vec![quick1, quick2, straggler],
+            std::time::Duration::from_millis(300),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "hung: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "returned before the deadline: {elapsed:?}",
+        );
+        let _ = release.send(());
+    }
 
     fn membership_pool(tag: &str) -> (std::path::PathBuf, Vec<String>) {
         let dir = std::env::temp_dir().join(format!(
@@ -2373,8 +4058,11 @@ mod tests {
             .iter()
             .zip([0xC1u8, 0xC2])
             .map(|(path, id)| MemberSpec {
-                device: FileBlockDevice::create(Path::new(path), geometry.capacity_bytes())
-                    .unwrap(),
+                device: FileBlockDevice::create(
+                    Path::new(path),
+                    scalefs_core::member_image_len(geometry.capacity_bytes()),
+                )
+                .unwrap(),
                 device_id: DeviceId([id; 16]),
                 geometry,
             })
@@ -2411,6 +4099,158 @@ mod tests {
 
     fn membership_payload() -> Vec<u8> {
         (0..200_000u32).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    fn membership_pool_three(tag: &str) -> (std::path::PathBuf, Vec<String>) {
+        let dir = std::env::temp_dir().join(format!(
+            "scalefsd-member-{}-{tag}-{}",
+            std::process::id(),
+            now_ns() & 0xFFFF_FFFF,
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let geometry = Geometry {
+            logical_block_size: 4096,
+            physical_block_size: 4096,
+            zone_size: 64 * 1024,
+            zone_count: 64,
+            erase_granularity_zones: 1,
+            sequential_write_required: false,
+        };
+        let images: Vec<String> = ["a.img", "b.img", "c.img"]
+            .iter()
+            .map(|file| dir.join(file).to_string_lossy().into_owned())
+            .collect();
+        let members = images
+            .iter()
+            .zip([0xC1u8, 0xC2, 0xC3])
+            .map(|(path, id)| MemberSpec {
+                device: FileBlockDevice::create(
+                    Path::new(path),
+                    scalefs_core::member_image_len(geometry.capacity_bytes()),
+                )
+                .unwrap(),
+                device_id: DeviceId([id; 16]),
+                geometry,
+            })
+            .collect();
+        let mut pool = Pool::create_multi(
+            members,
+            PoolParams {
+                pool_id: PoolId([0x67; 16]),
+                case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                dirent_hash_seed: 7,
+                label: "memb".to_string(),
+                created_at_ns: now_ns(),
+                mirror_width: 2,
+                data_width: 1,
+                parity_width: 0,
+            },
+        )
+        .unwrap();
+        let file = pool
+            .create_file(
+                scalefs_core::tree::ROOT_INODE,
+                "payload.bin",
+                0o644,
+                now_ns(),
+            )
+            .unwrap();
+        pool.write(file, 0, &membership_payload(), now_ns())
+            .unwrap();
+        pool.commit(scalefs_core::AllocPurpose::Normal, now_ns())
+            .unwrap();
+        drop(pool);
+        (dir, images)
+    }
+
+    #[test]
+    fn retire_returns_a_degraded_pool_to_service() {
+        let (dir, images) = membership_pool_three("retire");
+        std::fs::remove_file(&images[2]).unwrap();
+        let registry = Registry::default();
+        registry
+            .attach(&attach_params("memb", &images[..2], true))
+            .unwrap();
+        let before = registry
+            .status(&object(vec![("name", Value::Str("memb".into()))]))
+            .unwrap();
+        assert_eq!(before.get("degraded"), Some(&Value::Bool(true)));
+        assert_eq!(before.get("read_only"), Some(&Value::Bool(true)));
+
+        let started = registry
+            .retire(&object(vec![
+                ("name", Value::Str("memb".into())),
+                ("member", Value::Int(2)),
+            ]))
+            .unwrap();
+        let result = finished_job(&registry, started);
+        assert_eq!(result.get("retired").and_then(Value::as_u64), Some(2));
+        assert!(result.get("records_rebuilt").and_then(Value::as_u64) >= Some(1));
+
+        let handle = registry.share_handle("memb").unwrap();
+        let core = Arc::clone(
+            handle
+                .core
+                .as_ref()
+                .expect("a healed pool regains its read-write core without re-attach"),
+        );
+        core.create(scalefs_core::ROOT_INODE, "after-heal.txt", 0o644, 0, 0)
+            .unwrap();
+        core.commit().unwrap();
+        drop(core);
+        drop(handle);
+
+        let status = registry
+            .status(&object(vec![("name", Value::Str("memb".into()))]))
+            .unwrap();
+        assert_eq!(status.get("degraded"), Some(&Value::Bool(false)));
+        assert_eq!(status.get("read_only"), Some(&Value::Bool(false)));
+        assert_eq!(status.get("wounded"), Some(&Value::Bool(false)));
+        assert_eq!(
+            status
+                .get("missing")
+                .and_then(Value::as_array)
+                .map(|missing| missing.len()),
+            Some(0),
+        );
+
+        let scrubbed = finished_job(
+            &registry,
+            registry
+                .scrub(&object(vec![("name", Value::Str("memb".into()))]))
+                .unwrap(),
+        );
+        assert_eq!(scrubbed.get("healthy"), Some(&Value::Bool(true)));
+        registry
+            .detach(&object(vec![("name", Value::Str("memb".into()))]))
+            .unwrap();
+        registry
+            .attach(&attach_params("memb", &images[..2], false))
+            .unwrap();
+        let strict = registry
+            .status(&object(vec![("name", Value::Str("memb".into()))]))
+            .unwrap();
+        assert_eq!(strict.get("degraded"), Some(&Value::Bool(false)));
+        assert_eq!(strict.get("read_only"), Some(&Value::Bool(false)));
+        registry
+            .detach(&object(vec![("name", Value::Str("memb".into()))]))
+            .unwrap();
+
+        let healed = Pool::open_multi(
+            images[..2]
+                .iter()
+                .map(|path| Arc::new(AnyBlockDevice::open(Path::new(path)).unwrap()))
+                .collect(),
+        )
+        .unwrap();
+        assert!(
+            healed
+                .lookup(scalefs_core::ROOT_INODE, "after-heal.txt")
+                .is_ok(),
+            "the post-heal write must have committed through the restored core"
+        );
+        drop(healed);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn attach_params(name: &str, images: &[String], degraded: bool) -> Value {
@@ -2469,6 +4309,19 @@ mod tests {
         assert_eq!(result.get("replaced").and_then(Value::as_u64), Some(1));
         assert!(result.get("records_rebuilt").and_then(Value::as_u64) >= Some(1));
 
+        let handle = registry.share_handle("memb").unwrap();
+        let core = Arc::clone(
+            handle
+                .core
+                .as_ref()
+                .expect("a replaced-and-rebuilt pool regains its read-write core"),
+        );
+        core.create(scalefs_core::ROOT_INODE, "after-heal.txt", 0o644, 0, 0)
+            .unwrap();
+        core.commit().unwrap();
+        drop(core);
+        drop(handle);
+
         let status = registry
             .status(&object(vec![("name", Value::Str("memb".into()))]))
             .unwrap();
@@ -2518,6 +4371,12 @@ mod tests {
             .read(entry.inode, 0, membership_payload().len())
             .unwrap();
         assert_eq!(bytes, membership_payload(), "healed bytes must match");
+        assert!(
+            healed
+                .lookup(scalefs_core::ROOT_INODE, "after-heal.txt")
+                .is_ok(),
+            "the post-heal write must have committed through the restored core"
+        );
         drop(healed);
         let _ = std::fs::remove_dir_all(dir);
     }

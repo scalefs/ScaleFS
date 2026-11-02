@@ -1,4 +1,3 @@
-
 use aws_lc_rs::cmac;
 
 pub fn aes128_cmac(key: &[u8; 16], message: &[u8]) -> [u8; 16] {

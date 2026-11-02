@@ -1,4 +1,3 @@
-
 use scalefs_daemon::service;
 use scalefs_ipc::endpoint::Endpoint;
 
@@ -12,6 +11,7 @@ const USAGE: &str = "usage: scalefsd serve [--endpoint <name-or-path>] \
                      [--state-dir <dir>] [--trust-enforce]\n\
                      |      scalefsd service <install|uninstall|run> \
                      [--endpoint <name-or-path>] [--state-dir <dir>]\n\
+                     |      scalefsd shell <register|unregister> [--endpoint <name-or-path>]\n\
                      |      scalefsd version";
 
 fn run(args: &[String]) -> i32 {
@@ -47,6 +47,32 @@ fn run(args: &[String]) -> i32 {
                 2
             }
         },
+        #[cfg(windows)]
+        Some("shell") => match parse_shell(&args[1..]) {
+            Ok(ShellCommand::Register(endpoint)) => report(service::shell_register(&endpoint)),
+            Ok(ShellCommand::Unregister) => report(service::shell_unregister()),
+            Err(message) => {
+                eprintln!("scalefsd: {message}");
+                2
+            }
+        },
+        #[cfg(windows)]
+        Some("session-announce") => {
+            let change = args
+                .get(1)
+                .and_then(|word| scalefs_shell::announce::Change::from_word(word));
+            let letter = args
+                .get(2)
+                .and_then(|text| text.chars().next())
+                .filter(char::is_ascii_alphabetic);
+            match (change, letter) {
+                (Some(change), Some(letter)) => {
+                    scalefs_shell::announce::announce_here(letter, change);
+                    0
+                }
+                _ => 2,
+            }
+        }
         Some("version") => {
             println!(
                 "scalefsd {} (protocol {}, on-disk format v{})",
@@ -70,6 +96,37 @@ fn report(outcome: Result<(), String>) -> i32 {
             eprintln!("scalefsd: {message}");
             1
         }
+    }
+}
+
+#[cfg(windows)]
+enum ShellCommand {
+    Register(Endpoint),
+    Unregister,
+}
+
+#[cfg(windows)]
+fn parse_shell(args: &[String]) -> Result<ShellCommand, String> {
+    let Some((verb, rest)) = args.split_first() else {
+        return Err(format!("shell needs a verb\n{USAGE}"));
+    };
+    let mut endpoint = Endpoint::default_endpoint();
+    let mut flags = rest.iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--endpoint" => {
+                let value = flags
+                    .next()
+                    .ok_or_else(|| format!("--endpoint needs a value\n{USAGE}"))?;
+                endpoint = Endpoint::new(value);
+            }
+            other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
+        }
+    }
+    match verb.as_str() {
+        "register" => Ok(ShellCommand::Register(endpoint)),
+        "unregister" => Ok(ShellCommand::Unregister),
+        other => Err(format!("unknown shell verb '{other}'\n{USAGE}")),
     }
 }
 

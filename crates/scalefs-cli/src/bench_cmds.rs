@@ -1,4 +1,3 @@
-
 use std::time::Instant;
 
 use scalefs_core::{AllocPurpose, AnyBlockDevice, EntryKind, Pool, ROOT_INODE, ScaleFsError};

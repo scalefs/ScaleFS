@@ -1,4 +1,3 @@
-
 use crate::pools::{PoolHandle, ShareGuard};
 use scalefs_core::AnyBlockDevice;
 use scalefs_ipc::json::{Value, object};
@@ -398,6 +397,7 @@ impl Shares {
         let PoolHandle {
             pool: pool_arc,
             core: canonical,
+            presentation: _,
             guard,
         } = resolve_pool(&pool)?;
         let read_only = requested_read_only;
@@ -421,7 +421,7 @@ impl Shares {
             server_guid: random_bytes::<16>(),
             target: "SCALEFS".to_string(),
             read_only,
-            throttle: Arc::new(scalefs_mount::smb::ntlm::AuthThrottle::default()),
+            throttle: Arc::new(scalefs_mount::smb::ntlm::AuthThrottle::share_wide()),
         };
 
         let claim_check = |shares: &BTreeMap<String, Arc<ActiveShare>>| -> Result<(), OpError> {
@@ -522,6 +522,7 @@ impl Shares {
 
     fn persist(&self) {
         let Some(store) = &self.state else { return };
+        let _persist = store.persist_guard();
         let snapshot: Vec<crate::state::RecordedShare> = {
             let shares = self.shares.lock().expect("shares lock");
             shares
@@ -857,9 +858,10 @@ fn trace_pdu(conn_id: u64, direction: &str, message: &[u8], base: usize, chained
             0x0009 => format!(" len {} at {}", u32_at(64 + 4), u64::from(u32_at(64 + 8))),
             0x000B => format!(" ctl 0x{:08x}", u32_at(64 + 4)),
             0x000E => format!(
-                " class 0x{:02x} flags 0x{:02x} outlen {}",
+                " class 0x{:02x} flags 0x{:02x} pattern '{}' outlen {}",
                 at(64 + 2),
                 at(64 + 3),
+                utf16_at(u16_at(64 + 24) as usize, u16_at(64 + 26) as usize),
                 u32_at(64 + 28),
             ),
             0x0010 | 0x0011 => {
@@ -893,7 +895,7 @@ pub(crate) fn try_random_bytes<const N: usize>() -> Option<[u8; N]> {
     os_random(&mut buf).ok().map(|()| buf)
 }
 
-fn random_bytes<const N: usize>() -> [u8; N] {
+pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     if os_random(&mut buf).is_err() {
         let seed = std::time::SystemTime::now()
@@ -987,7 +989,11 @@ mod dispatch_tests {
             std::process::id(),
         ));
         let _ = std::fs::remove_file(&path);
-        let device = FileBlockDevice::create(&path, geometry.capacity_bytes()).unwrap();
+        let device = FileBlockDevice::create(
+            &path,
+            scalefs_core::member_image_len(geometry.capacity_bytes()),
+        )
+        .unwrap();
         let mut pool = Pool::create(
             Arc::new(AnyBlockDevice::File(device)),
             CreateParams {
@@ -1042,12 +1048,14 @@ mod dispatch_tests {
         (writer, client)
     }
 
-    fn signed_flush(message_id: u64, key: &[u8; 16]) -> (Header, Vec<u8>) {
+    fn signed_flush(message_id: u64, tree_id: u32, key: &[u8; 16]) -> (Header, Vec<u8>) {
         let header = Header {
             command: command::FLUSH,
             message_id,
             credits: 1,
             flags: flags::SIGNED,
+            tree_id,
+            session_id: 0x4653_0000_0000_0001,
             ..Header::default()
         };
         let mut message = Vec::new();
@@ -1083,10 +1091,22 @@ mod dispatch_tests {
         let pool = SmbDispatchPool::start(2);
         assert!(pool.active());
         let share = share_over(temp_core("serve"));
+        let connected = {
+            use scalefs_mount::smb::session::Handler as _;
+            share.dispatch(
+                &Header {
+                    command: command::TREE_CONNECT,
+                    ..Header::default()
+                },
+                &scalefs_mount::smb::testclient::tree_connect_request("\\\\scalefs\\p5"),
+            )
+        };
+        assert_eq!(connected.status, 0, "TREE_CONNECT");
+        let tree_id = connected.tree_id.expect("a tree id was assigned");
         let key = [7u8; 16];
         let (writer, mut client) = writer_pair();
 
-        pool.submit(work(signed_flush(9, &key), key, &share, &writer));
+        pool.submit(work(signed_flush(9, tree_id, &key), key, &share, &writer));
 
         let mut transport = [0u8; 4];
         client.read_exact(&mut transport).unwrap();
@@ -1107,7 +1127,7 @@ mod dispatch_tests {
         writer.drain();
         assert!(!writer.dead.load(Ordering::SeqCst));
 
-        let (header, mut message) = signed_flush(10, &key);
+        let (header, mut message) = signed_flush(10, tree_id, &key);
         *message.last_mut().unwrap() ^= 1;
         pool.submit(work((header, message), key, &share, &writer));
         writer.drain();
@@ -1124,7 +1144,7 @@ mod dispatch_tests {
         let (writer, mut client) = writer_pair();
         writer.kill();
         for mid in 0..8 {
-            pool.submit(work(signed_flush(mid, &key), key, &share, &writer));
+            pool.submit(work(signed_flush(mid, 0, &key), key, &share, &writer));
         }
         writer.drain();
         let mut byte = [0u8; 1];

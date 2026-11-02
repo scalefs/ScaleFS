@@ -1,4 +1,3 @@
-
 use crate::fuse::fs::Filesystem;
 use crate::fuse::wire::{
     Attr, AttrOut, EntryOut, OpenOut, SetattrIn, StatfsOut, dirent_type, errno, push_dirent,
@@ -235,6 +234,7 @@ fn set_attr_from(change: &SetattrIn) -> SetAttr {
         ctime: (valid & setattr_flags::CTIME != 0)
             .then(|| join_time(change.ctime, change.ctime_nsec)),
         attributes: None,
+        bsd_flags: None,
         crtime: None,
     }
 }
@@ -252,38 +252,28 @@ impl<D: SharedDevice> Filesystem for PoolFilesystem<D> {
     }
 
     fn readdir(&self, nodeid: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        let entries = self.core.readdir(nodeid).map_err(errno_of)?;
+        let entries = self.core.readdir_hashed(nodeid).map_err(errno_of)?;
         let mut out = Vec::new();
         let capacity = size as usize;
-        let mut cursor = 0u64;
-        for name in [b".".as_slice(), b"..".as_slice()] {
-            cursor += 1;
-            if cursor <= offset {
-                continue;
-            }
-            if !push_dirent(
-                &mut out,
-                capacity,
-                nodeid,
-                cursor,
-                dirent_type::DIRECTORY,
-                name,
-            ) {
-                return Ok(out);
-            }
+        if offset < 1 && !push_dirent(&mut out, capacity, nodeid, 1, dirent_type::DIRECTORY, b".") {
+            return Ok(out);
         }
-        for entry in &entries {
-            cursor += 1;
-            if cursor <= offset {
+        if offset < 2 && !push_dirent(&mut out, capacity, nodeid, 2, dirent_type::DIRECTORY, b"..")
+        {
+            return Ok(out);
+        }
+        for hashed in &entries {
+            let d_off = hashed.hash.saturating_add(3);
+            if d_off <= offset {
                 continue;
             }
             if !push_dirent(
                 &mut out,
                 capacity,
-                entry.inode,
-                cursor,
-                kind_bits(&entry.kind),
-                entry.name.as_bytes(),
+                hashed.entry.inode,
+                d_off,
+                kind_bits(&hashed.entry.kind),
+                hashed.entry.name.as_bytes(),
             ) {
                 break;
             }
@@ -572,9 +562,9 @@ mod tests {
 
     fn test_pool() -> Pool<Arc<MemoryBlockDevice>> {
         Pool::create(
-            Arc::new(MemoryBlockDevice::new(
-                test_geometry().capacity_bytes() as usize
-            )),
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                test_geometry().capacity_bytes(),
+            ) as usize)),
             test_params(),
         )
         .unwrap()
@@ -667,7 +657,10 @@ mod tests {
         let (fs, ..) = seeded();
         let full = fs.readdir(ROOT_INODE, 0, 4096).unwrap();
         let names = dirent_names(&full);
-        assert_eq!(names, vec![".", "..", "docs", "empty.bin"]);
+        assert_eq!(&names[..2], &[".", ".."], "dots come first");
+        let mut rest = names[2..].to_vec();
+        rest.sort();
+        assert_eq!(rest, vec!["docs", "empty.bin"], "every entry, once");
 
         let mut seen = Vec::new();
         let mut offset = 0u64;
@@ -680,9 +673,52 @@ mod tests {
             offset = entries.last().unwrap().1;
             seen.extend(entries.into_iter().map(|(name, _)| name));
         }
-        assert_eq!(seen, vec![".", "..", "docs", "empty.bin"]);
+        assert_eq!(seen, names, "the paged walk reproduces the full listing");
 
         assert_eq!(fs.readdir(999_999, 0, 4096), Err(errno::ENOENT));
+    }
+
+    #[test]
+    fn readdir_survives_mutation_between_pages() {
+        let (fs, _shared) = seeded_rw();
+        for i in 0..50 {
+            fs.create(ROOT_INODE, format!("f-{i:03}").as_bytes(), 0o644, 0, 0)
+                .unwrap();
+        }
+
+        let mut counts = std::collections::BTreeMap::<String, u32>::new();
+        let mut offset = 0u64;
+        let mut mutated = false;
+        let mut emitted = 0usize;
+        loop {
+            let page = fs.readdir(ROOT_INODE, offset, 96).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            let entries = parse_dirents(&page);
+            offset = entries.last().unwrap().1;
+            for (name, _) in &entries {
+                *counts.entry(name.clone()).or_default() += 1;
+                emitted += 1;
+            }
+            if !mutated && emitted >= 12 {
+                mutated = true;
+                for i in 0..5 {
+                    let _ = fs.unlink(ROOT_INODE, format!("f-{i:03}").as_bytes());
+                    fs.create(ROOT_INODE, format!("g-{i:03}").as_bytes(), 0o644, 0, 0)
+                        .unwrap();
+                }
+            }
+        }
+        assert!(mutated, "the walk paged enough to mutate mid-flight");
+
+        for i in 5..50 {
+            let name = format!("f-{i:03}");
+            assert_eq!(counts.get(&name), Some(&1), "{name} returned exactly once");
+        }
+        for (name, count) in &counts {
+            assert!(*count <= 1, "{name} duplicated ({count} times)");
+        }
     }
 
     #[test]
@@ -759,8 +795,13 @@ mod tests {
             std::process::id(),
             now_ns() & 0xFFFF_FFFF,
         ));
-        let device =
-            Arc::new(FileBlockDevice::create(&image, test_geometry().capacity_bytes()).unwrap());
+        let device = Arc::new(
+            FileBlockDevice::create(
+                &image,
+                scalefs_core::member_image_len(test_geometry().capacity_bytes()),
+            )
+            .unwrap(),
+        );
         let mut pool = Pool::create(device, test_params()).unwrap();
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let shared = Arc::new(RwLock::new(pool));
@@ -1308,6 +1349,38 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_names_are_rejected_at_the_gateway() {
+        let (fs, _shared) = seeded_rw();
+        let bad: &[u8] = &[0xFF, 0xFE];
+
+        assert_eq!(
+            fs.create(ROOT_INODE, bad, 0o644, 0, 0).unwrap_err(),
+            errno::EINVAL
+        );
+        assert_eq!(
+            fs.symlink(ROOT_INODE, bad, b"target", 0, 0).unwrap_err(),
+            errno::EINVAL
+        );
+        fs.create(ROOT_INODE, b"real.txt", 0o644, 0, 0).unwrap();
+        assert_eq!(
+            fs.rename(ROOT_INODE, b"real.txt", ROOT_INODE, bad, true)
+                .unwrap_err(),
+            errno::EINVAL,
+            "rename target"
+        );
+
+        assert_eq!(fs.lookup(ROOT_INODE, bad).unwrap_err(), errno::ENOENT);
+        assert_eq!(fs.unlink(ROOT_INODE, bad).unwrap_err(), errno::ENOENT);
+        assert_eq!(fs.rmdir(ROOT_INODE, bad).unwrap_err(), errno::ENOENT);
+        assert_eq!(
+            fs.rename(ROOT_INODE, bad, ROOT_INODE, b"dst.txt", true)
+                .unwrap_err(),
+            errno::ENOENT,
+            "rename source"
+        );
+    }
+
+    #[test]
     fn times_join_and_split_at_the_edges() {
         assert_eq!(join_time(100, 5), 100_000_000_005);
         let minus_one_second = (-1i64) as u64;
@@ -1373,22 +1446,19 @@ mod tests {
         let types: std::collections::BTreeMap<String, u32> = parse_dirents(&listing)
             .iter()
             .map(|(name, _)| name.clone())
-            .zip(
-                {
-                    let mut kinds = Vec::new();
-                    let mut at = 0usize;
-                    while at + 24 <= listing.len() {
-                        let namelen =
-                            u32::from_le_bytes(listing[at + 16..at + 20].try_into().unwrap())
-                                as usize;
-                        kinds.push(u32::from_le_bytes(
-                            listing[at + 20..at + 24].try_into().unwrap(),
-                        ));
-                        at += (24 + namelen).div_ceil(8) * 8;
-                    }
-                    kinds
-                },
-            )
+            .zip({
+                let mut kinds = Vec::new();
+                let mut at = 0usize;
+                while at + 24 <= listing.len() {
+                    let namelen =
+                        u32::from_le_bytes(listing[at + 16..at + 20].try_into().unwrap()) as usize;
+                    kinds.push(u32::from_le_bytes(
+                        listing[at + 20..at + 24].try_into().unwrap(),
+                    ));
+                    at += (24 + namelen).div_ceil(8) * 8;
+                }
+                kinds
+            })
             .collect();
         assert_eq!(types["ln"], dirent_type::SYMLINK);
         assert_eq!(types["pipe"], dirent_type::FIFO);

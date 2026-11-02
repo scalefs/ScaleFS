@@ -1,4 +1,3 @@
-
 use crate::device::{BlockDevice, MemoryBlockDevice, check_bounds};
 use crate::error::{Result, ScaleFsError};
 use crate::rng::XorShift64;
@@ -161,10 +160,7 @@ impl BlockDevice for TortureBlockDevice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    Write {
-        offset: u64,
-        data: Vec<u8>,
-    },
+    Write { offset: u64, data: Vec<u8> },
     Flush,
 }
 

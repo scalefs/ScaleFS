@@ -1,4 +1,3 @@
-
 #![cfg(target_os = "linux")]
 
 use scalefs_mount::fuse::device::FuseMount;

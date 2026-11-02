@@ -1,4 +1,3 @@
-
 use crate::device::{BlockDevice, check_bounds, read_exact_at, write_all_at};
 use crate::discovery::DeviceIdentity;
 use crate::error::{Result, ScaleFsError};
@@ -173,6 +172,11 @@ impl RawBlockDevice {
                 "device capacity is not sector-aligned",
             ));
         }
+        if probed.sector_size > 4096 {
+            return Err(ScaleFsError::Unsupported(
+                "devices with sectors larger than 4 KiB are not supported",
+            ));
+        }
         Ok(Self::wrap(probed))
     }
 
@@ -219,6 +223,10 @@ impl BlockDevice for RawBlockDevice {
     fn actuator_ranges(&self) -> Vec<std::ops::Range<u64>> {
         self.aligned.inner.actuators.clone()
     }
+
+    fn sector_size(&self) -> u32 {
+        self.sector_size
+    }
 }
 
 pub enum AnyBlockDevice {
@@ -262,6 +270,13 @@ impl BlockDevice for AnyBlockDevice {
         }
     }
 
+    fn sector_size(&self) -> u32 {
+        match self {
+            AnyBlockDevice::File(device) => device.sector_size(),
+            AnyBlockDevice::Raw(device) => BlockDevice::sector_size(device),
+        }
+    }
+
     fn flush_group(devices: &[&Self]) -> Result<()> {
         if devices.len() <= 1 {
             return devices.iter().try_for_each(|device| device.flush());
@@ -291,7 +306,9 @@ impl BlockDevice for AnyBlockDevice {
 }
 
 #[cfg(windows)]
-pub(crate) use platform::{IOCTL_STORAGE_QUERY_PROPERTY, device_io};
+pub(crate) use platform::{
+    IOCTL_STORAGE_QUERY_PROPERTY, device_io, volume_guid_name, volume_path_name,
+};
 
 #[cfg(windows)]
 mod platform {
@@ -319,6 +336,16 @@ mod platform {
             pub fn FindFirstVolumeW(volume_name: *mut u16, length: u32) -> isize;
             pub fn FindNextVolumeW(handle: isize, volume_name: *mut u16, length: u32) -> i32;
             pub fn FindVolumeClose(handle: isize) -> i32;
+            pub fn GetVolumePathNameW(
+                file_name: *const u16,
+                volume_path_name: *mut u16,
+                length: u32,
+            ) -> i32;
+            pub fn GetVolumeNameForVolumeMountPointW(
+                volume_mount_point: *const u16,
+                volume_name: *mut u16,
+                length: u32,
+            ) -> i32;
         }
     }
 
@@ -550,6 +577,52 @@ mod platform {
         };
         names
     }
+
+    pub(crate) fn volume_path_name(path: &Path) -> Option<String> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = [0u16; 261];
+        #[allow(unsafe_code)]
+        let ok = unsafe {
+            ffi::GetVolumePathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+        };
+        if ok == 0 {
+            return None;
+        }
+        let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..len]))
+    }
+
+    pub(crate) fn volume_guid_name(mount_point: &str) -> Option<String> {
+        use std::os::windows::ffi::OsStrExt;
+        let with_slash = if mount_point.ends_with('\\') {
+            mount_point.to_string()
+        } else {
+            format!("{mount_point}\\")
+        };
+        let wide: Vec<u16> = std::ffi::OsStr::new(&with_slash)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = [0u16; 64];
+        #[allow(unsafe_code)]
+        let ok = unsafe {
+            ffi::GetVolumeNameForVolumeMountPointW(
+                wide.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..len]))
+    }
 }
 
 #[cfg(unix)]
@@ -569,14 +642,12 @@ mod platform {
             pub fn ioctl(
                 fd: core::ffi::c_int,
                 request: core::ffi::c_ulong,
-                arg: *mut core::ffi::c_void,
+                ...
             ) -> core::ffi::c_int;
             #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-            pub fn fcntl(
-                fd: core::ffi::c_int,
-                cmd: core::ffi::c_int,
-                arg: core::ffi::c_int,
-            ) -> core::ffi::c_int;
+            pub fn fcntl(fd: core::ffi::c_int, cmd: core::ffi::c_int, ...) -> core::ffi::c_int;
+            #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+            pub fn fsync(fd: core::ffi::c_int) -> core::ffi::c_int;
         }
     }
 
@@ -586,7 +657,7 @@ mod platform {
             ffi::ioctl(
                 file.as_raw_fd(),
                 request as core::ffi::c_ulong,
-                std::ptr::from_mut(value).cast(),
+                std::ptr::from_mut(value).cast::<core::ffi::c_void>(),
             )
         };
         if rc != 0 {
@@ -598,10 +669,21 @@ mod platform {
     #[cfg(target_os = "macos")]
     pub(super) fn full_sync(file: &std::fs::File) -> std::io::Result<()> {
         const F_FULLFSYNC: core::ffi::c_int = 51;
+        const ENOTTY: i32 = 25;
+        const ENOTSUP: i32 = 45;
         #[allow(unsafe_code)]
         let rc = unsafe { ffi::fcntl(file.as_raw_fd(), F_FULLFSYNC, 0) };
+        if rc != -1 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(ENOTTY) | Some(ENOTSUP)) {
+            return Err(error);
+        }
+        #[allow(unsafe_code)]
+        let rc = unsafe { ffi::fsync(file.as_raw_fd()) };
         if rc == -1 {
-            return file.sync_all();
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -860,7 +942,7 @@ pub(crate) mod actuator {
                 pub fn ioctl(
                     fd: core::ffi::c_int,
                     request: core::ffi::c_ulong,
-                    arg: *mut core::ffi::c_void,
+                    ...
                 ) -> core::ffi::c_int;
             }
         }
@@ -897,7 +979,7 @@ pub(crate) mod actuator {
             ffi::ioctl(
                 file.as_raw_fd(),
                 SG_IO,
-                std::ptr::from_mut(&mut header).cast(),
+                std::ptr::from_mut(&mut header).cast::<core::ffi::c_void>(),
             )
         };
         if rc != 0 || header.status != 0 || header.host_status != 0 || header.driver_status != 0 {
@@ -1107,12 +1189,17 @@ mod tests {
         };
         {
             let image = std::fs::File::create(&path).unwrap();
-            image.set_len(geometry.capacity_bytes()).unwrap();
+            image
+                .set_len(crate::gpt::member_image_len(geometry.capacity_bytes()))
+                .unwrap();
         }
 
         let device = RawBlockDevice::open(&path).unwrap();
         assert_eq!(device.sector_size(), 512);
-        assert_eq!(device.len(), geometry.capacity_bytes());
+        assert_eq!(
+            device.len(),
+            crate::gpt::member_image_len(geometry.capacity_bytes())
+        );
 
         let params = CreateParams {
             geometry,

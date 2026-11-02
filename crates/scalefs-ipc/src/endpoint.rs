@@ -1,4 +1,3 @@
-
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
@@ -27,6 +26,10 @@ impl Endpoint {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn shell_companion(&self) -> Endpoint {
+        Endpoint(format!("{}-shell", self.0))
     }
 
     fn address(&self) -> String {
@@ -133,6 +136,13 @@ impl Listener {
         }
     }
 
+    #[cfg(windows)]
+    pub fn bind_for_interactive_users(endpoint: &Endpoint) -> std::io::Result<Listener> {
+        Ok(Listener(ListenerImp::Pipe(
+            windows::PipeListener::bind_with(&endpoint.address(), windows::INTERACTIVE_PIPE_SDDL)?,
+        )))
+    }
+
     pub fn accept(&mut self) -> std::io::Result<Stream> {
         match &mut self.0 {
             #[cfg(windows)]
@@ -149,6 +159,27 @@ impl Listener {
 }
 
 pub fn connect(endpoint: &Endpoint, timeout: Duration) -> std::io::Result<Stream> {
+    connect_with(endpoint, timeout, None)
+}
+
+pub fn connect_limited(endpoint: &Endpoint, timeout: Duration) -> std::io::Result<Stream> {
+    #[cfg(windows)]
+    {
+        connect_with(endpoint, timeout, Some(windows::INTERACTIVE_ACCESS))
+    }
+    #[cfg(unix)]
+    {
+        connect_with(endpoint, timeout, None)
+    }
+}
+
+fn connect_with(
+    endpoint: &Endpoint,
+    timeout: Duration,
+    access: Option<u32>,
+) -> std::io::Result<Stream> {
+    #[cfg(unix)]
+    let _ = access;
     let address = endpoint.address();
     let deadline = Instant::now() + timeout;
     loop {
@@ -157,10 +188,15 @@ pub fn connect(endpoint: &Endpoint, timeout: Duration) -> std::io::Result<Stream
             {
                 use std::os::windows::fs::OpenOptionsExt;
                 const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
-                std::fs::OpenOptions::new()
+                let mut options = std::fs::OpenOptions::new();
+                options
                     .read(true)
                     .write(true)
-                    .security_qos_flags(SECURITY_IDENTIFICATION)
+                    .security_qos_flags(SECURITY_IDENTIFICATION);
+                if let Some(access) = access {
+                    options.access_mode(access);
+                }
+                options
                     .open(&address)
                     .map(|file| Stream(StreamImp::Pipe(file)))
             }
@@ -203,6 +239,7 @@ impl UnixListenerImp {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(&lock_path)?;
         match lock.try_lock() {
@@ -281,6 +318,9 @@ mod windows {
     }
 
     const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
+    pub const INTERACTIVE_PIPE_SDDL: &str =
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12008b;;;IU)";
+    pub const INTERACTIVE_ACCESS: u32 = 0x0012_008b;
     const SDDL_REVISION_1: u32 = 1;
     const ERROR_ACCESS_DENIED: i32 = 5;
 
@@ -343,8 +383,12 @@ mod windows {
 
     impl PipeListener {
         pub fn bind(address: &str) -> std::io::Result<PipeListener> {
+            PipeListener::bind_with(address, PIPE_SDDL)
+        }
+
+        pub fn bind_with(address: &str, sddl: &str) -> std::io::Result<PipeListener> {
             let name: Vec<u16> = address.encode_utf16().chain(std::iter::once(0)).collect();
-            let security = SecurityDescriptor::from_sddl(PIPE_SDDL)?;
+            let security = SecurityDescriptor::from_sddl(sddl)?;
             let first = match create_instance(&name, true, security.as_ptr()) {
                 Ok(handle) => handle,
                 Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {

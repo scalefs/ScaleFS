@@ -1,7 +1,6 @@
-
 use scalefs_core::{
-    AllocPurpose, BlockDevice, DirEntry, EntryKind, InodeAttrs, MAX_NAME_LEN, MODE_TYPE_MASK, Pool,
-    ROOT_INODE, ScaleFsError, SharedDevice,
+    AllocPurpose, BlockDevice, DirEntry, EntryKind, HashedEntry, InodeAttrs, MAX_NAME_LEN,
+    MODE_TYPE_MASK, Pool, ROOT_INODE, ScaleFsError, SharedDevice,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -12,6 +11,7 @@ const _: () = assert!(ROOT_INODE == 1);
 pub(crate) const DEBOUNCE_QUIET: Duration = Duration::from_millis(500);
 const STALL_RETRY: Duration = Duration::from_secs(1);
 const DEBOUNCE_BYTES: u64 = 64 * 1024 * 1024;
+const DEBOUNCE_MAX_AGE: Duration = Duration::from_secs(5);
 const METADATA_CHARGE: u64 = 4096;
 const MODE_SETGID: u32 = 0o2000;
 
@@ -70,6 +70,7 @@ pub struct SetAttr {
     pub ctime: Option<i64>,
     pub attributes: Option<u32>,
     pub crtime: Option<i64>,
+    pub bsd_flags: Option<u32>,
 }
 
 pub struct MountCore<D: SharedDevice> {
@@ -98,6 +99,7 @@ struct Dirt {
     dirty: bool,
     staged_bytes: u64,
     last_write: Instant,
+    first_dirty: Option<Instant>,
     stalled: bool,
     shutdown: bool,
     poisoned: bool,
@@ -113,6 +115,7 @@ impl Durability {
                 dirty: false,
                 staged_bytes: 0,
                 last_write: Instant::now(),
+                first_dirty: None,
                 stalled: false,
                 shutdown: false,
                 poisoned: false,
@@ -126,6 +129,9 @@ impl Durability {
 
     fn mark(&self, bytes: u64) {
         if let Ok(mut dirt) = self.dirt.lock() {
+            if !dirt.dirty {
+                dirt.first_dirty = Some(Instant::now());
+            }
             dirt.dirty = true;
             dirt.stalled = false;
             dirt.staged_bytes = dirt.staged_bytes.saturating_add(bytes);
@@ -188,24 +194,42 @@ fn commit_ticketed<D: SharedDevice>(
     let executed = ticket.execute();
     let result = {
         let mut pool = pool.write().map_err(|_| MountError::Io)?;
+        let settle = |durability: &Durability| {
+            if let Ok(mut dirt) = durability.dirt.lock() {
+                dirt.committed = dirt.committed.max(covers);
+                dirt.dirty = dirt.epoch > covers;
+                dirt.staged_bytes = dirt.staged_bytes.saturating_sub(staged_at_plan);
+                dirt.stalled = false;
+                dirt.first_dirty = dirt.dirty.then(Instant::now);
+            }
+        };
         match executed {
             Ok(done) => {
                 pool.commit_publish(done);
-                if let Ok(mut dirt) = durability.dirt.lock() {
-                    dirt.committed = dirt.committed.max(covers);
-                    dirt.dirty = dirt.epoch > covers;
-                    dirt.staged_bytes = dirt.staged_bytes.saturating_sub(staged_at_plan);
-                    dirt.stalled = false;
-                }
+                settle(durability);
                 Ok(())
             }
-            Err(aborted) => {
-                let error = pool.commit_abandon(aborted);
-                if let Ok(mut dirt) = durability.dirt.lock() {
-                    dirt.stalled = true;
+            Err(aborted) => match pool.commit_abandon(aborted) {
+                Ok(outcome) => {
+                    if let scalefs_core::pool::CommitOutcome::Degraded(degrade) = &outcome {
+                        eprintln!(
+                            "scalefs-mount: member {} failed while committing; the pending \
+                                 writes were committed onto the surviving members (tx {}) and the \
+                                 pool is now DEGRADED and READ-ONLY — replace or retire the member \
+                                 to restore writes",
+                            degrade.member, degrade.tx_id,
+                        );
+                    }
+                    settle(durability);
+                    Ok(())
                 }
-                Err(mount_error(&error))
-            }
+                Err(error) => {
+                    if let Ok(mut dirt) = durability.dirt.lock() {
+                        dirt.stalled = true;
+                    }
+                    Err(mount_error(&error))
+                }
+            },
         }
     };
     durability.signal.notify_all();
@@ -262,12 +286,24 @@ fn debounce_loop<D: SharedDevice>(pool: &Arc<RwLock<Pool<D>>>, durability: &Arc<
                     if dirt.staged_bytes >= DEBOUNCE_BYTES {
                         break;
                     }
+                    if dirt
+                        .first_dirty
+                        .is_some_and(|first| first.elapsed() >= DEBOUNCE_MAX_AGE)
+                    {
+                        break;
+                    }
                     let since = dirt.last_write.elapsed();
                     if since >= DEBOUNCE_QUIET {
                         break;
                     }
-                    let Ok(waited) = durability.signal.wait_timeout(dirt, DEBOUNCE_QUIET - since)
-                    else {
+                    let quiet_left = DEBOUNCE_QUIET - since;
+                    let nap = match dirt.first_dirty {
+                        Some(first) => {
+                            quiet_left.min(DEBOUNCE_MAX_AGE.saturating_sub(first.elapsed()))
+                        }
+                        None => quiet_left,
+                    };
+                    let Ok(waited) = durability.signal.wait_timeout(dirt, nap) else {
                         return;
                     };
                     dirt = waited.0;
@@ -361,7 +397,10 @@ pub fn is_reserved(parent: u64, name: &str) -> bool {
 }
 
 fn xattr_namespace_allowed(name: &str) -> bool {
-    name.starts_with("user.") || name.starts_with("security.") || name.starts_with("trusted.")
+    name.starts_with("user.")
+        || name.starts_with("security.")
+        || name.starts_with("trusted.")
+        || name.starts_with("com.apple.")
 }
 
 impl<D: SharedDevice> MountCore<D> {
@@ -520,7 +559,6 @@ impl<D: SharedDevice> MountCore<D> {
         })
     }
 
-
     pub fn getattr(&self, inode: u64) -> Result<MountAttr, MountError> {
         self.with_pool(|pool| self.make_attr(pool, inode))?
     }
@@ -541,6 +579,16 @@ impl<D: SharedDevice> MountCore<D> {
             Ok(entries
                 .into_iter()
                 .filter(|entry| !(inode == ROOT_INODE && is_orphanage_name(&entry.name)))
+                .collect())
+        })?
+    }
+
+    pub fn readdir_hashed(&self, inode: u64) -> Result<Vec<HashedEntry>, MountError> {
+        self.with_pool(|pool| {
+            let entries = pool.readdir_hashed(inode).map_err(|e| mount_error(&e))?;
+            Ok(entries
+                .into_iter()
+                .filter(|hashed| !(inode == ROOT_INODE && is_orphanage_name(&hashed.entry.name)))
                 .collect())
         })?
     }
@@ -592,7 +640,6 @@ impl<D: SharedDevice> MountCore<D> {
         })?
     }
 
-
     pub fn retain(&self, inode: u64) {
         if let Ok(mut state) = self.state.lock() {
             *state.open_counts.entry(inode).or_insert(0) += 1;
@@ -628,7 +675,6 @@ impl<D: SharedDevice> MountCore<D> {
             });
         }
     }
-
 
     pub fn create(
         &self,
@@ -957,7 +1003,7 @@ impl<D: SharedDevice> MountCore<D> {
                 return Ok(());
             }
             if is_dir && !pool.readdir(inode).map_err(|e| mount_error(&e))?.is_empty() {
-                return Ok(());
+                return Err(MountError::NotEmpty);
             }
             let mut state = self.state.lock().map_err(|_| MountError::Io)?;
             let last_name = pool
@@ -994,7 +1040,8 @@ impl<D: SharedDevice> MountCore<D> {
                 || change.mtime.is_some()
                 || change.ctime.is_some()
                 || change.attributes.is_some()
-                || change.crtime.is_some();
+                || change.crtime.is_some()
+                || change.bsd_flags.is_some();
             if touches_metadata {
                 pool.update_attrs(inode, |attrs| {
                     if let Some(mode) = change.mode {
@@ -1008,6 +1055,9 @@ impl<D: SharedDevice> MountCore<D> {
                     }
                     if let Some(bits) = change.attributes {
                         attrs.attrs = bits;
+                    }
+                    if let Some(flags) = change.bsd_flags {
+                        attrs.bsd_flags = flags;
                     }
                     if let Some(crtime) = change.crtime {
                         attrs.crtime_ns = crtime;
@@ -1116,7 +1166,9 @@ mod tests {
 
     fn fresh_rw() -> MountCore<Arc<MemoryBlockDevice>> {
         let mut pool = Pool::create(
-            Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize)),
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                geometry().capacity_bytes(),
+            ) as usize)),
             CreateParams {
                 geometry: geometry(),
                 pool_id: PoolId([0x77; 16]),
@@ -1296,6 +1348,40 @@ mod tests {
     }
 
     #[test]
+    fn unlink_handle_refuses_a_non_empty_directory() {
+        let core = fresh_rw();
+        let dir = core.mkdir(ROOT_INODE, "d", 0o755, 0, 0).unwrap();
+        let child = core.create(dir.inode, "f", 0o644, 0, 0).unwrap();
+
+        assert!(
+            matches!(
+                core.unlink_handle(ROOT_INODE, "d", dir.inode, true),
+                Err(MountError::NotEmpty)
+            ),
+            "a non-empty directory must refuse with NotEmpty"
+        );
+        assert_eq!(
+            core.lookup(ROOT_INODE, "d").unwrap().inode,
+            dir.inode,
+            "the directory survives the refusal"
+        );
+        assert_eq!(
+            core.lookup(dir.inode, "f").unwrap().inode,
+            child.inode,
+            "the child survives — never orphaned"
+        );
+
+        core.unlink_handle(dir.inode, "f", child.inode, false)
+            .unwrap();
+        core.unlink_handle(ROOT_INODE, "d", dir.inode, true)
+            .unwrap();
+        assert!(
+            core.lookup(ROOT_INODE, "d").is_err(),
+            "an empty directory still removes cleanly"
+        );
+    }
+
+    #[test]
     fn a_poisoned_core_serves_nothing() {
         let core = fresh_rw();
         let file = core.create(ROOT_INODE, "f", 0o644, 0, 0).unwrap();
@@ -1320,7 +1406,9 @@ mod tests {
     #[test]
     fn poison_disarms_every_commit_path() {
         let mut pool = Pool::create(
-            Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize)),
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                geometry().capacity_bytes(),
+            ) as usize)),
             CreateParams {
                 geometry: geometry(),
                 pool_id: PoolId([0x21; 16]),
@@ -1366,9 +1454,57 @@ mod tests {
     }
 
     #[test]
+    fn a_steady_writer_commits_within_the_max_age() {
+        let mut pool = Pool::create(
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                geometry().capacity_bytes(),
+            ) as usize)),
+            CreateParams {
+                geometry: geometry(),
+                pool_id: PoolId([0x2A; 16]),
+                device_id: DeviceId([0x2B; 16]),
+                case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                dirent_hash_seed: 9,
+                label: "steady".to_string(),
+                created_at_ns: NOW,
+            },
+        )
+        .unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let shared = Arc::new(RwLock::new(pool));
+        let baseline = shared.read().unwrap().committed_tx();
+        let core = MountCore::read_write(Arc::clone(&shared));
+
+        let file = core.create(ROOT_INODE, "log", 0o644, 0, 0).unwrap();
+        let start = Instant::now();
+        let deadline = start + DEBOUNCE_MAX_AGE + Duration::from_secs(3);
+        let mut offset = 0u64;
+        let mut committed_at = None;
+        while Instant::now() < deadline {
+            core.write(file.inode, offset, b"x").unwrap();
+            offset += 1;
+            std::thread::sleep(Duration::from_millis(200));
+            if shared.read().unwrap().committed_tx() > baseline {
+                committed_at = Some(start.elapsed());
+                break;
+            }
+        }
+        let elapsed = committed_at.expect(
+            "a steady sub-quiet writer was never committed — the max-age backstop is missing",
+        );
+        assert!(
+            elapsed >= DEBOUNCE_QUIET * 3,
+            "committed suspiciously early ({elapsed:?}) — not via the max-age path",
+        );
+        core.shutdown().unwrap();
+    }
+
+    #[test]
     fn separate_cores_do_not_share_the_open_table() {
         let mut pool = Pool::create(
-            Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize)),
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                geometry().capacity_bytes(),
+            ) as usize)),
             CreateParams {
                 geometry: geometry(),
                 pool_id: PoolId([0x31; 16]),
@@ -1400,7 +1536,9 @@ mod tests {
     #[test]
     fn read_only_refuses_mutation() {
         let mut pool = Pool::create(
-            Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize)),
+            Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
+                geometry().capacity_bytes(),
+            ) as usize)),
             CreateParams {
                 geometry: geometry(),
                 pool_id: PoolId([0x11; 16]),

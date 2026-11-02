@@ -130,6 +130,7 @@ dependencies = [
  "scalefs-core",
  "scalefs-ipc",
  "scalefs-mount",
+ "scalefs-shell",
 ]
 
 [[package]]
@@ -150,6 +151,13 @@ version = "1.0.0-preview.1"
 dependencies = [
  "aws-lc-rs",
  "scalefs-core",
+]
+
+[[package]]
+name = "scalefs-shell"
+version = "1.0.0-preview.1"
+dependencies = [
+ "scalefs-ipc",
 ]
 
 [[package]]

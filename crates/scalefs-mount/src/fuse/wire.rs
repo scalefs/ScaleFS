@@ -1,4 +1,3 @@
-
 use scalefs_core::error::{Result, ScaleFsError};
 use scalefs_core::wire::{Cursor, put_u16, put_u32, put_u64};
 
@@ -628,6 +627,7 @@ pub fn reply_payload(unique: u64, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn reply_error(unique: u64, errno: i32) -> Vec<u8> {
+    let errno = errno.clamp(1, 511);
     let mut out = Vec::with_capacity(16);
     put_u32(&mut out, 16);
     put_u32(&mut out, (-errno) as u32);

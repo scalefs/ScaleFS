@@ -1,4 +1,3 @@
-
 use crate::util::{Opts, format_size, parse_size};
 use scalefs_ipc::client::Client;
 use scalefs_ipc::endpoint::Endpoint;
@@ -10,15 +9,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
     let usage = "usage: scalefs daemon \
                  <ping|version|shutdown|pools|attach|import|devices|detach|status|\
-                 mount|unmount|share|unshare|shares|scrub|reclaim|rebuild|\
-                 replace|add|remove|jobs> ... \
+                 mount|unmount|share|unshare|shares|serve|serve-stop|serves|\
+                 scrub|reclaim|rebuild|replace|add|remove|retire|jobs> ... \
                  [--endpoint <name-or-path>]";
     let Some((verb, rest)) = args.split_first() else {
         return Err(usage.to_string());
     };
     let opts = Opts::parse(
         rest,
-        &["degraded", "repair", "force", "read-only"],
+        &["degraded", "repair", "force", "read-only", "password-stdin"],
         &[
             "endpoint",
             "pool",
@@ -30,6 +29,9 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
             "size",
             "zone-size",
             "block-size",
+            "unix-socket",
+            "kernel-device",
+            "mount",
         ],
     )?;
     let endpoint = match opts.value("endpoint") {
@@ -204,13 +206,22 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         ("unmount", [name]) => {
+            let force = opts.flag("force");
+            let mut params = vec![("name", Value::Str(name.clone()))];
+            if force {
+                params.push(("force", Value::Bool(true)));
+            }
             client
-                .call(
-                    "pool.unmount",
-                    object(vec![("name", Value::Str(name.clone()))]),
-                )
+                .call("pool.unmount", object(params))
                 .map_err(|error| error.to_string())?;
-            println!("unmounted '{name}'");
+            println!(
+                "{} '{name}'",
+                if force {
+                    "force-unmounted"
+                } else {
+                    "unmounted"
+                },
+            );
             Ok(())
         }
         ("share", [pool, name]) => {
@@ -218,10 +229,16 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
                 .value("user")
                 .ok_or("share needs --user <name>")?
                 .to_string();
-            let password = opts
-                .value("password")
-                .ok_or("share needs --password <password>")?
-                .to_string();
+            let password = match (opts.value("password"), opts.flag("password-stdin")) {
+                (Some(_), true) => {
+                    return Err("use either --password or --password-stdin, not both".to_string());
+                }
+                (Some(password), false) => password.to_string(),
+                (None, true) => password_from_reader(std::io::stdin().lock())?,
+                (None, false) => {
+                    return Err("share needs --password <password> or --password-stdin".to_string());
+                }
+            };
             let mut params = vec![
                 ("pool", Value::Str(pool.clone())),
                 ("name", Value::Str(name.clone())),
@@ -289,6 +306,88 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
                     text("pool"),
                     share.get("port").and_then(Value::as_u64).unwrap_or(0),
                     text("user"),
+                );
+            }
+            Ok(())
+        }
+        ("serve", [pool]) => {
+            let mut params = vec![("pool", Value::Str(pool.clone()))];
+            if opts.flag("read-only") {
+                params.push(("read_only", Value::Bool(true)));
+            }
+            if let Some(path) = opts.value("unix-socket") {
+                params.push(("unix_socket", Value::Str(path.to_string())));
+            }
+            if let Some(device) = opts.value("kernel-device") {
+                params.push(("kernel_device", Value::Str(device.to_string())));
+            }
+            if let Some(letter) = opts.value("mount") {
+                params.push(("mount", Value::Str(letter.to_string())));
+            }
+            let served = client
+                .call("pool.serve", object(params))
+                .map_err(|error| error.to_string())?;
+            let text = |key: &str| served.get(key).and_then(Value::as_str).unwrap_or("?");
+            let mode = if served.get("read_only") == Some(&Value::Bool(true)) {
+                " (read-only)"
+            } else {
+                ""
+            };
+            println!("serving '{pool}' at {}{mode}", text("endpoint"));
+            println!("  token: {}", text("token"));
+            if let Some(Value::Str(letter)) = served.get("mount") {
+                println!("  mounted at {letter}\\");
+            }
+            if let Some(Value::Str(guid)) = served.get("volume_guid") {
+                println!("  volume: {guid}");
+            }
+            Ok(())
+        }
+        ("serve-stop", [pool]) => {
+            let mut params = vec![("pool", Value::Str(pool.clone()))];
+            let forced = opts.flag("force");
+            if forced {
+                params.push(("force", Value::Bool(true)));
+            }
+            client
+                .call("pool.serve_stop", object(params))
+                .map_err(|error| error.to_string())?;
+            println!(
+                "stopped serving '{pool}'{}",
+                if forced { " (forced)" } else { "" }
+            );
+            Ok(())
+        }
+        ("serves", []) => {
+            let listed = client
+                .call("serve.list", Value::Null)
+                .map_err(|error| error.to_string())?;
+            let serving = listed
+                .get("serving")
+                .and_then(Value::as_array)
+                .unwrap_or_default();
+            if serving.is_empty() {
+                println!("no served pools");
+            }
+            for serve in serving {
+                let text = |key: &str| serve.get(key).and_then(Value::as_str).unwrap_or("?");
+                let mode = if serve.get("read_only") == Some(&Value::Bool(true)) {
+                    " (read-only)"
+                } else {
+                    ""
+                };
+                let mount = match serve.get("mount") {
+                    Some(Value::Str(letter)) => format!(" mounted at {letter}\\"),
+                    _ => String::new(),
+                };
+                let volume = match serve.get("volume_guid") {
+                    Some(Value::Str(guid)) => format!(" volume {guid}"),
+                    _ => String::new(),
+                };
+                println!(
+                    "pool '{}' at {}{mode}{mount}{volume}",
+                    text("pool"),
+                    text("endpoint")
                 );
             }
             Ok(())
@@ -453,6 +552,25 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
             println!(
                 "removed member {} from '{pool}': now {} member(s)",
                 field("removed"),
+                field("members"),
+            );
+            Ok(())
+        }
+        ("retire", [pool]) => {
+            let mut params = vec![("name", Value::Str(pool.clone()))];
+            push_member(&mut params, &opts)?;
+            if !params.iter().any(|(key, _)| *key == "member") {
+                return Err(
+                    "retire needs --member <index-or-device-id> (see 'daemon status')".to_string(),
+                );
+            }
+            let report = run_job(&mut client, "pool.retire", object(params))?;
+            let field = |key: &str| report.get(key).and_then(Value::as_u64).unwrap_or(0);
+            println!(
+                "retired member {} from '{pool}': healed {} record(s), now {} member(s), \
+                 serving writable",
+                field("retired"),
+                field("records_rebuilt"),
                 field("members"),
             );
             Ok(())
@@ -647,5 +765,45 @@ fn print_status(status: &Value) {
                 member.get("state").and_then(Value::as_str).unwrap_or("?"),
             );
         }
+    }
+}
+
+fn password_from_reader(mut input: impl std::io::BufRead) -> Result<String, String> {
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .map_err(|error| format!("cannot read the password from stdin: {error}"))?;
+    let password = line
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&line)
+        .trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        return Err("--password-stdin: no password was read from stdin".to_string());
+    }
+    Ok(password.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::password_from_reader;
+
+    #[test]
+    fn stdin_passwords_lose_their_line_ending_and_bom_only() {
+        assert_eq!(password_from_reader(&b"s3cret\n"[..]).unwrap(), "s3cret");
+        assert_eq!(password_from_reader(&b"s3cret\r\n"[..]).unwrap(), "s3cret");
+        assert_eq!(
+            password_from_reader(&b"\xEF\xBB\xBFs3cret\r\n"[..]).unwrap(),
+            "s3cret"
+        );
+        assert_eq!(
+            password_from_reader(&b"two words \n"[..]).unwrap(),
+            "two words "
+        );
+        assert_eq!(
+            password_from_reader(&b"first\nsecond\n"[..]).unwrap(),
+            "first"
+        );
+        assert!(password_from_reader(&b"\r\n"[..]).is_err());
+        assert!(password_from_reader(&b""[..]).is_err());
     }
 }

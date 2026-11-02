@@ -1,4 +1,3 @@
-
 use aws_lc_rs::digest;
 
 pub fn sha512(message: &[u8]) -> [u8; 64] {

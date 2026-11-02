@@ -1,4 +1,3 @@
-
 mod bench_cmds;
 mod daemon_cmds;
 mod device_cmds;
@@ -97,6 +96,7 @@ fn help_text() -> String {
         "  pool replace <survivors> <new> --size <n>   Replace a lost member\n",
         "  pool rebuild <image>         Finish re-mirroring after a replace\n",
         "  pool remove <images> <leaving>   Evacuate and remove a member\n",
+        "  pool retire <survivors> <member>   Retire a LOST member onto the survivors\n",
         "  pool status <image>          Summarize a pool\n",
         "  pool inspect <image>         Detailed superblock and zone state\n",
         "  pool reclaim <image>         Return dead space to the free pool\n",
@@ -166,11 +166,20 @@ fn help_text() -> String {
         "  daemon detach <name>         Release an attached pool\n",
         "  daemon mount <name> <dir> [--read-only]\n",
         "                               Serve the pool at a mountpoint (Linux)\n",
-        "  daemon unmount <name>        Detach the pool's mountpoint\n",
-        "  daemon share <pool> <name> --user <u> --password <p> [--port <n>]\n",
+        "  daemon unmount <name> [--force]\n",
+        "                               Unmount the pool (busy mounts refuse;\n",
+        "                               --force detaches and aborts open files)\n",
+        "  daemon share <pool> <name> --user <u> (--password <p> | --password-stdin) [--port <n>]\n",
         "                               Serve the pool over SMB on a loopback port\n",
         "  daemon unshare <name>        Stop an SMB share\n",
         "  daemon shares                List SMB shares\n",
+        "  daemon serve <pool> [--read-only] [--unix-socket <path>] [--kernel-device <dev>] [--mount <letter>:|auto]\n",
+        "                               Serve the pool's data plane (native-volume\n",
+        "                               gateways; loopback TCP by default)\n",
+        "  daemon serve-stop <pool> [--force]\n",
+        "                               Stop serving the pool's data plane\n",
+        "                               (--force dismounts a busy kernel volume)\n",
+        "  daemon serves                List served pools\n",
         "  daemon pools                 List attached pools\n",
         "  daemon status <name>         Detailed status of an attached pool\n",
         "  daemon scrub <name> [--repair]   Verify every copy, as a job\n",

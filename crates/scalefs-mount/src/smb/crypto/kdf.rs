@@ -1,4 +1,3 @@
-
 use super::sha256::hmac_sha256;
 
 pub fn sp800_108_counter(key: &[u8], label: &[u8], context: &[u8], out_bits: u32) -> Vec<u8> {

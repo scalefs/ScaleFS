@@ -1,4 +1,3 @@
-
 use scalefs_ipc::endpoint::Endpoint;
 use std::path::PathBuf;
 
@@ -19,6 +18,34 @@ pub fn default_state_dir() -> PathBuf {
     {
         PathBuf::from("/var/lib/scalefs")
     }
+}
+
+#[cfg(windows)]
+pub fn shell_register(endpoint: &Endpoint) -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve this executable's path: {error}"))?;
+    let dll = exe.with_file_name(scalefs_shell::register::DLL_NAME);
+    if !dll.is_file() {
+        return Err(format!(
+            "{} is not installed next to scalefsd ({})",
+            scalefs_shell::register::DLL_NAME,
+            dll.display()
+        ));
+    }
+    let recorded = (*endpoint != Endpoint::default_endpoint()).then(|| endpoint.as_str());
+    scalefs_shell::register::register(&dll, recorded)?;
+    println!(
+        "registered Explorer's Eject command for ScaleFS volumes ({})",
+        dll.display()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn shell_unregister() -> Result<(), String> {
+    scalefs_shell::register::unregister()?;
+    println!("removed Explorer's Eject command for ScaleFS volumes");
+    Ok(())
 }
 
 fn shutdown_via_self_client(endpoint: &Endpoint) {
@@ -455,6 +482,9 @@ mod windows {
         println!("installed service '{SERVICE_NAME}' ({DISPLAY_NAME})");
         println!("  runs: {binary_path}");
         println!("  account: LocalSystem, start: automatic (boot)");
+        if let Err(why) = super::shell_register(endpoint) {
+            println!("  Explorer's Eject command not registered: {why}");
+        }
         println!("start it now with: net start {SERVICE_NAME}");
         Ok(())
     }
@@ -495,6 +525,9 @@ mod windows {
             "removed service '{SERVICE_NAME}' (if it was running, stop it with: \
              net stop {SERVICE_NAME})"
         );
+        if let Err(why) = super::shell_unregister() {
+            eprintln!("warning: Explorer's Eject command was not removed: {why}");
+        }
         Ok(())
     }
 

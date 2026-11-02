@@ -1,0 +1,24 @@
+[package]
+name = "scalefs-shell"
+description = "Windows Explorer integration for ScaleFS volumes: the drive menu's Eject command and its registration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+scalefs-ipc = { path = "../scalefs-ipc" }
+
+# This crate is an in-process COM server: its exports and vtables are
+# `unsafe` by nature, so the workspace's deny is relaxed here (as in
+# scalefs-ffi) while every unsafe block still carries its SAFETY note.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+missing_safety_doc = "allow"
+undocumented_unsafe_blocks = "allow"

@@ -1,4 +1,3 @@
-
 use scalefs_ipc::client::{CallError, Client};
 use scalefs_ipc::endpoint::Endpoint;
 use scalefs_ipc::frame::{read_frame, write_frame};
@@ -212,12 +211,20 @@ fn scratch_pool_sized(tag: &str, zone_count: u64) -> (std::path::PathBuf, String
     let b = dir.join("b.img");
     let members = vec![
         MemberSpec {
-            device: FileBlockDevice::create(&a, geometry.capacity_bytes()).unwrap(),
+            device: FileBlockDevice::create(
+                &a,
+                scalefs_core::member_image_len(geometry.capacity_bytes()),
+            )
+            .unwrap(),
             device_id: DeviceId([0xA1; 16]),
             geometry,
         },
         MemberSpec {
-            device: FileBlockDevice::create(&b, geometry.capacity_bytes()).unwrap(),
+            device: FileBlockDevice::create(
+                &b,
+                scalefs_core::member_image_len(geometry.capacity_bytes()),
+            )
+            .unwrap(),
             device_id: DeviceId([0xB2; 16]),
             geometry,
         },
@@ -1154,6 +1161,312 @@ fn pools_mount_read_write_and_persist() {
             object(vec![("name", Value::Str("tank".into()))]),
         )
         .unwrap();
+    client
+        .call(
+            "pool.detach",
+            object(vec![("name", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pool_serve_sessions_and_fencing() {
+    use std::io::{Read, Write};
+
+    let (dir, a, b) = scratch_pool("serve");
+    let daemon = DaemonUnderTest::spawn("serve");
+    let mut client = daemon.client();
+    client
+        .call("pool.attach", attach_params("tank", &[&a, &b], false))
+        .unwrap();
+
+    let served = client
+        .call(
+            "pool.serve",
+            object(vec![("pool", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    let endpoint = served
+        .get("endpoint")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = served.get("token").unwrap().as_str().unwrap().to_string();
+    assert_eq!(served.get("read_only"), Some(&Value::Bool(false)));
+
+    let refused = client.call(
+        "pool.serve",
+        object(vec![("pool", Value::Str("tank".into()))]),
+    );
+    assert!(refused.is_err());
+    let listing = client.call("serve.list", Value::Null).unwrap();
+    let rows = listing.get("serving").unwrap().as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("endpoint").unwrap().as_str(),
+        Some(endpoint.as_str())
+    );
+
+    let mut stream = std::net::TcpStream::connect(&endpoint).unwrap();
+    let mut req_id = 0u32;
+    let mut call = |stream: &mut std::net::TcpStream, op: u16, body: &[u8]| -> (i16, Vec<u8>) {
+        req_id += 1;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+        frame.extend_from_slice(&req_id.to_le_bytes());
+        frame.extend_from_slice(&op.to_le_bytes());
+        frame.extend_from_slice(&0u16.to_le_bytes());
+        frame.extend_from_slice(body);
+        stream.write_all(&frame).unwrap();
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).unwrap();
+        let mut reply = vec![0u8; u32::from_le_bytes(len) as usize];
+        stream.read_exact(&mut reply).unwrap();
+        (
+            i16::from_le_bytes(reply[4..6].try_into().unwrap()),
+            reply[8..].to_vec(),
+        )
+    };
+    let bytes_field = |payload: &[u8]| -> Vec<u8> {
+        let mut out = (payload.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(payload);
+        out
+    };
+    let mut hello = 1u16.to_le_bytes().to_vec();
+    hello.extend_from_slice(&[0x77; 16]);
+    hello.extend_from_slice(&bytes_field(token.as_bytes()));
+    let (code, reply) = call(&mut stream, 1, &hello);
+    assert_eq!(code, 0, "HELLO refused");
+    assert_eq!(reply[6], 0, "writable pool advertised read-write");
+
+    let mut mkdir = 1u64.to_le_bytes().to_vec();
+    mkdir.extend_from_slice(&bytes_field(b"native"));
+    mkdir.extend_from_slice(&0o755u32.to_le_bytes());
+    mkdir.extend_from_slice(&[0u8; 8]);
+    let (code, attr) = call(&mut stream, 10, &mkdir);
+    assert_eq!(code, 0, "MKDIR failed");
+    let dir_inode = u64::from_le_bytes(attr[0..8].try_into().unwrap());
+
+    let mut lookup = 1u64.to_le_bytes().to_vec();
+    lookup.extend_from_slice(&bytes_field(b"native"));
+    let (code, found) = call(&mut stream, 3, &lookup);
+    assert_eq!(code, 0);
+    assert_eq!(
+        u64::from_le_bytes(found[0..8].try_into().unwrap()),
+        dir_inode
+    );
+
+    let refused = client.call(
+        "pool.detach",
+        object(vec![("name", Value::Str("tank".into()))]),
+    );
+    assert!(refused.is_err(), "detach must refuse while served");
+
+    let (code, _) = call(&mut stream, 26, &[]);
+    assert_eq!(code, 0);
+    drop(stream);
+
+    client
+        .call(
+            "pool.serve_stop",
+            object(vec![("pool", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    client
+        .call(
+            "pool.detach",
+            object(vec![("name", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+
+    let reattached = client
+        .call("pool.attach", attach_params("tank", &[&a, &b], false))
+        .unwrap();
+    assert_eq!(reattached.get("name").unwrap().as_str(), Some("tank"));
+    let status = client
+        .call(
+            "pool.status",
+            object(vec![("name", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    assert!(status.get("tx").unwrap().as_u64().unwrap() >= 2);
+    client
+        .call(
+            "pool.detach",
+            object(vec![("name", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn pool_serve_over_a_unix_socket() {
+    use std::io::{Read, Write};
+
+    let (dir, a, b) = scratch_pool("serveuds");
+    let daemon = DaemonUnderTest::spawn("serveuds");
+    let mut client = daemon.client();
+    client
+        .call("pool.attach", attach_params("tank", &[&a, &b], false))
+        .unwrap();
+
+    let socket_path = dir.join("dataplane.sock");
+    let served = client
+        .call(
+            "pool.serve",
+            object(vec![
+                ("pool", Value::Str("tank".into())),
+                (
+                    "unix_socket",
+                    Value::Str(socket_path.to_string_lossy().into_owned()),
+                ),
+            ]),
+        )
+        .unwrap();
+    let endpoint = served
+        .get("endpoint")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(endpoint.starts_with("unix:"), "{endpoint}");
+    let token = served.get("token").unwrap().as_str().unwrap().to_string();
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+    let mut hello = Vec::new();
+    let mut body = 1u16.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0x77; 16]);
+    body.extend_from_slice(&(token.len() as u32).to_le_bytes());
+    body.extend_from_slice(token.as_bytes());
+    hello.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+    hello.extend_from_slice(&1u32.to_le_bytes());
+    hello.extend_from_slice(&1u16.to_le_bytes());
+    hello.extend_from_slice(&0u16.to_le_bytes());
+    hello.extend_from_slice(&body);
+    stream.write_all(&hello).unwrap();
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).unwrap();
+    let mut reply = vec![0u8; u32::from_le_bytes(len) as usize];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(i16::from_le_bytes(reply[4..6].try_into().unwrap()), 0);
+    drop(stream);
+
+    client
+        .call(
+            "pool.serve_stop",
+            object(vec![("pool", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    assert!(!socket_path.exists(), "the socket file is removed on stop");
+    client
+        .call(
+            "pool.detach",
+            object(vec![("name", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pool_serve_kernel_device_validation() {
+    let (dir, a, b) = scratch_pool("servek");
+    let daemon = DaemonUnderTest::spawn("servek");
+    let mut client = daemon.client();
+    client
+        .call("pool.attach", attach_params("tank", &[&a, &b], false))
+        .unwrap();
+
+    let both = client.call(
+        "pool.serve",
+        object(vec![
+            ("pool", Value::Str("tank".into())),
+            ("unix_socket", Value::Str("/tmp/never-bound.sock".into())),
+            ("kernel_device", Value::Str(r"\\.\ScaleFsCtl".into())),
+        ]),
+    );
+    assert!(both.is_err(), "unix_socket + kernel_device must be refused");
+
+    let mount_alone = client.call(
+        "pool.serve",
+        object(vec![
+            ("pool", Value::Str("tank".into())),
+            ("mount", Value::Str("Z:".into())),
+        ]),
+    );
+    assert!(mount_alone.is_err(), "mount without kernel_device refused");
+    for bad in ["Z", "Z:\\", "ZZ:", "5:", ""] {
+        let shape = client.call(
+            "pool.serve",
+            object(vec![
+                ("pool", Value::Str("tank".into())),
+                ("kernel_device", Value::Str(r"\\.\ScaleFsCtl".into())),
+                ("mount", Value::Str(bad.into())),
+            ]),
+        );
+        assert!(shape.is_err(), "mount letter {bad:?} must be refused");
+    }
+    let auto = client.call(
+        "pool.serve",
+        object(vec![
+            ("pool", Value::Str("tank".into())),
+            ("kernel_device", Value::Str(r"\\.\ScaleFsCtl".into())),
+            ("mount", Value::Str("auto".into())),
+        ]),
+    );
+    match auto {
+        Ok(_) => {
+            client
+                .call(
+                    "pool.serve_stop",
+                    object(vec![("pool", Value::Str("tank".into()))]),
+                )
+                .unwrap();
+        }
+        Err(error) => {
+            let text = format!("{error}");
+            assert!(
+                !text.contains("must be"),
+                "mount \"auto\" was shape-rejected: {text}"
+            );
+        }
+    }
+    {
+        let listing = client.call("serve.list", Value::Null).unwrap();
+        let rows = listing.get("serving").unwrap().as_array().unwrap();
+        assert!(rows.is_empty(), "refused mounts must not register");
+    }
+
+    let kernel = client.call(
+        "pool.serve",
+        object(vec![
+            ("pool", Value::Str("tank".into())),
+            ("kernel_device", Value::Str(r"\\.\ScaleFsCtl".into())),
+        ]),
+    );
+    match kernel {
+        Ok(served) => {
+            let endpoint = served.get("endpoint").unwrap().as_str().unwrap();
+            assert!(endpoint.starts_with("kernel:"), "{endpoint}");
+            client
+                .call(
+                    "pool.serve_stop",
+                    object(vec![("pool", Value::Str("tank".into()))]),
+                )
+                .unwrap();
+        }
+        Err(_) => {
+            let listing = client.call("serve.list", Value::Null).unwrap();
+            let rows = listing.get("serving").unwrap().as_array().unwrap();
+            assert!(rows.is_empty(), "a failed serve must not register");
+        }
+    }
+
     client
         .call(
             "pool.detach",

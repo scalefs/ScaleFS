@@ -1,6 +1,10 @@
-
+#[cfg(windows)]
+mod kernel_pump;
 mod pools;
 pub mod service;
+mod serving;
+#[cfg(windows)]
+mod session_notify;
 mod shares;
 mod state;
 
@@ -11,13 +15,13 @@ use scalefs_ipc::proto::{
     ErrorCode, Request, check_client_hello, daemon_hello, error_response, ok_response,
 };
 use std::io::BufReader;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 #[cfg(target_os = "linux")]
-const CAPABILITIES: &[&str] = &["pools", "jobs", "devices", "mounts", "smb"];
+const CAPABILITIES: &[&str] = &["pools", "jobs", "devices", "mounts", "smb", "serve"];
 #[cfg(not(target_os = "linux"))]
-const CAPABILITIES: &[&str] = &["pools", "jobs", "devices", "smb"];
+const CAPABILITIES: &[&str] = &["pools", "jobs", "devices", "smb", "serve"];
 
 struct Daemon {
     endpoint: Endpoint,
@@ -26,6 +30,74 @@ struct Daemon {
     trust: TrustPolicy,
     pools: pools::Registry,
     shares: shares::Shares,
+    serving: serving::ServingRegistry,
+    weak_self: Weak<Daemon>,
+}
+
+fn reconcile_external_eject(
+    weak: &Weak<Daemon>,
+    pool: &str,
+    generation: u64,
+) -> serving::EjectClaim {
+    let Some(daemon) = weak.upgrade() else {
+        return serving::EjectClaim::Superseded;
+    };
+    let claim = daemon.serving.eject_claim(pool, generation);
+    if claim != serving::EjectClaim::Won {
+        return claim;
+    }
+    match daemon.pools.detach_quiesce(pool) {
+        Ok(()) => println!(
+            "scalefsd: external eject of '{pool}' — serving stopped and pool detached; \
+             the disk is quiesced and safe to unplug"
+        ),
+        Err((code, why)) => {
+            eprintln!(
+                "scalefsd: external eject of '{pool}' — serving stopped, but the pool is \
+                 STILL attached ({code:?}: {why}); another surface holds it"
+            );
+            daemon
+                .pools
+                .eject_abort(pool, scalefs_mount::dataplane::eject::BLIND_GENERATION);
+        }
+    }
+    serving::EjectClaim::Won
+}
+
+fn eject_reconciler(daemon: &Daemon) -> serving::EjectReconciler {
+    let weak = daemon.weak_self.clone();
+    Arc::new(move |pool: &str, generation: u64| reconcile_external_eject(&weak, pool, generation))
+}
+
+fn eject_gate(daemon: &Daemon) -> serving::EjectGate {
+    let weak = daemon.weak_self.clone();
+    Arc::new(move |pool: &str, op: serving::EjectGateOp| {
+        use scalefs_mount::dataplane::{PrepareOutcome, PrepareVerdict};
+        let Some(daemon) = weak.upgrade() else {
+            return PrepareOutcome::nak(PrepareVerdict::Unsupported);
+        };
+        match op {
+            serving::EjectGateOp::Prepare { preparer } => {
+                daemon.pools.eject_prepare(pool, Some(&preparer))
+            }
+            serving::EjectGateOp::Abort(generation) => {
+                daemon.pools.eject_abort(pool, generation);
+                PrepareOutcome {
+                    verdict: PrepareVerdict::Ack,
+                    generation: 0,
+                }
+            }
+            serving::EjectGateOp::Commit {
+                generation,
+                committer,
+            } => PrepareOutcome {
+                verdict: daemon
+                    .pools
+                    .eject_commit(pool, generation, Some(&committer)),
+                generation,
+            },
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +114,19 @@ const READ_VERBS: &[&str] = &[
     "job.list",
     "device.list",
     "share.list",
+    "serve.list",
+    "pool.eject_record",
+    "shell.volume",
 ];
+
+const SHELL_VERBS: &[&str] = &["ping", "version", "shell.volume"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Management,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Shell,
+}
 
 const MUTATE_VERBS: &[&str] = &[
     "shutdown",
@@ -57,8 +141,11 @@ const MUTATE_VERBS: &[&str] = &[
     "pool.replace",
     "pool.add",
     "pool.remove",
+    "pool.retire",
     "share.add",
     "share.remove",
+    "pool.serve",
+    "pool.serve_stop",
 ];
 
 enum PeerGate {
@@ -129,13 +216,15 @@ pub fn serve_with(options: ServeOptions) -> Result<(), String> {
             ""
         },
     );
-    let daemon = Arc::new(Daemon {
+    let daemon = Arc::new_cyclic(|weak| Daemon {
         endpoint: endpoint.clone(),
         shutdown: AtomicBool::new(false),
         closing: AtomicBool::new(false),
         trust,
         pools: pools::Registry::with_state(state.clone()),
         shares: shares::Shares::with_state(shares_state.clone()),
+        serving: serving::ServingRegistry::default(),
+        weak_self: weak.clone(),
     });
     if let Some(store) = &state {
         state::reassemble(&daemon.pools, store);
@@ -145,6 +234,12 @@ pub fn serve_with(options: ServeOptions) -> Result<(), String> {
             .shares
             .restore(store, |name| daemon.pools.share_handle(name));
     }
+    #[cfg(windows)]
+    if let Some(store) = &state {
+        restore_serves(&daemon, store);
+    }
+    #[cfg(windows)]
+    spawn_shell_companion(&daemon);
     if let Some(ready) = options.on_ready {
         ready();
     }
@@ -159,7 +254,7 @@ pub fn serve_with(options: ServeOptions) -> Result<(), String> {
                 let daemon = Arc::clone(&daemon);
                 let _ = std::thread::Builder::new()
                     .name("scalefsd-session".to_string())
-                    .spawn(move || serve_connection(stream, &daemon));
+                    .spawn(move || serve_connection(stream, &daemon, Surface::Management));
             }
             Err(error) => {
                 if daemon.shutdown.load(Ordering::SeqCst) {
@@ -169,6 +264,7 @@ pub fn serve_with(options: ServeOptions) -> Result<(), String> {
                 if consecutive_failures >= 64 {
                     daemon.closing.store(true, Ordering::SeqCst);
                     daemon.pools.unmount_all();
+                    daemon.serving.stop_all();
                     daemon.shares.stop_all();
                     return Err(format!("listener failed: {error}"));
                 }
@@ -178,7 +274,45 @@ pub fn serve_with(options: ServeOptions) -> Result<(), String> {
     }
 }
 
-fn serve_connection(stream: Stream, daemon: &Daemon) {
+#[cfg(windows)]
+fn restore_serves(daemon: &Daemon, store: &state::StateStore) {
+    use scalefs_ipc::json::{Value, object};
+    for recorded in store.load() {
+        if recorded.eject.is_some() {
+            continue;
+        }
+        for mount in &recorded.mounts {
+            let Some(device) = &mount.kernel_device else {
+                continue;
+            };
+            let mut params = vec![
+                ("pool", Value::Str(recorded.name.clone())),
+                ("kernel_device", Value::Str(device.clone())),
+                ("mount", Value::Str(mount.mountpoint.clone())),
+            ];
+            if mount.read_only {
+                params.push(("read_only", Value::Bool(true)));
+            }
+            match daemon.serving.serve(
+                &object(params),
+                |name| daemon.pools.share_handle(name),
+                eject_reconciler(daemon),
+                eject_gate(daemon),
+            ) {
+                Ok(_) => println!(
+                    "scalefsd: restored the serve of '{}' at {}",
+                    recorded.name, mount.mountpoint,
+                ),
+                Err((_code, why)) => eprintln!(
+                    "scalefsd: could not restore the serve of '{}' at {}: {why}",
+                    recorded.name, mount.mountpoint,
+                ),
+            }
+        }
+    }
+}
+
+fn serve_connection(stream: Stream, daemon: &Daemon, surface: Surface) {
     let mut reader = BufReader::new(stream);
 
     let hello = match read_frame(&mut reader) {
@@ -234,7 +368,19 @@ fn serve_connection(stream: Stream, daemon: &Daemon) {
                 continue;
             }
         };
-        let (response, hang_up) = dispatch(&request, daemon, reader.get_ref(), &mut gate);
+        let (response, hang_up) =
+            if surface == Surface::Shell && !SHELL_VERBS.contains(&request.op.as_str()) {
+                (
+                    error_response(
+                        Some(request.id),
+                        ErrorCode::Forbidden,
+                        &format!("'{}' is not answered on the shell endpoint", request.op),
+                    ),
+                    false,
+                )
+            } else {
+                dispatch(&request, daemon, reader.get_ref(), &mut gate)
+            };
         if write_frame(reader.get_mut(), &response).is_err() {
             return;
         }
@@ -343,6 +489,7 @@ fn dispatch(
             }
             daemon.closing.store(true, Ordering::SeqCst);
             daemon.pools.unmount_all();
+            daemon.serving.stop_all();
             daemon.shares.stop_all();
             daemon.shutdown.store(true, Ordering::SeqCst);
             (ok_response(request.id, Value::Null), true)
@@ -371,9 +518,52 @@ fn dispatch(
         "pool.replace" => answer(request.id, daemon.pools.replace(&request.params)),
         "pool.add" => answer(request.id, daemon.pools.add(&request.params)),
         "pool.remove" => answer(request.id, daemon.pools.remove(&request.params)),
+        "pool.retire" => answer(request.id, daemon.pools.retire(&request.params)),
         "job.status" => answer(request.id, daemon.pools.job_status(&request.params)),
         "job.list" => answer(request.id, daemon.pools.job_list()),
         "device.list" => answer(request.id, daemon.pools.device_list()),
+        "pool.serve" => {
+            let served = daemon.serving.serve(
+                &request.params,
+                |name| daemon.pools.share_handle(name),
+                eject_reconciler(daemon),
+                eject_gate(daemon),
+            );
+            #[cfg(windows)]
+            if let Ok(reply) = &served
+                && let Some(scalefs_ipc::json::Value::Str(pool)) = request.params.get("pool")
+            {
+                let record = match reply.get("mount") {
+                    Some(scalefs_ipc::json::Value::Str(letter)) => {
+                        Some(crate::state::RecordedMount {
+                            mountpoint: letter.clone(),
+                            read_only: reply.get("read_only")
+                                == Some(&scalefs_ipc::json::Value::Bool(true)),
+                            kernel_device: match request.params.get("kernel_device") {
+                                Some(scalefs_ipc::json::Value::Str(device)) => Some(device.clone()),
+                                _ => None,
+                            },
+                        })
+                    }
+                    _ => None,
+                };
+                daemon.pools.record_serve_mount(pool, record);
+            }
+            answer(request.id, served)
+        }
+        "pool.serve_stop" => {
+            let stopped = daemon.serving.stop(&request.params);
+            #[cfg(windows)]
+            if stopped.is_ok()
+                && let Some(scalefs_ipc::json::Value::Str(pool)) = request.params.get("pool")
+            {
+                daemon.pools.record_serve_mount(pool, None);
+            }
+            answer(request.id, stopped)
+        }
+        "serve.list" => answer(request.id, daemon.serving.list()),
+        "pool.eject_record" => answer(request.id, daemon.pools.eject_record(&request.params)),
+        "shell.volume" => answer(request.id, shell_volume(daemon, &request.params)),
         "share.add" => answer(
             request.id,
             daemon
@@ -391,6 +581,133 @@ fn dispatch(
             false,
         ),
     }
+}
+
+#[cfg(windows)]
+fn spawn_shell_companion(daemon: &Arc<Daemon>) {
+    let daemon = Arc::clone(daemon);
+    let _ = std::thread::Builder::new()
+        .name("scalefsd-shell".to_string())
+        .spawn(move || {
+            let companion = daemon.endpoint.shell_companion();
+            let mut listener = match Listener::bind_for_interactive_users(&companion) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    eprintln!(
+                        "scalefsd: the shell endpoint {} is unavailable ({error}); Explorer's \
+                         Eject command cannot reach this daemon",
+                        companion.as_str()
+                    );
+                    return;
+                }
+            };
+            let mut failures = 0;
+            while !daemon.shutdown.load(Ordering::SeqCst) && failures < 64 {
+                match listener.accept() {
+                    Ok(stream) => {
+                        failures = 0;
+                        let daemon = Arc::clone(&daemon);
+                        let _ = std::thread::Builder::new()
+                            .name("scalefsd-shell-session".to_string())
+                            .spawn(move || serve_connection(stream, &daemon, Surface::Shell));
+                    }
+                    Err(_) => {
+                        failures += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+        });
+}
+
+fn shell_volume(daemon: &Daemon, params: &Value) -> Result<Value, pools::OpError> {
+    let rows = daemon.serving.list()?;
+    let serving = rows
+        .get("serving")
+        .and_then(Value::as_array)
+        .unwrap_or_default();
+    let by_id = params.get("pool_id").and_then(Value::as_str);
+    let row = match (params.get("letter").and_then(Value::as_str), by_id) {
+        (Some(letter), _) => {
+            let want = format!("{}:", letter.trim_end_matches(['\\', ':']));
+            Some(
+                serving
+                    .iter()
+                    .find(|row| {
+                        row.get("mount")
+                            .and_then(Value::as_str)
+                            .is_some_and(|mount| mount.eq_ignore_ascii_case(&want))
+                    })
+                    .ok_or_else(|| -> pools::OpError {
+                        (
+                            ErrorCode::NotFound,
+                            format!("no serving is mounted at {want}"),
+                        )
+                    })?,
+            )
+        }
+        (None, Some(pool_id)) => serving.iter().find(|row| {
+            row.get("pool_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.eq_ignore_ascii_case(pool_id))
+        }),
+        (None, None) => {
+            return Err((
+                ErrorCode::BadRequest,
+                "'letter' or 'pool_id' is required".to_string(),
+            ));
+        }
+    };
+    let pool_id = row
+        .and_then(|row| row.get("pool_id").and_then(Value::as_str))
+        .or(by_id)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let record = daemon
+        .pools
+        .eject_record(&object(vec![("pool_id", Value::Str(pool_id.clone()))]))?;
+    let mut reply = vec![
+        ("pool_id", Value::Str(pool_id)),
+        ("phase", record.get("phase").cloned().unwrap_or(Value::Null)),
+        (
+            "generation",
+            record.get("generation").cloned().unwrap_or(Value::Int(0)),
+        ),
+    ];
+    if let Some(row) = row {
+        let pool = row
+            .get("pool")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        reply.push(("holders", Value::Array(holders(daemon, &pool))));
+        if let Some(mount) = row.get("mount") {
+            reply.push(("mount", mount.clone()));
+        }
+        reply.push(("pool", Value::Str(pool)));
+    }
+    Ok(object(reply))
+}
+
+fn holders(daemon: &Daemon, pool: &str) -> Vec<Value> {
+    let mut found = Vec::new();
+    if let Ok(shares) = daemon.shares.list() {
+        for share in shares
+            .get("shares")
+            .and_then(Value::as_array)
+            .unwrap_or_default()
+        {
+            if share.get("pool").and_then(Value::as_str) == Some(pool)
+                && let Some(name) = share.get("name")
+            {
+                found.push(object(vec![
+                    ("kind", Value::Str("share".to_string())),
+                    ("name", name.clone()),
+                ]));
+            }
+        }
+    }
+    found
 }
 
 fn answer(id: u64, result: Result<Value, pools::OpError>) -> (Value, bool) {
@@ -420,6 +737,8 @@ mod tests {
             trust: TrustPolicy { enforce },
             pools: pools::Registry::default(),
             shares: shares::Shares::default(),
+            serving: serving::ServingRegistry::default(),
+            weak_self: Weak::new(),
         }
     }
 
@@ -585,7 +904,7 @@ mod tests {
             )
         });
         let stream = listener.accept().unwrap();
-        serve_connection(stream, &daemon);
+        serve_connection(stream, &daemon, Surface::Management);
 
         let expected = if scalefs_ipc::trust::process_is_privileged() {
             "bad_request"

@@ -1,4 +1,3 @@
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -26,9 +25,10 @@ pub fn cmd_pool(args: &[String]) -> Result<(), String> {
         Some("replace") => pool_replace(&args[1..]),
         Some("rebuild") => pool_rebuild(&args[1..]),
         Some("remove") => pool_remove(&args[1..]),
+        Some("retire") => pool_retire(&args[1..]),
         _ => Err(
             "usage: scalefs pool <create|import|status|inspect|reclaim|compact|add|replace|\
-             rebuild|remove> ..."
+             rebuild|remove|retire> ..."
                 .to_string(),
         ),
     }
@@ -113,14 +113,10 @@ fn pool_remove(args: &[String]) -> Result<(), String> {
         return Err(format!("{leaving} is not among the supplied members"));
     }
     let mut pool = open_pool(images)?;
-    let leaving_device = scalefs_core::RawBlockDevice::open_probe(Path::new(leaving))
-        .map_err(|err| format!("cannot open {leaving}: {err}"))?;
-    let leaving_id = scalefs_core::decode_superblock(
-        &read_first_block(&leaving_device).map_err(|err| format!("{leaving}: {err}"))?,
-    )
-    .map_err(|err| format!("{leaving}: {err}"))?
-    .device_id;
-    drop(leaving_device);
+    let leaving_id = match scalefs_core::probe_path(Path::new(leaving)).contents {
+        Contents::Pool(probe) => probe.device_id,
+        _ => return Err(format!("{leaving} does not read as a ScaleFS member")),
+    };
     let member = (0..pool.member_count() as u16)
         .find(|&m| {
             pool.superblock_for_member(m)
@@ -136,15 +132,93 @@ fn pool_remove(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn create_member(path: &str, capacity: u64, block_size: u32) -> Result<AnyBlockDevice, String> {
+fn pool_retire(args: &[String]) -> Result<(), String> {
+    let [images, missing] = args else {
+        return Err("usage: scalefs pool retire <surviving-image[,image...]> \
+             <member-index|device-id-hex>"
+            .to_string());
+    };
+    let mut devices = Vec::new();
+    for image in images.split(',') {
+        devices.push(
+            AnyBlockDevice::open(Path::new(image))
+                .map_err(|err| format!("cannot open {image}: {err}"))?,
+        );
+    }
+    let mut pool = Pool::open_multi_degraded(devices).map_err(|err| format!("{images}: {err}"))?;
+    let member = match missing.parse::<u16>() {
+        Ok(index) => index,
+        Err(_) => {
+            let rosters = pool.member_rosters().map_err(|err| err.to_string())?;
+            rosters
+                .first()
+                .and_then(|roster| {
+                    roster
+                        .members
+                        .iter()
+                        .position(|entry| hex(&entry.device_id.0) == *missing)
+                })
+                .map(|index| index as u16)
+                .ok_or_else(|| format!("{missing} names no member of this pool"))?
+        }
+    };
+    let report = pool
+        .retire_member(member, now_ns())
+        .map_err(|err| format!("cannot retire member {member}: {err}"))?;
+    println!(
+        "retired member {member}; healed {} record(s) ({} new copies, {} snapshot trees) — \
+         the pool now serves writable with {} member(s)",
+        report.records_rebuilt,
+        report.copies_written,
+        report.snapshots_rewritten,
+        pool.superblocks().len(),
+    );
+    Ok(())
+}
+
+fn provision_member(
+    path: &str,
+    size: u64,
+    zone_size: Option<u64>,
+    block_size: u32,
+) -> Result<(AnyBlockDevice, Geometry), String> {
+    let geometry_for = |path: &str, usable: u64| -> Result<Geometry, String> {
+        let zone_size = zone_size.unwrap_or_else(|| default_zone_size(usable));
+        let zone_count = usable / zone_size;
+        if zone_count < 3 {
+            return Err(format!(
+                "{path}: {} usable gives only {zone_count} zones of {}; \
+                 use a larger --size or smaller --zone-size",
+                format_size(usable),
+                format_size(zone_size),
+            ));
+        }
+        let summary = scalefs_core::zone_summary_len(zone_count);
+        if summary > zone_size {
+            return Err(format!(
+                "{path}: {zone_count} zones of {} need a {} zone summary, which must fit in \
+                 one zone; use a larger --zone-size",
+                format_size(zone_size),
+                format_size(summary),
+            ));
+        }
+        Ok(Geometry {
+            logical_block_size: block_size,
+            physical_block_size: block_size,
+            zone_size,
+            zone_count,
+            erase_granularity_zones: 1,
+            sequential_write_required: false,
+        })
+    };
     if scalefs_core::is_device_path(Path::new(path)) {
         let device = scalefs_core::RawBlockDevice::open(Path::new(path))
             .map_err(|err| format!("cannot open {path}: {err}"))?;
-        if device.len() < capacity {
+        if device.len() < size {
             return Err(format!(
                 "{path}: the device holds {} but the pool needs {}",
                 format_size(device.len()),
-                format_size(capacity),
+                format_size(size),
             ));
         }
         if block_size < device.sector_size() {
@@ -154,11 +228,16 @@ fn create_member(path: &str, capacity: u64, block_size: u32) -> Result<AnyBlockD
                 device.sector_size(),
             ));
         }
-        Ok(AnyBlockDevice::Raw(device))
+        let geometry = geometry_for(path, scalefs_core::usable_len(size, device.sector_size()))?;
+        Ok((AnyBlockDevice::Raw(device), geometry))
     } else {
-        FileBlockDevice::create(Path::new(path), capacity)
-            .map(AnyBlockDevice::File)
-            .map_err(|err| format!("cannot create {path}: {err}"))
+        let geometry = geometry_for(path, scalefs_core::usable_len(size, 512))?;
+        FileBlockDevice::create(
+            Path::new(path),
+            scalefs_core::member_image_len(geometry.capacity_bytes()),
+        )
+        .map(|device| (AnyBlockDevice::File(device), geometry))
+        .map_err(|err| format!("cannot create {path}: {err}"))
     }
 }
 
@@ -172,7 +251,8 @@ fn refuse_accidental_overwrite(path: &str, force: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let holds = match scalefs_core::probe_path(Path::new(path)).contents {
+    let probed = scalefs_core::probe_path(Path::new(path));
+    let holds = match probed.contents {
         scalefs_core::Contents::Blank => return Ok(()),
         scalefs_core::Contents::Pool(probe) => {
             format!(
@@ -182,19 +262,12 @@ fn refuse_accidental_overwrite(path: &str, force: bool) -> Result<(), String> {
             )
         }
         scalefs_core::Contents::Partitioned => "a partition table".to_string(),
-        scalefs_core::Contents::Foreign => "unrecognized data".to_string(),
+        scalefs_core::Contents::Foreign => probed
+            .error
+            .unwrap_or_else(|| "unrecognized data".to_string()),
         scalefs_core::Contents::Unreadable => return Ok(()),
     };
     Err(format!("{path} holds {holds}; use --force to overwrite it"))
-}
-
-fn read_first_block<D: scalefs_core::BlockDevice>(device: &D) -> Result<Vec<u8>, String> {
-    let len = device.len().min(4096);
-    let mut bytes = vec![0u8; len as usize];
-    device
-        .read_at(0, &mut bytes)
-        .map_err(|err| err.to_string())?;
-    Ok(bytes)
 }
 
 fn pool_replace(args: &[String]) -> Result<(), String> {
@@ -212,26 +285,7 @@ fn pool_replace(args: &[String]) -> Result<(), String> {
         Some(text) => u32::try_from(parse_size(text)?).map_err(|_| "block size too large")?,
         None => 4096,
     };
-    let zone_size = match opts.value("zone-size") {
-        Some(text) => parse_size(text)?,
-        None => default_zone_size(size),
-    };
-    let zone_count = size / zone_size;
-    if zone_count < 3 {
-        return Err(format!(
-            "{new_image}: size {} gives only {zone_count} zones of {}",
-            format_size(size),
-            format_size(zone_size),
-        ));
-    }
-    let geometry = Geometry {
-        logical_block_size: block_size,
-        physical_block_size: block_size,
-        zone_size,
-        zone_count,
-        erase_granularity_zones: 1,
-        sequential_write_required: false,
-    };
+    let zone_size = opts.value("zone-size").map(parse_size).transpose()?;
 
     let mut devices = Vec::new();
     for image in images.split(',') {
@@ -248,11 +302,7 @@ fn pool_replace(args: &[String]) -> Result<(), String> {
 
     let mut device_id = [0u8; 16];
     fill_random(&mut device_id)?;
-    let device = create_member(
-        new_image,
-        geometry.capacity_bytes(),
-        geometry.logical_block_size,
-    )?;
+    let (device, geometry) = provision_member(new_image, size, zone_size, block_size)?;
     pool.replace_member(
         member,
         MemberSpec {
@@ -312,35 +362,12 @@ fn pool_add(args: &[String]) -> Result<(), String> {
         Some(text) => u32::try_from(parse_size(text)?).map_err(|_| "block size too large")?,
         None => 4096,
     };
-    let zone_size = match opts.value("zone-size") {
-        Some(text) => parse_size(text)?,
-        None => default_zone_size(size),
-    };
-    let zone_count = size / zone_size;
-    if zone_count < 3 {
-        return Err(format!(
-            "{new_image}: size {} gives only {zone_count} zones of {}",
-            format_size(size),
-            format_size(zone_size),
-        ));
-    }
-    let geometry = Geometry {
-        logical_block_size: block_size,
-        physical_block_size: block_size,
-        zone_size,
-        zone_count,
-        erase_granularity_zones: 1,
-        sequential_write_required: false,
-    };
+    let zone_size = opts.value("zone-size").map(parse_size).transpose()?;
 
     let mut pool = open_pool(images)?;
     let mut device_id = [0u8; 16];
     fill_random(&mut device_id)?;
-    let device = create_member(
-        new_image,
-        geometry.capacity_bytes(),
-        geometry.logical_block_size,
-    )?;
+    let (device, geometry) = provision_member(new_image, size, zone_size, block_size)?;
     let member = pool
         .add_member(
             MemberSpec {
@@ -443,31 +470,7 @@ fn pool_create(args: &[String]) -> Result<(), String> {
         Some(text) => u32::try_from(parse_size(text)?).map_err(|_| "block size too large")?,
         None => 4096,
     };
-
-    let mut geometries = Vec::with_capacity(images.len());
-    for (image, &size) in images.iter().zip(&sizes) {
-        let zone_size = match opts.value("zone-size") {
-            Some(text) => parse_size(text)?,
-            None => default_zone_size(size),
-        };
-        let zone_count = size / zone_size;
-        if zone_count < 3 {
-            return Err(format!(
-                "{image}: size {} gives only {zone_count} zones of {}; \
-                 use a larger --size or smaller --zone-size",
-                format_size(size),
-                format_size(zone_size),
-            ));
-        }
-        geometries.push(Geometry {
-            logical_block_size: block_size,
-            physical_block_size: block_size,
-            zone_size,
-            zone_count,
-            erase_granularity_zones: 1,
-            sequential_write_required: false,
-        });
-    }
+    let zone_size = opts.value("zone-size").map(parse_size).transpose()?;
 
     let parity_width: u16 = match opts.value("parity") {
         Some(text) => {
@@ -531,22 +534,20 @@ fn pool_create(args: &[String]) -> Result<(), String> {
     };
 
     let mut members = Vec::with_capacity(images.len());
-    for (image, geometry) in images.iter().zip(&geometries) {
+    let mut geometries = Vec::with_capacity(images.len());
+    for (image, &size) in images.iter().zip(&sizes) {
         let mut device_id = [0u8; 16];
         fill_random(&mut device_id)?;
-        let device = create_member(
-            image,
-            geometry.capacity_bytes(),
-            geometry.logical_block_size,
-        )?;
+        let (device, geometry) = provision_member(image, size, zone_size, block_size)?;
+        geometries.push(geometry);
         members.push(MemberSpec {
             device,
             device_id: DeviceId(device_id),
-            geometry: *geometry,
+            geometry,
         });
     }
 
-    let pool = if members.len() == 1 {
+    let created = if members.len() == 1 {
         let member = members.into_iter().next().expect("length checked");
         Pool::create(
             member.device,
@@ -562,8 +563,18 @@ fn pool_create(args: &[String]) -> Result<(), String> {
         )
     } else {
         Pool::create_multi(members, params)
-    }
-    .map_err(|err| format!("cannot format: {err}"))?;
+    };
+    let pool = match created {
+        Ok(pool) => pool,
+        Err(err) => {
+            for image in &images {
+                if !scalefs_core::is_device_path(Path::new(image)) {
+                    let _ = std::fs::remove_file(image);
+                }
+            }
+            return Err(format!("cannot format: {err}"));
+        }
+    };
 
     let total: u64 = geometries.iter().map(|g| g.capacity_bytes()).sum();
     if pool.member_count() == 1 {
@@ -766,7 +777,13 @@ fn print_pool_status(
                 .count(),
         );
     } else {
-        println!("Members:      {}", pool.member_count());
+        let missing = pool.missing_members();
+        let retired = pool.member_count() - pool.superblocks().len() - missing.len();
+        if retired > 0 {
+            println!("Members:      {} ({retired} retired)", pool.member_count());
+        } else {
+            println!("Members:      {}", pool.member_count());
+        }
         let mut slot = 0usize;
         for index in 0..pool.member_count() {
             match pool.superblock_for_member(index as u16) {
@@ -789,7 +806,10 @@ fn print_pool_status(
                     );
                     slot += 1;
                 }
-                None => println!("  [{index}] MISSING"),
+                None if missing.contains(&(index as u16)) => {
+                    println!("  [{index}] MISSING")
+                }
+                None => println!("  [{index}] retired"),
             }
         }
     }
@@ -1523,7 +1543,11 @@ mod tests {
             sequential_write_required: false,
         };
         let mut pool = Pool::create(
-            FileBlockDevice::create(&image, geometry.capacity_bytes()).unwrap(),
+            FileBlockDevice::create(
+                &image,
+                scalefs_core::member_image_len(geometry.capacity_bytes()),
+            )
+            .unwrap(),
             CreateParams {
                 geometry,
                 pool_id: PoolId([0x44; 16]),
@@ -1599,7 +1623,7 @@ mod tests {
             .map(|i| MemberSpec {
                 device: FileBlockDevice::create(
                     &dir.join(format!("{i}.img")),
-                    geometry.capacity_bytes(),
+                    scalefs_core::member_image_len(geometry.capacity_bytes()),
                 )
                 .unwrap(),
                 device_id: DeviceId([0x50 + i as u8; 16]),
@@ -1683,7 +1707,9 @@ mod tests {
         use std::io::{Seek, SeekFrom, Write};
         let mut file_handle = file_handle;
         file_handle
-            .seek(SeekFrom::Start(parity_extent.offset))
+            .seek(SeekFrom::Start(
+                scalefs_core::MEMBER_PARTITION_START + parity_extent.offset,
+            ))
             .unwrap();
         file_handle.write_all(&forged).unwrap();
         drop(file_handle);
@@ -1729,7 +1755,11 @@ mod tests {
             sequential_write_required: false,
         };
         let mut pool = Pool::create(
-            FileBlockDevice::create(&image, geometry.capacity_bytes()).unwrap(),
+            FileBlockDevice::create(
+                &image,
+                scalefs_core::member_image_len(geometry.capacity_bytes()),
+            )
+            .unwrap(),
             CreateParams {
                 geometry,
                 pool_id: PoolId([0x46; 16]),
@@ -1784,9 +1814,11 @@ mod tests {
         corrupt(&image, |pool| {
             let seed = pool.superblock().dirent_hash_seed;
             let case = pool.superblock().case_sensitivity;
+            let version = pool.superblock().unicode_version;
             scalefs_core::dirent::add_entry(
                 pool.tree_mut(),
                 seed,
+                version,
                 case,
                 ROOT_INODE,
                 "d-again",

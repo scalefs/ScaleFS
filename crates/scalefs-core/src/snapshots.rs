@@ -1,4 +1,3 @@
-
 use crate::device::BlockDevice;
 use crate::dirent;
 use crate::error::{Result, ScaleFsError};
@@ -29,6 +28,7 @@ fn retained_key(id: u64) -> MetadataKey {
 
 impl<D: BlockDevice> Pool<D> {
     pub fn snapshot_create(&mut self, name: &str, now_ns: i64) -> Result<u64> {
+        self.ensure_mutable()?;
         dirent::validate_name(name)?;
         if self.snapshot_list().iter().any(|s| s.name == name) {
             return Err(ScaleFsError::AlreadyExists);
@@ -70,6 +70,7 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn snapshot_release(&mut self, name: &str) -> Result<SnapshotInfo> {
+        self.ensure_mutable()?;
         let info = self
             .snapshot_list()
             .into_iter()
@@ -115,8 +116,9 @@ impl<D: BlockDevice> Snapshot<'_, D> {
         if !getattr_in(&self.tree, parent)?.is_dir() {
             return Err(ScaleFsError::NotDirectory);
         }
-        let (seed, case) = self.pool.naming();
-        dirent::lookup_entry(&self.tree, seed, case, parent, name).ok_or(ScaleFsError::NotFound)
+        let (seed, version, case) = self.pool.naming();
+        dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
+            .ok_or(ScaleFsError::NotFound)
     }
 
     pub fn readdir(&self, dir: u64) -> Result<Vec<DirEntry>> {
@@ -151,7 +153,7 @@ mod tests {
             sequential_write_required: true,
         };
         Pool::create(
-            MemoryBlockDevice::new(geometry.capacity_bytes() as usize),
+            MemoryBlockDevice::new(crate::gpt::member_image_len(geometry.capacity_bytes()) as usize),
             CreateParams {
                 pool_id: PoolId([0x11; 16]),
                 device_id: DeviceId([0x22; 16]),

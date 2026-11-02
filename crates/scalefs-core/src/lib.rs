@@ -1,4 +1,3 @@
-
 #[cfg(test)]
 mod chaos;
 pub mod checksum;
@@ -8,6 +7,7 @@ pub mod discovery;
 pub mod error;
 pub mod format;
 pub mod fs;
+pub mod gpt;
 pub mod layout;
 pub mod pool;
 pub mod raw;
@@ -20,14 +20,19 @@ pub mod stripes;
 pub mod topology;
 pub mod torture;
 pub mod tree;
+pub mod unicode;
 pub mod wire;
 pub mod zones;
 
 pub use checksum::{Crc32c, crc32c};
-pub use device::{BlockDevice, FileBlockDevice, MemoryBlockDevice, ReadOnly, SharedDevice};
+pub use device::{
+    BlockDevice, FileBlockDevice, MemoryBlockDevice, PartitionView, ReadOnly, SharedDevice,
+};
+pub use dirent::HashedEntry;
 pub use discovery::{
-    Contents, DeviceIdentity, DiscoveredDevice, ImportPlan, PlanError, PoolChoice, PoolProbe,
-    discovered_pools, list_devices, plan_import, probe_path, same_spindle,
+    BLANK_SAMPLE_LEN, Contents, DeviceAttachment, DeviceIdentity, DiscoveredDevice, ImportPlan,
+    PlanError, PoolChoice, PoolProbe, attachment_of_path, classify_attachment, discovered_pools,
+    list_devices, plan_import, probe_path, same_spindle,
 };
 pub use error::{Result, ScaleFsError};
 pub use format::{
@@ -38,7 +43,14 @@ pub use fs::FILE_DATA_CHUNK;
 pub use fs::LINK_MAX;
 pub use fs::MAX_SYMLINK_TARGET;
 pub use fs::{XATTR_SET_CREATE, XATTR_SET_EITHER, XATTR_SET_REPLACE};
-pub use layout::{CaseSensitivity, DeviceId, Extent, Geometry, PoolId, superblock_slots};
+pub use gpt::{
+    MEMBER_PARTITION_START, MemberPartition, SCALEFS_PART_TYPE_GUID, SCALEFS_PART_TYPE_GUID_TEXT,
+    find_member_partition, guid_text, member_image_len, member_view, member_view_forensic,
+    usable_len, write_member_gpt,
+};
+pub use layout::{
+    CaseSensitivity, DeviceId, Extent, Geometry, PoolId, superblock_slots, zone_summary_len,
+};
 pub use pool::{
     AbortedCommit, CommitTicket, CompactReport, CreateParams, ExecutedCommit, MemberSpec, Pool,
     PoolParams, RebuildReport, ReclaimReport, ScrubReport,
@@ -46,10 +58,10 @@ pub use pool::{
 pub use raw::{AnyBlockDevice, RawBlockDevice, is_device_path};
 pub use records::{
     Commit, FEATURE_COMPAT_KNOWN, FEATURE_INCOMPAT_KNOWN, FEATURE_INCOMPAT_MULTI_DEVICE,
-    FEATURE_INCOMPAT_PARITY, FEATURE_RO_COMPAT_HARDLINKS, FEATURE_RO_COMPAT_KNOWN,
-    FEATURE_RO_COMPAT_SPECIAL_FILES, FEATURE_RO_COMPAT_XATTRS, MAX_LABEL_LEN, Superblock,
-    decode_commit, decode_file_data, decode_superblock, encode_commit, encode_file_data,
-    encode_superblock,
+    FEATURE_INCOMPAT_PARITY, FEATURE_INCOMPAT_THIN_METADATA, FEATURE_RO_COMPAT_HARDLINKS,
+    FEATURE_RO_COMPAT_KNOWN, FEATURE_RO_COMPAT_SPECIAL_FILES, FEATURE_RO_COMPAT_XATTRS,
+    MAX_LABEL_LEN, Superblock, decode_commit, decode_file_data, decode_superblock, encode_commit,
+    encode_file_data, encode_superblock,
 };
 pub use rs::generate_parity;
 pub use salvage::{AssemblyReport, DeviceRole, Rung, Salvage, SalvageOptions};
@@ -65,5 +77,9 @@ pub use tree::{
     ITEM_XATTR, InodeAttrs, MAX_NAME_LEN, MAX_VALUE_LEN, MODE_BLOCK_DEVICE, MODE_CHAR_DEVICE,
     MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET, MODE_SYMLINK, MODE_TYPE_MASK, MetadataKey,
     MetadataTree, MetadataValue, PagePlan, ROOT_INODE, XATTR_TAG, XATTR_VALUE_MAX, XattrEntry,
+};
+pub use unicode::{
+    NEWEST_SUPPORTED_UNICODE_VERSION, SUPPORTED_UNICODE_VERSIONS, UnicodeVersion, V17_0_0,
+    is_supported as is_supported_unicode_version,
 };
 pub use zones::{AllocPurpose, Allocation, ZoneAllocator, ZoneClass, ZoneView};

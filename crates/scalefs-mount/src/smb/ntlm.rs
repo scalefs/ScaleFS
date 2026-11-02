@@ -1,4 +1,3 @@
-
 use super::crypto::md5::hmac_md5;
 use super::crypto::rc4::rc4;
 use super::crypto::{ct_eq, md4::nt_hash};
@@ -237,6 +236,14 @@ impl Default for AuthThrottle {
 }
 
 impl AuthThrottle {
+    pub fn share_wide() -> AuthThrottle {
+        AuthThrottle::with_tuning(
+            20,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+        )
+    }
+
     pub fn with_tuning(
         free_failures: u32,
         base_delay: std::time::Duration,

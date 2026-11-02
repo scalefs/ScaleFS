@@ -1,4 +1,3 @@
-
 use super::fs::Filesystem;
 use super::wire::{
     self, AttrOut, CreateIn, EntryOut, FlushIn, FsyncIn, GetattrIn, GetxattrIn, InitIn, InitOut,
@@ -295,18 +294,26 @@ pub fn serve(
 
     let session = Session::new();
     if workers <= 1 {
+        mount.set_nonblocking()?;
         let mut buffer = vec![0u8; super::device::REQUEST_BUFFER];
-        while let Some(len) = mount.read_request(&mut buffer)? {
-            match session.handle(&buffer[..len], filesystem) {
-                Outcome::Reply(reply) => mount.write_reply(&reply)?,
-                Outcome::Silent => {}
-                Outcome::Farewell(reply) => {
-                    mount.write_reply(&reply)?;
-                    return Ok(());
-                }
+        loop {
+            if mount.stop_requested() {
+                return Ok(());
+            }
+            mount.wait_readable()?;
+            match mount.read_request_nonblocking(&mut buffer)? {
+                RequestRead::Ready(len) => match session.handle(&buffer[..len], filesystem) {
+                    Outcome::Reply(reply) => mount.write_reply(&reply)?,
+                    Outcome::Silent => {}
+                    Outcome::Farewell(reply) => {
+                        mount.write_reply(&reply)?;
+                        return Ok(());
+                    }
+                },
+                RequestRead::NotReady => {}
+                RequestRead::Unmounted => return Ok(()),
             }
         }
-        return Ok(());
     }
 
     mount.set_nonblocking()?;
@@ -331,6 +338,9 @@ pub fn serve(
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::io::Result<()> {
                 loop {
+                    if mount.stop_requested() {
+                        return Ok(());
+                    }
                     if pool.stopped() {
                         return pool.take_error();
                     }

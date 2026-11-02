@@ -1,4 +1,3 @@
-
 use aws_lc_rs::{digest, hmac};
 
 pub fn sha256(message: &[u8]) -> [u8; 32] {

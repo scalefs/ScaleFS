@@ -1,4 +1,3 @@
-
 use super::crypto::md4::nt_hash;
 use super::crypto::md5::hmac_md5;
 use super::fileops::{
@@ -25,6 +24,8 @@ struct Reply {
 struct Client {
     connection: Connection,
     message_id: u64,
+    session_id: u64,
+    tree_id: u32,
 }
 
 impl Client {
@@ -32,6 +33,8 @@ impl Client {
         Client {
             connection: Connection::new(),
             message_id: 0,
+            session_id: 0,
+            tree_id: 0,
         }
     }
 
@@ -45,6 +48,8 @@ impl Client {
             command,
             message_id: self.message_id,
             credits: 1,
+            session_id: self.session_id,
+            tree_id: self.tree_id,
             ..Header::default()
         };
         self.message_id += 1;
@@ -77,6 +82,12 @@ impl Client {
             );
         }
         let status = u32::from_le_bytes(smb2[8..12].try_into().unwrap());
+        if command == command::SESSION_SETUP {
+            self.session_id = u64::from_le_bytes(smb2[40..48].try_into().unwrap());
+        }
+        if command == command::TREE_CONNECT && status == status::SUCCESS {
+            self.tree_id = u32::from_le_bytes(smb2[36..40].try_into().unwrap());
+        }
         Reply {
             status,
             body: smb2[wire::HEADER_LEN..].to_vec(),
@@ -109,7 +120,6 @@ impl Client {
         assert_eq!(reply.status, status::SUCCESS, "TREE_CONNECT");
     }
 }
-
 
 fn negotiate_request() -> Vec<u8> {
     let mut out = Vec::new();
@@ -216,7 +226,6 @@ fn tree_connect_request(path: &str) -> Vec<u8> {
     out
 }
 
-
 fn create_request(path: &str, disposition: u32, create_options: u32) -> Vec<u8> {
     let name = wire::to_utf16le(path);
     let mut out = Vec::new();
@@ -315,7 +324,6 @@ fn query_info_request(file_id: FileId, info_type: u8, info_class: u8) -> Vec<u8>
     out
 }
 
-
 fn created_file_id(body: &[u8]) -> FileId {
     body[64..80].try_into().unwrap()
 }
@@ -353,7 +361,6 @@ fn directory_names(query_body: &[u8], name_offset: usize) -> Vec<String> {
     names
 }
 
-
 fn config() -> ShareConfig {
     ShareConfig {
         name: "vault".to_string(),
@@ -383,7 +390,9 @@ fn test_core() -> Arc<MountCore<Arc<MemoryBlockDevice>>> {
         sequential_write_required: false,
     };
     let mut pool = Pool::create(
-        Arc::new(MemoryBlockDevice::new(geometry.capacity_bytes() as usize)),
+        Arc::new(MemoryBlockDevice::new(
+            scalefs_core::member_image_len(geometry.capacity_bytes()) as usize,
+        )),
         CreateParams {
             geometry,
             pool_id: PoolId([0x77; 16]),
@@ -761,6 +770,60 @@ fn a_bad_password_is_refused() {
         &mut share,
     );
     assert_eq!(tree.status, status::ACCESS_DENIED, "no session");
+}
+
+#[test]
+fn a_guesser_on_one_connection_is_throttled_without_locking_the_share() {
+    fn attempt(
+        client: &mut Client,
+        share: &mut SmbShare<Arc<MemoryBlockDevice>>,
+        password: &str,
+    ) -> (u32, Option<([u8; 8], u32)>) {
+        let step1 = client.send(
+            command::SESSION_SETUP,
+            &session_setup_request(&ntlmssp_negotiate()),
+            share,
+        );
+        if step1.status != status::MORE_PROCESSING_REQUIRED {
+            return (step1.status, None);
+        }
+        let challenge = server_challenge_from(&step1.body);
+        let auth = ntlmssp_authenticate("backup", "", password, challenge);
+        let step2 = client.send(command::SESSION_SETUP, &session_setup_request(&auth), share);
+        (step1.status, Some((challenge, step2.status)))
+    }
+
+    let core = test_core();
+    let mut shared = config();
+    shared.throttle = std::sync::Arc::new(super::ntlm::AuthThrottle::share_wide());
+
+    let mut share = SmbShare::new(shared.clone(), nonces(), Arc::clone(&core));
+    let mut guesser = Client::new();
+    assert_eq!(
+        guesser
+            .send(command::NEGOTIATE, &negotiate_request(), &mut share)
+            .status,
+        status::SUCCESS,
+    );
+    let mut challenges = Vec::new();
+    for _ in 0..4 {
+        let (step1, step2) = attempt(&mut guesser, &mut share, "wrong");
+        assert_eq!(step1, status::MORE_PROCESSING_REQUIRED);
+        let (challenge, step2) = step2.expect("a challenge was offered");
+        assert_eq!(step2, status::LOGON_FAILURE);
+        challenges.push(challenge);
+    }
+    challenges.sort_unstable();
+    challenges.dedup();
+    assert_eq!(challenges.len(), 4, "every exchange gets its own challenge");
+    assert_eq!(
+        attempt(&mut guesser, &mut share, "s3cret-pass"),
+        (status::LOGON_FAILURE, None)
+    );
+
+    let mut share_for_user = SmbShare::new(shared, nonces(), Arc::clone(&core));
+    let mut user = Client::new();
+    user.log_in("backup", "s3cret-pass", &mut share_for_user);
 }
 
 #[test]

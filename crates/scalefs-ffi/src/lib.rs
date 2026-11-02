@@ -1,4 +1,3 @@
-
 use scalefs_core::RawBlockDevice;
 use scalefs_core::salvage::{
     AssemblyReport, CandidateKind, DeviceRole, DirListing, ExtentVerdict, FileReport, PathOutcome,
@@ -24,7 +23,6 @@ pub extern "C" fn scalefs_format_version() -> u32 {
 pub extern "C" fn scalefs_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
-
 
 std::thread_local! {
     static LAST_ERROR: std::cell::RefCell<Option<CString>> =
@@ -63,7 +61,6 @@ fn guarded<T>(fallback: T, body: impl FnOnce() -> T) -> T {
         }
     }
 }
-
 
 pub struct ScalefsSalvage {
     session: Mutex<Salvage<RawBlockDevice>>,
@@ -164,7 +161,6 @@ fn json_out(value: Value) -> *mut c_char {
         }
     }
 }
-
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -430,7 +426,6 @@ fn resolve(session: &Salvage<RawBlockDevice>, path: &str) -> Result<u64, String>
     }
 }
 
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn scalefs_salvage_report_json(session: *mut ScalefsSalvage) -> *mut c_char {
     with_session(session, std::ptr::null_mut(), |salvage| {
@@ -680,8 +675,11 @@ mod tests {
             .iter()
             .zip([0xD1u8, 0xD2])
             .map(|(path, id)| MemberSpec {
-                device: FileBlockDevice::create(Path::new(path), geometry.capacity_bytes())
-                    .unwrap(),
+                device: FileBlockDevice::create(
+                    Path::new(path),
+                    scalefs_core::member_image_len(geometry.capacity_bytes()),
+                )
+                .unwrap(),
                 device_id: DeviceId([id; 16]),
                 geometry,
             })
@@ -708,7 +706,9 @@ mod tests {
         drop(pool);
 
         let device = FileBlockDevice::open(Path::new(&images[1])).unwrap();
-        device.write_at(0, &vec![0u8; 4096]).unwrap();
+        device
+            .write_at(scalefs_core::MEMBER_PARTITION_START, &vec![0u8; 4096])
+            .unwrap();
         device.flush().unwrap();
         drop(device);
         (dir, images)

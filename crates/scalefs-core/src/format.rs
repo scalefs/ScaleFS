@@ -1,4 +1,3 @@
-
 use crate::checksum::Crc32c;
 use crate::error::{Result, ScaleFsError};
 

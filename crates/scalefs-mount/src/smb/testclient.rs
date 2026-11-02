@@ -1,4 +1,3 @@
-
 use super::crypto::kdf::smb3_signing_key;
 use super::crypto::md4::nt_hash;
 use super::crypto::md5::hmac_md5;
@@ -15,7 +14,6 @@ pub fn utf16le(text: &str) -> Vec<u8> {
     }
     out
 }
-
 
 pub fn negotiate_request() -> Vec<u8> {
     let mut out = Vec::new();
@@ -256,7 +254,6 @@ pub fn query_info_request(file_id: FileId, info_type: u8, info_class: u8) -> Vec
     out
 }
 
-
 pub fn created_file_id(body: &[u8]) -> FileId {
     body[64..80].try_into().unwrap()
 }
@@ -298,7 +295,6 @@ pub struct Reply {
     pub status: u32,
     pub body: Vec<u8>,
 }
-
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -432,8 +428,16 @@ impl TcpSmbClient {
         if matches!(fold, Fold::Yes) {
             fold_preauth(&mut self.preauth, &message);
         }
+        let status = u32::from_le_bytes(message[8..12].try_into().unwrap());
+        let command = u16::from_le_bytes(message[12..14].try_into().unwrap());
+        if command == wire::command::SESSION_SETUP {
+            self.session_id = u64::from_le_bytes(message[40..48].try_into().unwrap());
+        }
+        if command == wire::command::TREE_CONNECT && status == wire::status::SUCCESS {
+            self.tree_id = u32::from_le_bytes(message[36..40].try_into().unwrap());
+        }
         Ok(Reply {
-            status: u32::from_le_bytes(message[8..12].try_into().unwrap()),
+            status,
             body: message[wire::HEADER_LEN..].to_vec(),
         })
     }
@@ -459,7 +463,6 @@ impl TcpSmbClient {
         self.stream.read_exact(&mut message)?;
         Ok(message)
     }
-
 
     pub fn create(&mut self, path: &str) -> Result<FileId, ClientError> {
         let body = create_request(

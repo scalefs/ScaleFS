@@ -1,4 +1,3 @@
-
 use scalefs_core::error::{Result, ScaleFsError};
 use scalefs_core::wire::{Cursor, put_u16, put_u32, put_u64};
 

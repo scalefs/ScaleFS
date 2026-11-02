@@ -1,4 +1,3 @@
-
 pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut s: [u8; 256] = [0; 256];
     for (i, byte) in s.iter_mut().enumerate() {

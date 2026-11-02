@@ -1,4 +1,3 @@
-
 use scalefs_ipc::client::Client;
 use scalefs_ipc::endpoint::Endpoint;
 use scalefs_ipc::json::{Value, object};
@@ -123,7 +122,11 @@ fn create_pool(dir: &std::path::Path, count: usize) -> Vec<String> {
         .iter()
         .enumerate()
         .map(|(i, path)| MemberSpec {
-            device: FileBlockDevice::create(path, geometry.capacity_bytes()).unwrap(),
+            device: FileBlockDevice::create(
+                path,
+                scalefs_core::member_image_len(geometry.capacity_bytes()),
+            )
+            .unwrap(),
             device_id: DeviceId([0xA0 + i as u8; 16]),
             geometry,
         })
@@ -149,7 +152,7 @@ fn create_pool(dir: &std::path::Path, count: usize) -> Vec<String> {
 }
 
 fn member_size() -> u64 {
-    geometry().capacity_bytes()
+    scalefs_core::member_image_len(geometry().capacity_bytes())
 }
 
 fn attach(client: &mut Client, name: &str, members: &[String]) {

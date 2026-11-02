@@ -1,4 +1,3 @@
-
 use crate::error::{Result, ScaleFsError};
 use crate::format::{RECORD_HEADER_LEN, RecordKind, decode_record, encode_record};
 use crate::layout::{Extent, decode_extent, encode_extent};

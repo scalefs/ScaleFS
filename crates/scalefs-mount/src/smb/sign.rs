@@ -1,4 +1,3 @@
-
 use super::crypto::aes::aes128_cmac;
 use super::crypto::ct_eq;
 use super::wire::{HEADER_LEN, SIGNATURE_OFFSET, flags};

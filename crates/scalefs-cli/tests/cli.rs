@@ -1,4 +1,3 @@
-
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -212,7 +211,7 @@ fn fsck_detects_a_corrupted_data_record() {
     assert!(ok(&["fsck", &image]).contains("clean"));
 
     let mut bytes = std::fs::read(&image).unwrap();
-    let target = 2 * 65536 + 100;
+    let target = (scalefs_core::MEMBER_PARTITION_START as usize) + 2 * 65536 + 100;
     bytes[target] ^= 0xFF;
     std::fs::write(&image, &bytes).unwrap();
 
@@ -389,7 +388,7 @@ fn scrub_finds_and_heals_silent_corruption() {
     assert!(ok(&["scrub", &members]).contains("healthy"));
 
     let mut bytes = std::fs::read(&b).unwrap();
-    let target = 2 * 65536 + 100;
+    let target = (scalefs_core::MEMBER_PARTITION_START as usize) + 2 * 65536 + 100;
     bytes[target] ^= 0xFF;
     std::fs::write(&b, &bytes).unwrap();
 
@@ -436,7 +435,7 @@ fn a_pool_grows_by_adding_members() {
     let members = format!("{a},{b}");
     let status = ok(&["pool", "status", &members]);
     assert!(status.contains("Members:      2"), "{status}");
-    assert!(status.contains("Capacity:     24 MiB"), "{status}");
+    assert!(status.contains("Capacity:     21.8 MiB"), "{status}");
 
     let (_, stderr) = fails(&["fs", "ls", &a]);
     assert!(

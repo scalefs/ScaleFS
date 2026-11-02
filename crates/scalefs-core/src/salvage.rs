@@ -1,4 +1,3 @@
-
 use crate::device::{BlockDevice, ReadOnly};
 use crate::dirent::{dirent_hash, fold_name};
 use crate::error::{Result, ScaleFsError};
@@ -12,6 +11,7 @@ use crate::tree::{
     DirEntry, ITEM_DIRENT, ITEM_INODE, InodeAttrs, MetadataKey, MetadataValue, ROOT_INODE,
     decode_internal_record, decode_leaf_record,
 };
+use crate::unicode::UnicodeVersion;
 
 #[derive(Debug, Default, Clone)]
 pub struct SalvageOptions {
@@ -110,12 +110,13 @@ impl std::fmt::Display for ReadFailure {
 const MAX_RECORD_READ: u64 = 128 << 20;
 
 pub struct Salvage<D: BlockDevice> {
-    devices: Vec<ReadOnly<D>>,
+    devices: Vec<ReadOnly<crate::device::PartitionView<D>>>,
     member_map: Vec<Option<usize>>,
     root: Vec<Extent>,
     live_root: Vec<Extent>,
     dirent_seed: u64,
     case_sensitivity: CaseSensitivity,
+    unicode_version: UnicodeVersion,
     report: AssemblyReport,
 }
 
@@ -147,7 +148,10 @@ impl<D: BlockDevice> Salvage<D> {
     }
 
     pub fn assemble_with(devices: Vec<D>, options: &SalvageOptions) -> Result<Salvage<D>> {
-        let devices: Vec<ReadOnly<D>> = devices.into_iter().map(ReadOnly::new).collect();
+        let devices: Vec<ReadOnly<crate::device::PartitionView<D>>> = devices
+            .into_iter()
+            .map(|device| ReadOnly::new(crate::gpt::member_view_forensic(device)))
+            .collect();
         let mut report = AssemblyReport {
             pool_id: None,
             label: None,
@@ -231,6 +235,7 @@ impl<D: BlockDevice> Salvage<D> {
 
         let mut dirent_seed = 0;
         let mut case_sensitivity = CaseSensitivity::Sensitive;
+        let mut unicode_version = crate::unicode::V17_0_0;
         let mut saw_pool_facts = false;
         for probe in &probes {
             let Some(sb) = &probe.superblock else {
@@ -243,6 +248,7 @@ impl<D: BlockDevice> Salvage<D> {
                 report.label = Some(sb.label.clone());
                 dirent_seed = sb.dirent_hash_seed;
                 case_sensitivity = sb.case_sensitivity;
+                unicode_version = sb.unicode_version;
                 saw_pool_facts = true;
             } else if sb.dirent_hash_seed != dirent_seed {
                 report
@@ -266,6 +272,7 @@ impl<D: BlockDevice> Salvage<D> {
                 live_root: Vec::new(),
                 dirent_seed,
                 case_sensitivity,
+                unicode_version,
                 report,
             });
         }
@@ -647,6 +654,7 @@ impl<D: BlockDevice> Salvage<D> {
             root,
             dirent_seed,
             case_sensitivity,
+            unicode_version,
             report,
         })
     }
@@ -685,7 +693,6 @@ impl<D: BlockDevice> Salvage<D> {
     ) -> std::result::Result<Vec<u8>, ReadFailure> {
         read_one_mapped(&self.devices, &self.member_map, extent, kinds)
     }
-
 
     fn load_node(
         &self,
@@ -865,11 +872,17 @@ impl<D: BlockDevice> Salvage<D> {
     }
 
     pub fn resolve_path(&self, path: &str) -> Result<PathOutcome> {
+        if !crate::unicode::is_supported(self.unicode_version) {
+            return Err(ScaleFsError::UnsupportedUnicodeVersion {
+                pool: self.unicode_version,
+                newest: crate::unicode::NEWEST_SUPPORTED_UNICODE_VERSION,
+            });
+        }
         let mut object = ROOT_INODE;
         for component in path.split(['/', '\\']).filter(|c| !c.is_empty()) {
             let hash = dirent_hash(
                 self.dirent_seed,
-                &fold_name(self.case_sensitivity, component),
+                &fold_name(self.unicode_version, self.case_sensitivity, component),
             );
             let key = MetadataKey {
                 object_id: object,
@@ -878,11 +891,13 @@ impl<D: BlockDevice> Salvage<D> {
             };
             let mut next = None;
             let mut damage = Vec::new();
-            let folded = fold_name(self.case_sensitivity, component);
+            let folded = fold_name(self.unicode_version, self.case_sensitivity, component);
             self.walk_range(key, key, &mut |event| match event {
                 WalkEvent::Item(_, MetadataValue::DirEntries(entries)) => {
                     for entry in entries {
-                        if fold_name(self.case_sensitivity, &entry.name) == folded {
+                        if fold_name(self.unicode_version, self.case_sensitivity, &entry.name)
+                            == folded
+                        {
                             next = Some(entry.inode);
                         }
                     }
@@ -936,7 +951,6 @@ impl<D: BlockDevice> Salvage<D> {
 }
 
 impl<D: BlockDevice> Salvage<D> {
-
     pub fn salvage_file(&self, object: u64, sink: &mut dyn std::io::Write) -> Result<FileReport> {
         let attrs = match self.stat(object)? {
             StatOutcome::Found(attrs) => attrs,
@@ -1592,7 +1606,11 @@ mod tests {
 
     fn mirror_pool(members: usize, m: u16) -> (Vec<Arc<MemoryBlockDevice>>, u64) {
         let devices: Vec<Arc<MemoryBlockDevice>> = (0..members)
-            .map(|_| Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize)))
+            .map(|_| {
+                Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry().capacity_bytes(),
+                ) as usize))
+            })
             .collect();
         let specs = devices
             .iter()
@@ -1633,49 +1651,56 @@ mod tests {
         Salvage::assemble(devices.to_vec()).expect("assemble")
     }
 
+    fn surgery(device: &MemoryBlockDevice) -> crate::device::PartitionView<&MemoryBlockDevice> {
+        crate::gpt::member_view(device).expect("test devices are formatted members")
+    }
+
     fn corrupt_record(device: &MemoryBlockDevice, extent: Extent) {
+        let view = surgery(device);
         let at = extent.offset + 40;
         let mut byte = [0u8; 1];
-        device.read_at(at, &mut byte).unwrap();
+        view.read_at(at, &mut byte).unwrap();
         byte[0] ^= 0xFF;
-        device.write_at(at, &byte).unwrap();
+        view.write_at(at, &byte).unwrap();
     }
 
     fn zero_slot(device: &MemoryBlockDevice, which: usize) {
-        let offset = superblock_slots(device.len())[which];
-        device.write_at(offset, &[0u8; 4096]).unwrap();
+        let view = surgery(device);
+        let offset = superblock_slots(view.len())[which];
+        view.write_at(offset, &[0u8; 4096]).unwrap();
     }
 
     fn chain_of(device: &MemoryBlockDevice) -> (Superblock, Commit, Option<Topology>) {
+        let view = surgery(device);
         let mut block = vec![0u8; 4096];
-        device
-            .read_at(superblock_slots(device.len())[0], &mut block)
+        view.read_at(superblock_slots(view.len())[0], &mut block)
             .unwrap();
         let superblock = decode_superblock(&block).unwrap();
         let commit_extent = superblock.newest_commit.unwrap();
         let mut bytes = vec![0u8; commit_extent.length as usize];
-        device.read_at(commit_extent.offset, &mut bytes).unwrap();
+        view.read_at(commit_extent.offset, &mut bytes).unwrap();
         let commit = decode_commit(&bytes).unwrap();
         let roster = commit.aux_root.map(|aux| {
             let mut bytes = vec![0u8; aux.length as usize];
-            device.read_at(aux.offset, &mut bytes).unwrap();
+            view.read_at(aux.offset, &mut bytes).unwrap();
             decode_topology(&bytes).unwrap()
         });
         (superblock, commit, roster)
     }
 
     fn slot_bytes(device: &MemoryBlockDevice, which: usize) -> Vec<u8> {
+        let view = surgery(device);
         let mut block = vec![0u8; 4096];
-        device
-            .read_at(superblock_slots(device.len())[which], &mut block)
+        view.read_at(superblock_slots(view.len())[which], &mut block)
             .unwrap();
         block
     }
 
     fn restore_slots(device: &MemoryBlockDevice, bytes: &[Vec<u8>; 2]) {
+        let view = surgery(device);
         for (which, block) in bytes.iter().enumerate() {
-            let offset = superblock_slots(device.len())[which];
-            device.write_at(offset, block).unwrap();
+            let offset = superblock_slots(view.len())[which];
+            view.write_at(offset, block).unwrap();
         }
     }
 
@@ -1808,7 +1833,9 @@ mod tests {
                     continue;
                 };
                 let mut bytes = vec![0u8; commit_extent.length as usize];
-                device.read_at(commit_extent.offset, &mut bytes).unwrap();
+                surgery(device)
+                    .read_at(commit_extent.offset, &mut bytes)
+                    .unwrap();
                 let Ok(commit) = decode_commit(&bytes) else {
                     continue;
                 };
@@ -1857,7 +1884,9 @@ mod tests {
 
     #[test]
     fn single_device_pools_assemble_without_a_roster() {
-        let device = Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize));
+        let device = Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+            geometry().capacity_bytes(),
+        ) as usize));
         let mut pool = Pool::create(
             Arc::clone(&device),
             CreateParams {
@@ -1883,14 +1912,60 @@ mod tests {
     }
 
     #[test]
+    fn salvage_folds_unicode_names_identically_to_the_engine() {
+        let device = Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+            geometry().capacity_bytes(),
+        ) as usize));
+        let mut pool = Pool::create(
+            Arc::clone(&device),
+            CreateParams {
+                geometry: geometry(),
+                pool_id: PoolId([0xCE; 16]),
+                device_id: DeviceId([0xCF; 16]),
+                case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                dirent_hash_seed: 9,
+                label: "unicode".to_string(),
+                created_at_ns: NOW,
+            },
+        )
+        .unwrap();
+
+        let cafe = pool
+            .create_file(ROOT_INODE, "caf\u{E9}", 0o644, NOW)
+            .unwrap();
+        let idot = pool
+            .create_file(ROOT_INODE, "\u{130}.txt", 0o644, NOW)
+            .unwrap();
+        let sigma = pool.create_file(ROOT_INODE, "\u{3A3}", 0o644, NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+
+        assert_eq!(pool.lookup(ROOT_INODE, "CAFE\u{301}").unwrap().inode, cafe);
+        assert_eq!(pool.lookup(ROOT_INODE, "i\u{307}.txt").unwrap().inode, idot);
+        assert_eq!(pool.lookup(ROOT_INODE, "\u{3C3}").unwrap().inode, sigma);
+        drop(pool);
+
+        let session = Salvage::assemble(vec![Arc::clone(&device)]).expect("assemble");
+        let resolve = |path: &str| match session.resolve_path(path).unwrap() {
+            PathOutcome::Found(inode) => inode,
+            _ => panic!("{path} did not resolve"),
+        };
+        assert_eq!(resolve("/CAFE\u{301}"), cafe);
+        assert_eq!(resolve("/i\u{307}.txt"), idot);
+        assert_eq!(resolve("/\u{3C3}"), sigma);
+    }
+
+    #[test]
     fn unknown_incompatible_bits_stop_at_identity() {
         let (devices, _) = mirror_pool(3, 2);
         let (mut superblock, _, _) = chain_of(&devices[0]);
         superblock.feature_incompat |= 1 << 7;
         let encoded = encode_superblock(&superblock).unwrap();
-        for which in 0..2 {
-            let offset = superblock_slots(devices[0].len())[which];
-            devices[0].write_at(offset, &encoded).unwrap();
+        {
+            let view = surgery(&devices[0]);
+            for which in 0..2 {
+                let offset = superblock_slots(view.len())[which];
+                view.write_at(offset, &encoded).unwrap();
+            }
         }
         let session = salvage(&devices);
         let report = session.report();
@@ -1986,10 +2061,13 @@ mod tests {
         assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
 
-
     fn many_file_pool(count: usize) -> (Vec<Arc<MemoryBlockDevice>>, u64) {
         let devices: Vec<Arc<MemoryBlockDevice>> = (0..3)
-            .map(|_| Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize)))
+            .map(|_| {
+                Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry().capacity_bytes(),
+                ) as usize))
+            })
             .collect();
         let specs = devices
             .iter()
@@ -2133,7 +2211,6 @@ mod tests {
         assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
 
-
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
@@ -2255,7 +2332,11 @@ mod tests {
 
     fn parity_pool() -> (Vec<Arc<MemoryBlockDevice>>, Vec<u8>) {
         let devices: Vec<Arc<MemoryBlockDevice>> = (0..4)
-            .map(|_| Arc::new(MemoryBlockDevice::new(geometry().capacity_bytes() as usize)))
+            .map(|_| {
+                Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry().capacity_bytes(),
+                ) as usize))
+            })
             .collect();
         let specs = devices
             .iter()
@@ -2363,9 +2444,9 @@ mod tests {
         };
         let devices: Vec<Arc<MemoryBlockDevice>> = (0..3)
             .map(|_| {
-                Arc::new(MemoryBlockDevice::new(
-                    big_geometry.capacity_bytes() as usize
-                ))
+                Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    big_geometry.capacity_bytes(),
+                ) as usize))
             })
             .collect();
         let specs = devices
@@ -2452,9 +2533,9 @@ mod tests {
         };
         let devices: Vec<Arc<MemoryBlockDevice>> = (0..3)
             .map(|_| {
-                Arc::new(MemoryBlockDevice::new(
-                    big_geometry.capacity_bytes() as usize
-                ))
+                Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    big_geometry.capacity_bytes(),
+                ) as usize))
             })
             .collect();
         let specs = devices
@@ -2586,7 +2667,6 @@ mod tests {
             "even reconstruction never writes"
         );
     }
-
 
     #[test]
     fn snapshots_enter_and_serve_their_retained_bytes() {

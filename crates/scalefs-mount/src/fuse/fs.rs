@@ -1,4 +1,3 @@
-
 use super::wire::{AttrOut, EntryOut, OpenOut, SetattrIn, StatfsOut, errno};
 
 pub trait Filesystem {

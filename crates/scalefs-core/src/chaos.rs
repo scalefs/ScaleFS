@@ -1,4 +1,3 @@
-
 use crate::device::MemoryBlockDevice;
 use crate::error::ScaleFsError;
 use crate::layout::{CaseSensitivity, DeviceId, Geometry, PoolId};
@@ -113,7 +112,9 @@ impl Chaos {
         let mut id = [0x40u8; 16];
         id[..8].copy_from_slice(&serial.to_le_bytes());
         Member {
-            backing: Arc::new(MemoryBlockDevice::new(GEOMETRY.capacity_bytes() as usize)),
+            backing: Arc::new(MemoryBlockDevice::new(crate::gpt::member_image_len(
+                GEOMETRY.capacity_bytes(),
+            ) as usize)),
             device_id: DeviceId(id),
         }
     }
@@ -178,8 +179,13 @@ impl Chaos {
         }
         let roll = self.rng.next_u64() % 100;
         if self.down.is_some() {
-            if roll < 70 {
+            if roll < 55 {
                 self.heal_via_replace();
+            } else if roll < 70
+                && matches!(self.shape, Shape::Mirror)
+                && self.members.len() > usize::from(MIRROR_WIDTH)
+            {
+                self.retire_downed();
             } else {
                 self.write_through_degraded();
             }
@@ -307,6 +313,50 @@ impl Chaos {
             self.write_one(&mut pool, Strict::MayRefuse);
         }
         self.commit_and_settle(&mut pool);
+    }
+
+    fn retire_downed(&mut self) {
+        let (mut pool, _switches) = match self.open() {
+            Ok(opened) => opened,
+            Err(error) => self.fail(&format!("could not open degraded to retire: {error:?}")),
+        };
+        let missing = pool.missing_members();
+        let Some(&member) = missing.first() else {
+            self.down = None;
+            return;
+        };
+        let retired_id = pool
+            .member_rosters()
+            .ok()
+            .and_then(|rosters| {
+                rosters
+                    .first()
+                    .map(|roster| roster.members[usize::from(member)].device_id)
+            })
+            .unwrap_or_else(|| self.fail("no roster naming the missing member"));
+        match pool.retire_member(member, self.now()) {
+            Ok(_) => {
+                let downed = self
+                    .down
+                    .take()
+                    .unwrap_or_else(|| self.fail("retire ran without a downed member"));
+                let removed = self.members.remove(downed);
+                if removed.device_id != retired_id {
+                    self.fail("retire bookkeeping: the downed member is not the retired one");
+                }
+                self.thinned = false;
+                if !pool
+                    .scrub(false)
+                    .unwrap_or_else(|error| self.fail(&format!("post-retire scrub: {error:?}")))
+                    .healthy()
+                {
+                    self.fail("post-retire scrub found unhealthy copies");
+                }
+                self.settle(&pool);
+            }
+            Err(ScaleFsError::OutOfSpace) => {}
+            Err(error) => self.fail(&format!("retire refused unexpectedly: {error:?}")),
+        }
     }
 
     fn heal_via_replace(&mut self) {
@@ -438,14 +488,12 @@ impl Chaos {
                     });
                 }
             }
-            2 => {
-                match pool.reclaim(self.now()) {
-                    Ok(_) => {}
-                    Err(ScaleFsError::Corrupt(advice))
-                        if advice.contains("scrub before reclaiming") => {}
-                    Err(error) => self.fail(&format!("reclaim failed: {error:?}")),
-                }
-            }
+            2 => match pool.reclaim(self.now()) {
+                Ok(_) => {}
+                Err(ScaleFsError::Corrupt(advice))
+                    if advice.contains("scrub before reclaiming") => {}
+                Err(error) => self.fail(&format!("reclaim failed: {error:?}")),
+            },
             _ => {
                 let report = pool
                     .scrub(false)

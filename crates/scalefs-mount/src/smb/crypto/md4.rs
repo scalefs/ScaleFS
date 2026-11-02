@@ -1,4 +1,3 @@
-
 pub fn md4(message: &[u8]) -> [u8; 16] {
     let mut a: u32 = 0x6745_2301;
     let mut b: u32 = 0xefcd_ab89;

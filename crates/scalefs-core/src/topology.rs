@@ -1,4 +1,3 @@
-
 use crate::error::{Result, ScaleFsError};
 use crate::format::{RecordKind, decode_record, encode_record};
 use crate::layout::{
@@ -94,9 +93,12 @@ impl Topology {
         if self.mirror_width > 255 {
             return Err(ScaleFsError::Corrupt("mirror width exceeds 255"));
         }
-        if self.metadata_root_replicas.len() != usize::from(self.mirror_width) {
+        if self.metadata_root_replicas.is_empty() {
+            return Err(ScaleFsError::Corrupt("topology has no root replica"));
+        }
+        if self.metadata_root_replicas.len() > usize::from(self.mirror_width) {
             return Err(ScaleFsError::Corrupt(
-                "root replica count must equal the mirror width",
+                "root replica count exceeds the mirror width",
             ));
         }
         for replica in &self.metadata_root_replicas {
@@ -174,6 +176,12 @@ impl Topology {
     }
 }
 
+const ZERO_EXTENT: Extent = Extent {
+    device_index: 0,
+    offset: 0,
+    length: 0,
+};
+
 pub fn encode_topology(topology: &Topology) -> Result<Vec<u8>> {
     topology.validate()?;
 
@@ -200,6 +208,9 @@ pub fn encode_topology(topology: &Topology) -> Result<Vec<u8>> {
     }
     for replica in &topology.metadata_root_replicas {
         encode_extent(&mut payload, *replica);
+    }
+    for _ in topology.metadata_root_replicas.len()..usize::from(topology.mirror_width) {
+        encode_extent(&mut payload, ZERO_EXTENT);
     }
     Ok(encode_record(RecordKind::Topology, &payload))
 }
@@ -253,8 +264,17 @@ pub fn decode_topology(bytes: &[u8]) -> Result<Topology> {
         });
     }
     let mut metadata_root_replicas = Vec::with_capacity(usize::from(mirror_width));
+    let mut padding = false;
     for _ in 0..mirror_width {
-        metadata_root_replicas.push(decode_extent(&mut cursor)?);
+        let replica = decode_extent(&mut cursor)?;
+        if replica == ZERO_EXTENT {
+            padding = true;
+            continue;
+        }
+        if padding {
+            return Err(ScaleFsError::Corrupt("root replica after padding"));
+        }
+        metadata_root_replicas.push(replica);
     }
     cursor.expect_end("topology payload has trailing bytes")?;
 
@@ -328,6 +348,26 @@ mod tests {
     }
 
     #[test]
+    fn thin_root_replicas_round_trip() {
+        let mut thin = fixture_topology();
+        thin.mirror_width = 2;
+        assert_eq!(thin.metadata_root_replicas.len(), 1);
+        let encoded = encode_topology(&thin).unwrap();
+        let mut full = thin.clone();
+        full.metadata_root_replicas.push(Extent {
+            device_index: 1,
+            offset: (1 << 26) + 8192,
+            length: 4096,
+        });
+        assert_eq!(
+            encoded.len(),
+            encode_topology(&full).unwrap().len(),
+            "the replica list keeps its fixed size"
+        );
+        assert_eq!(decode_topology(&encoded).unwrap(), thin);
+    }
+
+    #[test]
     fn member_index_finds_members() {
         let topology = fixture_topology();
         assert_eq!(topology.member_index(DeviceId([0x22; 16])), Some(0));
@@ -372,9 +412,16 @@ mod tests {
             ("mirror width beyond membership", &|t: &mut Topology| {
                 t.mirror_width = 3
             }),
-            ("root replica count mismatch", &|t: &mut Topology| {
+            ("no root replicas", &|t: &mut Topology| {
                 t.metadata_root_replicas.clear()
             }),
+            (
+                "root replicas beyond the mirror width",
+                &|t: &mut Topology| {
+                    let extra = t.metadata_root_replicas[0];
+                    t.metadata_root_replicas.push(extra)
+                },
+            ),
             ("empty root replica", &|t: &mut Topology| {
                 t.metadata_root_replicas[0].length = 0
             }),

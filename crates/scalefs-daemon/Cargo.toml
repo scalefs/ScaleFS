@@ -16,6 +16,9 @@ scalefs-core = { path = "../scalefs-core" }
 scalefs-ipc = { path = "../scalefs-ipc" }
 scalefs-mount = { path = "../scalefs-mount" }
 
+[target.'cfg(windows)'.dependencies]
+scalefs-shell = { path = "../scalefs-shell" }
+
 [dev-dependencies]
 # The real-process chaos harness (tests/chaos.rs) drives SMB load through
 # the in-tree TCP client; dev-only, so nothing the daemon ships depends

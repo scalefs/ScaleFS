@@ -21,3 +21,4 @@ scalefs-daemon = { path = "../scalefs-daemon" }
 
 [lints]
 workspace = true
+

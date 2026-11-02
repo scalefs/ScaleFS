@@ -1,4 +1,3 @@
-
 pub fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = Crc32c::new();
     crc.update(bytes);
@@ -71,6 +70,36 @@ pub(crate) fn update_sw(state: u32, bytes: &[u8]) -> u32 {
     }
     crc
 }
+
+pub(crate) fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc = (crc >> 8) ^ IEEE_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize];
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+const fn build_ieee_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+static IEEE_TABLE: [u32; 256] = build_ieee_table();
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod hw {
@@ -162,6 +191,17 @@ mod tests {
             crc.update(b);
             assert_eq!(crc.finalize(), expected, "split at {split}");
         }
+    }
+
+    #[test]
+    fn ieee_reference_vectors() {
+        assert_eq!(crc32_ieee(b""), 0x0000_0000);
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_ieee(&[0u8; 32]), 0x190A_55AD);
+        assert_eq!(
+            crc32_ieee(b"The quick brown fox jumps over the lazy dog"),
+            0x414F_A339
+        );
     }
 
     #[test]

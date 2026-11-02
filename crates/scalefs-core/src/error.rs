@@ -1,5 +1,5 @@
-
 use crate::layout::DeviceId;
+use crate::unicode::UnicodeVersion;
 use std::fmt;
 
 #[derive(Debug)]
@@ -19,6 +19,10 @@ pub enum ScaleFsError {
     TooManyLinks,
     OutOfSpace,
     Unsupported(&'static str),
+    UnsupportedUnicodeVersion {
+        pool: UnicodeVersion,
+        newest: UnicodeVersion,
+    },
     MissingMembers {
         missing: Vec<DeviceId>,
     },
@@ -46,6 +50,11 @@ impl fmt::Display for ScaleFsError {
             Self::TooManyLinks => write!(f, "too many links"),
             Self::OutOfSpace => write!(f, "out of space"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
+            Self::UnsupportedUnicodeVersion { pool, newest } => write!(
+                f,
+                "this pool uses Unicode naming tables v{pool}; this ScaleFS \
+                 carries up to v{newest} — upgrade ScaleFS to mount this pool"
+            ),
             Self::MissingMembers { missing } => {
                 write!(f, "pool members are missing:")?;
                 for id in missing {
