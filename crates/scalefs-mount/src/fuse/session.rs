@@ -36,6 +36,8 @@ impl Session {
         let Ok((header, body)) = wire::split_request(frame) else {
             return Outcome::Silent;
         };
+        let _perf =
+            scalefs_core::perftrace::op(scalefs_core::perftrace::Surface::Fuse, header.opcode);
         let reply = match header.opcode {
             opcode::INIT => {
                 return Outcome::Reply(match InitIn::decode(&mut Cursor::new(body)) {

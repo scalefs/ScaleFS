@@ -2,10 +2,10 @@ use crate::device::BlockDevice;
 use crate::dirent;
 use crate::error::{Result, ScaleFsError};
 use crate::fs::{getattr_in, read_in};
-use crate::layout::Extent;
 use crate::pool::Pool;
 use crate::tree::{
-    DirEntry, ITEM_RETAINED_ROOT, InodeAttrs, MetadataKey, MetadataTree, MetadataValue,
+    DirEntry, ITEM_RETAINED_ROOT, InodeAttrs, MetadataKey, MetadataTree, MetadataValue, PageRef,
+    TreeRef,
 };
 use crate::zones::AllocPurpose;
 
@@ -15,7 +15,7 @@ pub struct SnapshotInfo {
     pub name: String,
     pub tx_id: u64,
     pub created_at_ns: i64,
-    pub metadata_roots: Vec<Extent>,
+    pub root: PageRef,
 }
 
 fn retained_key(id: u64) -> MetadataKey {
@@ -30,64 +30,64 @@ impl<D: BlockDevice> Pool<D> {
     pub fn snapshot_create(&mut self, name: &str, now_ns: i64) -> Result<u64> {
         self.ensure_mutable()?;
         dirent::validate_name(name)?;
-        if self.snapshot_list().iter().any(|s| s.name == name) {
+        if self.snapshot_list()?.iter().any(|s| s.name == name) {
             return Err(ScaleFsError::AlreadyExists);
         }
 
         self.commit(AllocPurpose::Normal, now_ns)?;
         let retained = MetadataValue::RetainedRoot {
             tx_id: self.committed_tx(),
-            metadata_roots: self.last_metadata_root.clone(),
+            root: self.last_metadata_root.clone(),
             created_at_ns: now_ns,
             name: name.to_string(),
         };
         let id = self.allocate_object_id()?;
-        self.tree.insert(retained_key(id), retained)?;
+        self.tree_mut().insert(retained_key(id), retained)?;
         self.commit(AllocPurpose::Normal, now_ns)?;
         Ok(id)
     }
 
-    pub fn snapshot_list(&self) -> Vec<SnapshotInfo> {
-        self.tree
-            .range(retained_key(0), retained_key(u64::MAX))
-            .iter()
+    pub fn snapshot_list(&self) -> Result<Vec<SnapshotInfo>> {
+        Ok(self
+            .tree()
+            .range(retained_key(0), retained_key(u64::MAX))?
+            .into_iter()
             .filter_map(|(key, value)| match value {
                 MetadataValue::RetainedRoot {
                     tx_id,
-                    metadata_roots,
+                    root,
                     created_at_ns,
                     name,
                 } => Some(SnapshotInfo {
                     id: key.offset,
-                    name: name.clone(),
-                    tx_id: *tx_id,
-                    created_at_ns: *created_at_ns,
-                    metadata_roots: metadata_roots.clone(),
+                    name,
+                    tx_id,
+                    created_at_ns,
+                    root,
                 }),
                 _ => None,
             })
-            .collect()
+            .collect())
     }
 
     pub fn snapshot_release(&mut self, name: &str) -> Result<SnapshotInfo> {
         self.ensure_mutable()?;
         let info = self
-            .snapshot_list()
+            .snapshot_list()?
             .into_iter()
             .find(|s| s.name == name)
             .ok_or(ScaleFsError::NotFound)?;
-        self.tree.remove(retained_key(info.id));
+        self.tree_mut().remove(retained_key(info.id))?;
         Ok(info)
     }
 
     pub fn snapshot_open(&self, name: &str) -> Result<Snapshot<'_, D>> {
         let info = self
-            .snapshot_list()
+            .snapshot_list()?
             .into_iter()
             .find(|s| s.name == name)
             .ok_or(ScaleFsError::NotFound)?;
-        let tree =
-            MetadataTree::load(&info.metadata_roots, &mut |copies| self.read_record(copies))?;
+        let tree = MetadataTree::load(&info.root, self)?;
         Ok(Snapshot {
             pool: self,
             tree,
@@ -108,28 +108,36 @@ impl<D: BlockDevice> Snapshot<'_, D> {
         &self.info
     }
 
+    fn view(&self) -> TreeRef<'_> {
+        self.tree.view(self.pool)
+    }
+
     pub fn getattr(&self, object_id: u64) -> Result<InodeAttrs> {
-        getattr_in(&self.tree, object_id)
+        getattr_in(self.view(), object_id)
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Result<DirEntry> {
-        if !getattr_in(&self.tree, parent)?.is_dir() {
+        if !getattr_in(self.view(), parent)?.is_dir() {
             return Err(ScaleFsError::NotDirectory);
         }
         let (seed, version, case) = self.pool.naming();
-        dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
+        dirent::lookup_entry(self.view(), seed, version, case, parent, name)?
             .ok_or(ScaleFsError::NotFound)
     }
 
     pub fn readdir(&self, dir: u64) -> Result<Vec<DirEntry>> {
-        if !getattr_in(&self.tree, dir)?.is_dir() {
+        if !getattr_in(self.view(), dir)?.is_dir() {
             return Err(ScaleFsError::NotDirectory);
         }
-        Ok(dirent::list_entries(&self.tree, dir))
+        dirent::list_entries(self.view(), dir)
     }
 
     pub fn read(&self, object_id: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
-        read_in(self.pool, &self.tree, object_id, offset, len)
+        read_in(self.pool, self.view(), object_id, offset, len)
+    }
+
+    pub fn item_count(&self) -> Result<usize> {
+        self.view().item_count()
     }
 }
 
@@ -216,13 +224,18 @@ mod tests {
         ));
         pool.snapshot_create("s2", NOW + 1).unwrap();
 
-        let names: Vec<String> = pool.snapshot_list().into_iter().map(|s| s.name).collect();
+        let names: Vec<String> = pool
+            .snapshot_list()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(names, ["s1", "s2"]);
 
         let released = pool.snapshot_release("s1").unwrap();
         assert_eq!(released.name, "s1");
         pool.commit(AllocPurpose::Reclaim, NOW).unwrap();
-        assert_eq!(pool.snapshot_list().len(), 1);
+        assert_eq!(pool.snapshot_list().unwrap().len(), 1);
         assert!(matches!(
             pool.snapshot_open("s1"),
             Err(ScaleFsError::NotFound)
@@ -243,7 +256,7 @@ mod tests {
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
 
         let pool = Pool::open(pool.into_device()).unwrap();
-        let list = pool.snapshot_list();
+        let list = pool.snapshot_list().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "persisted");
         let snap = pool.snapshot_open("persisted").unwrap();

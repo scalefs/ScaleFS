@@ -85,6 +85,7 @@ pub enum PlanError {
     SeveralPools(Vec<PoolChoice>),
     NoMatch(String),
     AmbiguousSelector(String, Vec<PoolChoice>),
+    EarlierFormat(String),
 }
 
 impl std::fmt::Display for PlanError {
@@ -119,6 +120,7 @@ impl std::fmt::Display for PlanError {
                 write!(f, "'{selector}' matches more than one pool:")?;
                 list(f, choices)
             }
+            PlanError::EarlierFormat(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -201,6 +203,7 @@ fn classify<D: BlockDevice>(device: &D) -> (Contents, Option<String>) {
             Err(error) => return (Contents::Partitioned, Some(error.to_string())),
         };
         let mut freshest: Option<PoolProbe> = None;
+        let mut earlier_format: Option<String> = None;
         for offset in superblock_slots(view.len()) {
             let available = view.len().saturating_sub(offset).min(4096);
             if available == 0 {
@@ -210,15 +213,21 @@ fn classify<D: BlockDevice>(device: &D) -> (Contents, Option<String>) {
             if let Err(error) = view.read_at(offset, &mut bytes) {
                 return (Contents::Unreadable, Some(error.to_string()));
             }
-            let Ok(superblock) = decode_superblock(&bytes) else {
-                continue;
+            let superblock = match decode_superblock(&bytes) {
+                Ok(superblock) => superblock,
+                Err(error @ crate::error::ScaleFsError::EarlierFormat { .. }) => {
+                    earlier_format = Some(error.to_string());
+                    continue;
+                }
+                Err(_) => continue,
             };
             let tx = superblock
                 .newest_commit
-                .filter(|extent| extent.length <= 64 * 1024)
-                .and_then(|extent| {
-                    let mut bytes = vec![0u8; extent.length as usize];
-                    view.read_at(extent.offset, &mut bytes).ok()?;
+                .filter(|reference| reference.extent.length <= 64 * 1024)
+                .and_then(|reference| {
+                    let mut bytes = vec![0u8; reference.extent.length as usize];
+                    view.read_at(reference.extent.offset, &mut bytes).ok()?;
+                    reference.expect.verify(&bytes).ok()?;
                     crate::records::decode_commit(&bytes).ok()
                 })
                 .map_or(0, |commit| commit.tx_id);
@@ -241,7 +250,9 @@ fn classify<D: BlockDevice>(device: &D) -> (Contents, Option<String>) {
         }
         return (
             Contents::Partitioned,
-            Some("a ScaleFS-typed partition with no readable superblock".to_string()),
+            Some(earlier_format.unwrap_or_else(|| {
+                "a ScaleFS-typed partition with no readable superblock".to_string()
+            })),
         );
     }
 
@@ -365,6 +376,17 @@ pub fn plan_import(
                 duplicates: Vec::new(),
             }),
         }
+    }
+    if groups.is_empty()
+        && let Some((path, reason)) = devices.iter().find_map(|device| {
+            device
+                .error
+                .as_deref()
+                .filter(|reason| reason.starts_with(crate::error::EARLIER_FORMAT_LEAD))
+                .map(|reason| (&device.path, reason))
+        })
+    {
+        return Err(PlanError::EarlierFormat(format!("{path}: {reason}")));
     }
     let choices = |groups: &[&Group]| {
         groups
@@ -924,6 +946,60 @@ mod tests {
             zone_count: 16,
             erase_granularity_zones: 1,
             sequential_write_required: false,
+        }
+    }
+
+    #[test]
+    fn earlier_format_members_are_named_as_such() {
+        let geometry = small_geometry();
+        let device = crate::device::MemoryBlockDevice::new(crate::gpt::member_image_len(
+            geometry.capacity_bytes(),
+        ) as usize);
+        let pool = Pool::create(
+            device,
+            CreateParams {
+                geometry,
+                pool_id: crate::layout::PoolId([0x51; 16]),
+                device_id: crate::layout::DeviceId([0x52; 16]),
+                case_sensitivity: CaseSensitivity::Sensitive,
+                dirent_hash_seed: 3,
+                label: "old".to_string(),
+                created_at_ns: 1_700_000_000_000_000_000,
+            },
+        )
+        .unwrap();
+        let device = pool.into_device();
+        let v1 = crate::format::tests::hex_bytes(crate::format::tests::VERSION_ONE_SUPERBLOCK);
+        {
+            let view = crate::gpt::member_view(&device).unwrap();
+            for offset in superblock_slots(view.len()) {
+                view.write_at(offset, &v1).unwrap();
+            }
+        }
+        let (contents, error) = classify(&device);
+        assert!(matches!(contents, Contents::Partitioned), "{contents:?}");
+        let error = error.expect("a reason");
+        assert!(
+            error.contains("created by an earlier preview of ScaleFS"),
+            "{error}"
+        );
+        let old = DiscoveredDevice {
+            path: "old-member".to_string(),
+            size: Some(device.len()),
+            identity: DeviceIdentity::default(),
+            actuators: 0,
+            contents,
+            error: Some(error),
+        };
+        match plan_import(&[stranger("x"), old], None) {
+            Err(PlanError::EarlierFormat(refusal)) => {
+                assert!(refusal.starts_with("old-member: "), "{refusal}");
+                assert!(
+                    refusal.contains("create a new pool and move the files"),
+                    "{refusal}"
+                );
+            }
+            other => panic!("{other:?}"),
         }
     }
 

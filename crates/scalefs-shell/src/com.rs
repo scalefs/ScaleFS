@@ -24,6 +24,7 @@ const E_NOTIMPL: Hresult = 0x8000_4001_u32 as i32;
 const E_NOINTERFACE: Hresult = 0x8000_4002_u32 as i32;
 const E_POINTER: Hresult = 0x8000_4003_u32 as i32;
 const E_FAIL: Hresult = 0x8000_4005_u32 as i32;
+const E_UNEXPECTED: Hresult = 0x8000_FFFF_u32 as i32;
 const CLASS_E_NOAGGREGATION: Hresult = 0x8004_0110_u32 as i32;
 const CLASS_E_CLASSNOTAVAILABLE: Hresult = 0x8004_0111_u32 as i32;
 
@@ -35,6 +36,52 @@ const SIGDN_NORMALDISPLAY: u32 = 0;
 const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+struct ModuleReference(isize);
+
+impl ModuleReference {
+    fn containing(address: *const c_void) -> Option<ModuleReference> {
+        let mut module = 0isize;
+        let ok = unsafe {
+            ffi::GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                address as *const u16,
+                &mut module,
+            )
+        };
+        (ok != 0 && module != 0).then_some(ModuleReference(module))
+    }
+
+    fn into_raw(self) -> isize {
+        let raw = self.0;
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for ModuleReference {
+    fn drop(&mut self) {
+        unsafe { ffi::FreeLibrary(self.0) };
+    }
+}
+
+fn start_worker(
+    builder: std::thread::Builder,
+    anchor: *const c_void,
+    job: impl FnOnce() + Send + 'static,
+) -> Result<std::thread::JoinHandle<()>, Hresult> {
+    let module = ModuleReference::containing(anchor).ok_or(E_FAIL)?;
+    builder
+        .spawn(move || {
+            let module = module;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            let raw = module.into_raw();
+            unsafe { ffi::FreeLibraryAndExitThread(raw, 0) };
+        })
+        .map_err(|_| E_FAIL)
+}
 
 pub struct Pin;
 impl Pin {
@@ -290,11 +337,14 @@ unsafe extern "system" fn command_get_state(
     if state.is_null() {
         return E_POINTER;
     }
-    let shown = unsafe { single_item(items, SIGDN_FILESYSPATH) }
-        .and_then(|path| crate::outcome::drive_root_letter(&path))
-        .is_some_and(crate::eject::is_ejectable_scalefs_volume);
-    unsafe { *state = if shown { ECS_ENABLED } else { ECS_HIDDEN } };
-    S_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shown = unsafe { single_item(items, SIGDN_FILESYSPATH) }
+            .and_then(|path| crate::outcome::drive_root_letter(&path))
+            .is_some_and(crate::eject::is_ejectable_scalefs_volume);
+        unsafe { *state = if shown { ECS_ENABLED } else { ECS_HIDDEN } };
+        S_OK
+    }))
+    .unwrap_or(E_UNEXPECTED)
 }
 
 unsafe extern "system" fn command_invoke(
@@ -302,19 +352,24 @@ unsafe extern "system" fn command_invoke(
     items: *mut c_void,
     _bind: *mut c_void,
 ) -> Hresult {
-    let Some(path) = (unsafe { single_item(items, SIGDN_FILESYSPATH) }) else {
-        return E_FAIL;
-    };
-    let Some(letter) = crate::outcome::drive_root_letter(&path) else {
-        return E_FAIL;
-    };
-    let display = unsafe { single_item(items, SIGDN_NORMALDISPLAY) }.unwrap_or(path);
-    let pin = Pin::new();
-    std::thread::spawn(move || {
-        crate::eject::run(letter, &display);
-        drop(pin);
-    });
-    S_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(path) = (unsafe { single_item(items, SIGDN_FILESYSPATH) }) else {
+            return E_FAIL;
+        };
+        let Some(letter) = crate::outcome::drive_root_letter(&path) else {
+            return E_FAIL;
+        };
+        let display = unsafe { single_item(items, SIGDN_NORMALDISPLAY) }.unwrap_or(path);
+        match start_worker(
+            std::thread::Builder::new().name("scalefs-eject".to_string()),
+            DllCanUnloadNow as *const c_void,
+            move || crate::eject::run(letter, &display),
+        ) {
+            Ok(_detached) => S_OK,
+            Err(hr) => hr,
+        }
+    }))
+    .unwrap_or(E_UNEXPECTED)
 }
 
 unsafe extern "system" fn command_get_flags(_this: *mut c_void, out: *mut u32) -> Hresult {
@@ -386,3 +441,7 @@ pub extern "system" fn DllCanUnloadNow() -> Hresult {
         S_FALSE
     }
 }
+
+#[cfg(test)]
+#[path = "com_fault_tests.rs"]
+mod fault_tests;

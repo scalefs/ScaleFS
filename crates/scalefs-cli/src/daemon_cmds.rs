@@ -32,6 +32,8 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
             "unix-socket",
             "kernel-device",
             "mount",
+            "close-durability",
+            "close-bound-ms",
         ],
     )?;
     let endpoint = match opts.value("endpoint") {
@@ -324,6 +326,15 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
             if let Some(letter) = opts.value("mount") {
                 params.push(("mount", Value::Str(letter.to_string())));
             }
+            if let Some(policy) = opts.value("close-durability") {
+                params.push(("close_durability", Value::Str(policy.to_string())));
+            }
+            if let Some(ms) = opts.value("close-bound-ms") {
+                let ms: u64 = ms
+                    .parse()
+                    .map_err(|_| format!("--close-bound-ms takes milliseconds, not '{ms}'"))?;
+                params.push(("close_bound_ms", Value::Int(i128::from(ms))));
+            }
             let served = client
                 .call("pool.serve", object(params))
                 .map_err(|error| error.to_string())?;
@@ -335,6 +346,7 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
             };
             println!("serving '{pool}' at {}{mode}", text("endpoint"));
             println!("  token: {}", text("token"));
+            println!("  written closes: {}", close_policy(&served));
             if let Some(Value::Str(letter)) = served.get("mount") {
                 println!("  mounted at {letter}\\");
             }
@@ -385,9 +397,10 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
                     _ => String::new(),
                 };
                 println!(
-                    "pool '{}' at {}{mode}{mount}{volume}",
+                    "pool '{}' at {}{mode}{mount}{volume}; written closes: {}",
                     text("pool"),
-                    text("endpoint")
+                    text("endpoint"),
+                    close_policy(serve),
                 );
             }
             Ok(())
@@ -447,8 +460,9 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
                     "healthy".to_string()
                 } else {
                     format!(
-                        "{} bad ({} repaired, {} unrepairable, {} missing)",
+                        "{} bad ({} stale; {} repaired, {} unrepairable, {} missing)",
                         field("copies_bad"),
+                        field("copies_stale"),
                         field("copies_repaired"),
                         field("copies_unrepairable"),
                         field("copies_missing"),
@@ -781,6 +795,20 @@ fn password_from_reader(mut input: impl std::io::BufRead) -> Result<String, Stri
         return Err("--password-stdin: no password was read from stdin".to_string());
     }
     Ok(password.to_string())
+}
+
+fn close_policy(serve: &Value) -> String {
+    match serve.get("close_durability").and_then(Value::as_str) {
+        Some("bounded") => format!(
+            "bounded, committed within {} ms",
+            serve
+                .get("close_bound_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ),
+        Some(policy) => policy.to_string(),
+        None => "commit-on-close".to_string(),
+    }
 }
 
 #[cfg(test)]

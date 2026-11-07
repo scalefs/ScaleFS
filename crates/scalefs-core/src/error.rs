@@ -23,11 +23,17 @@ pub enum ScaleFsError {
         pool: UnicodeVersion,
         newest: UnicodeVersion,
     },
+    EarlierFormat {
+        version: u32,
+    },
     MissingMembers {
         missing: Vec<DeviceId>,
     },
     Io(std::io::Error),
 }
+
+pub(crate) const EARLIER_FORMAT_LEAD: &str =
+    "this pool was created by an earlier preview of ScaleFS";
 
 impl fmt::Display for ScaleFsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -54,6 +60,12 @@ impl fmt::Display for ScaleFsError {
                 f,
                 "this pool uses Unicode naming tables v{pool}; this ScaleFS \
                  carries up to v{newest} — upgrade ScaleFS to mount this pool"
+            ),
+            Self::EarlierFormat { version } => write!(
+                f,
+                "{EARLIER_FORMAT_LEAD} (on-disk format {version}; this build reads format {}): \
+                 create a new pool and move the files",
+                crate::format::FORMAT_VERSION
             ),
             Self::MissingMembers { missing } => {
                 write!(f, "pool members are missing:")?;

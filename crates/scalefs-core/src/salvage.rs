@@ -1,17 +1,18 @@
 use crate::device::{BlockDevice, ReadOnly};
 use crate::dirent::{dirent_hash, fold_name};
 use crate::error::{Result, ScaleFsError};
-use crate::format::{RecordKind, decode_record};
+use crate::format::{Expect, RecordKind, decode_record, is_stale};
 use crate::layout::{CaseSensitivity, DeviceId, Extent, Geometry, PoolId, superblock_slots};
 use crate::records::{
     Commit, FEATURE_INCOMPAT_MULTI_DEVICE, Superblock, decode_commit, decode_superblock,
 };
 use crate::topology::{MemberState, Topology, decode_topology};
 use crate::tree::{
-    DirEntry, ITEM_DIRENT, ITEM_INODE, InodeAttrs, MetadataKey, MetadataValue, ROOT_INODE,
+    DirEntry, ITEM_DIRENT, ITEM_INODE, InodeAttrs, MetadataKey, MetadataValue, PageRef, ROOT_INODE,
     decode_internal_record, decode_leaf_record,
 };
 use crate::unicode::UnicodeVersion;
+use std::collections::HashSet;
 
 #[derive(Debug, Default, Clone)]
 pub struct SalvageOptions {
@@ -95,6 +96,7 @@ pub enum ReadFailure {
     AbsentMember(u16),
     Io(u16, String),
     Corrupt(u16, &'static str),
+    Stale(u16),
 }
 
 impl std::fmt::Display for ReadFailure {
@@ -103,6 +105,10 @@ impl std::fmt::Display for ReadFailure {
             ReadFailure::AbsentMember(index) => write!(f, "member {index} absent"),
             ReadFailure::Io(index, error) => write!(f, "member {index} I/O: {error}"),
             ReadFailure::Corrupt(index, reason) => write!(f, "member {index}: {reason}"),
+            ReadFailure::Stale(index) => write!(
+                f,
+                "member {index}: a stale copy (it verifies, but is not the record its parent names)"
+            ),
         }
     }
 }
@@ -112,8 +118,8 @@ const MAX_RECORD_READ: u64 = 128 << 20;
 pub struct Salvage<D: BlockDevice> {
     devices: Vec<ReadOnly<crate::device::PartitionView<D>>>,
     member_map: Vec<Option<usize>>,
-    root: Vec<Extent>,
-    live_root: Vec<Extent>,
+    root: PageRef,
+    live_root: PageRef,
     dirent_seed: u64,
     case_sensitivity: CaseSensitivity,
     unicode_version: UnicodeVersion,
@@ -169,6 +175,7 @@ impl<D: BlockDevice> Salvage<D> {
         };
 
         let mut probes: Vec<Probe> = Vec::new();
+        let mut earlier_format: Option<ScaleFsError> = None;
         for device in &devices {
             let mut slots = [SlotHealth::Valid, SlotHealth::Valid];
             let mut decoded: Vec<(usize, Superblock)> = Vec::new();
@@ -181,7 +188,12 @@ impl<D: BlockDevice> Salvage<D> {
                             slots[which] = SlotHealth::Valid;
                             decoded.push((which, superblock));
                         }
-                        Err(error) => slots[which] = SlotHealth::Corrupt(corrupt_reason(&error)),
+                        Err(error) => {
+                            slots[which] = SlotHealth::Corrupt(corrupt_reason(&error));
+                            if let ScaleFsError::EarlierFormat { version } = error {
+                                earlier_format = Some(ScaleFsError::EarlierFormat { version });
+                            }
+                        }
                     },
                 }
             }
@@ -218,6 +230,9 @@ impl<D: BlockDevice> Salvage<D> {
             .iter()
             .find_map(|p| p.superblock.as_ref().map(|sb| sb.pool_id))
         else {
+            if let Some(earlier) = earlier_format {
+                return Err(earlier);
+            }
             return Err(ScaleFsError::Corrupt(
                 "no supplied device carries a decodable ScaleFS superblock",
             ));
@@ -268,8 +283,8 @@ impl<D: BlockDevice> Salvage<D> {
             return Ok(Salvage {
                 devices,
                 member_map: Vec::new(),
-                root: Vec::new(),
-                live_root: Vec::new(),
+                root: no_root(),
+                live_root: no_root(),
                 dirent_seed,
                 case_sensitivity,
                 unicode_version,
@@ -291,11 +306,15 @@ impl<D: BlockDevice> Salvage<D> {
                 let Ok(superblock) = decode_superblock(&block) else {
                     continue;
                 };
-                let Some(commit_extent) = superblock.newest_commit else {
+                let Some(commit_ref) = superblock.newest_commit else {
                     continue;
                 };
-                let Ok(bytes) = read_local_record(device, commit_extent, &[RecordKind::Commit])
-                else {
+                let Ok(bytes) = read_local_record(
+                    device,
+                    commit_ref.extent,
+                    &[RecordKind::Commit],
+                    Some(commit_ref.expect),
+                ) else {
                     continue;
                 };
                 let Ok(commit) = decode_commit(&bytes) else {
@@ -303,8 +322,13 @@ impl<D: BlockDevice> Salvage<D> {
                 };
                 let mut roster = None;
                 if let Some(aux) = commit.aux_root {
-                    match read_local_record(device, aux, &[RecordKind::Topology])
-                        .and_then(|bytes| decode_topology(&bytes))
+                    match read_local_record(
+                        device,
+                        aux.extent,
+                        &[RecordKind::Topology],
+                        Some(aux.expect),
+                    )
+                    .and_then(|bytes| decode_topology(&bytes))
                     {
                         Ok(topology) => {
                             if topology.tx_id != commit.tx_id {
@@ -395,7 +419,7 @@ impl<D: BlockDevice> Salvage<D> {
 
         let wanted = |tx: u64| options.view_tx.is_none_or(|want| want == tx);
 
-        type Adopted = (Rung, u64, Vec<Option<usize>>, Vec<Extent>);
+        type Adopted = (Rung, u64, Vec<Option<usize>>, PageRef);
         let mut adopted: Option<Adopted> = None;
 
         if multi {
@@ -437,20 +461,25 @@ impl<D: BlockDevice> Salvage<D> {
                         }
                         Some(slot) => {
                             map.push(Some(slot));
-                            let commit_ok = read_local_record(
+                            let commit = read_local_record(
                                 &devices[slot],
                                 member.newest_commit,
                                 &[RecordKind::Commit],
+                                None,
                             )
                             .and_then(|bytes| decode_commit(&bytes))
-                            .map(|commit| commit.tx_id == member.newest_tx)
-                            .unwrap_or(false);
-                            let summary_ok = read_local_record(
-                                &devices[slot],
-                                member.newest_summary,
-                                &[RecordKind::ZoneSummary],
-                            )
-                            .is_ok();
+                            .ok()
+                            .filter(|commit| commit.tx_id == member.newest_tx);
+                            let summary_ok = commit.is_some_and(|commit| {
+                                read_local_record(
+                                    &devices[slot],
+                                    member.newest_summary,
+                                    &[RecordKind::ZoneSummary],
+                                    Some(commit.allocator_summary.expect),
+                                )
+                                .is_ok()
+                            });
+                            let commit_ok = commit.is_some();
                             if !commit_ok || !summary_ok {
                                 chain_failures += 1;
                             }
@@ -462,11 +491,8 @@ impl<D: BlockDevice> Salvage<D> {
                         &devices,
                         &map,
                         *extent,
-                        &[
-                            RecordKind::MetadataLeaf,
-                            RecordKind::MetadataInternal,
-                            RecordKind::MetadataInternalMirrored,
-                        ],
+                        PAGE_KINDS,
+                        Some(roster.metadata_root_expect),
                     )
                     .is_ok()
                 });
@@ -508,7 +534,15 @@ impl<D: BlockDevice> Salvage<D> {
                         });
                     }
                 }
-                adopted = Some((rung, head.tx, map, roster.metadata_root_replicas.clone()));
+                adopted = Some((
+                    rung,
+                    head.tx,
+                    map,
+                    PageRef {
+                        copies: roster.metadata_root_replicas.clone(),
+                        expect: roster.metadata_root_expect,
+                    },
+                ));
             }
 
             if adopted.is_none()
@@ -531,12 +565,9 @@ impl<D: BlockDevice> Salvage<D> {
                     let root_ok = read_mapped_record(
                         &devices,
                         &map,
-                        head.commit.metadata_root,
-                        &[
-                            RecordKind::MetadataLeaf,
-                            RecordKind::MetadataInternal,
-                            RecordKind::MetadataInternalMirrored,
-                        ],
+                        head.commit.metadata_root.extent,
+                        PAGE_KINDS,
+                        Some(head.commit.metadata_root.expect),
                     )
                     .is_ok();
                     report.candidates.push(ViewCandidate {
@@ -557,7 +588,7 @@ impl<D: BlockDevice> Salvage<D> {
                             Rung::CommitRoot,
                             head.tx,
                             map.clone(),
-                            vec![head.commit.metadata_root],
+                            commit_root(&head.commit),
                         ));
                     }
                 }
@@ -593,18 +624,16 @@ impl<D: BlockDevice> Salvage<D> {
                 let root_ok = read_mapped_record(
                     &devices,
                     &map,
-                    head.commit.metadata_root,
-                    &[
-                        RecordKind::MetadataLeaf,
-                        RecordKind::MetadataInternal,
-                        RecordKind::MetadataInternalMirrored,
-                    ],
+                    head.commit.metadata_root.extent,
+                    PAGE_KINDS,
+                    Some(head.commit.metadata_root.expect),
                 )
                 .is_ok();
                 let summary_ok = read_local_record(
                     &devices[head.device_slot],
-                    head.commit.allocator_summary,
+                    head.commit.allocator_summary.extent,
                     &[RecordKind::ZoneSummary],
+                    Some(head.commit.allocator_summary.expect),
                 )
                 .is_ok();
                 report.candidates.push(ViewCandidate {
@@ -620,7 +649,7 @@ impl<D: BlockDevice> Salvage<D> {
                     } else {
                         Rung::PartialRoster
                     };
-                    adopted = Some((rung, head.tx, map, vec![head.commit.metadata_root]));
+                    adopted = Some((rung, head.tx, map, commit_root(&head.commit)));
                 }
             }
         }
@@ -643,7 +672,7 @@ impl<D: BlockDevice> Salvage<D> {
                         .notes
                         .push("no candidate view could be adopted".to_string());
                 }
-                (Vec::new(), Vec::new())
+                (Vec::new(), no_root())
             }
         };
 
@@ -664,21 +693,22 @@ impl<D: BlockDevice> Salvage<D> {
     }
 
     pub fn has_view(&self) -> bool {
-        !self.root.is_empty()
+        !self.root.copies.is_empty()
     }
 
     pub fn root_extents(&self) -> &[Extent] {
-        &self.root
+        &self.root.copies
     }
 
     pub(crate) fn read_record_any(
         &self,
         extents: &[Extent],
         kinds: &[RecordKind],
+        expect: Option<Expect>,
     ) -> std::result::Result<(usize, Vec<u8>), Vec<ReadFailure>> {
         let mut failures = Vec::new();
         for (index, extent) in extents.iter().enumerate() {
-            match read_one_mapped(&self.devices, &self.member_map, *extent, kinds) {
+            match read_one_mapped(&self.devices, &self.member_map, *extent, kinds, expect) {
                 Ok(bytes) => return Ok((index, bytes)),
                 Err(failure) => failures.push(failure),
             }
@@ -690,24 +720,19 @@ impl<D: BlockDevice> Salvage<D> {
         &self,
         extent: Extent,
         kinds: &[RecordKind],
+        expect: Option<Expect>,
     ) -> std::result::Result<Vec<u8>, ReadFailure> {
-        read_one_mapped(&self.devices, &self.member_map, extent, kinds)
+        read_one_mapped(&self.devices, &self.member_map, extent, kinds, expect)
     }
 
     fn load_node(
         &self,
-        extents: &[Extent],
+        page: &PageRef,
         first_key: MetadataKey,
         last_key: MetadataKey,
     ) -> std::result::Result<Node, Damage> {
-        match self.read_record_any(
-            extents,
-            &[
-                RecordKind::MetadataLeaf,
-                RecordKind::MetadataInternal,
-                RecordKind::MetadataInternalMirrored,
-            ],
-        ) {
+        let extents = page.copies.as_slice();
+        match self.read_record_any(extents, PAGE_KINDS, Some(page.expect)) {
             Err(reasons) => Err(Damage {
                 extents: extents.to_vec(),
                 reasons,
@@ -749,6 +774,7 @@ impl<D: BlockDevice> Salvage<D> {
             None,
             visit,
             0,
+            &mut HashSet::new(),
         );
         Ok(())
     }
@@ -771,24 +797,28 @@ impl<D: BlockDevice> Salvage<D> {
             Some((start, end)),
             visit,
             0,
+            &mut HashSet::new(),
         );
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_node(
         &self,
-        extents: &[Extent],
+        page: &PageRef,
         first_key: MetadataKey,
         last_key: MetadataKey,
         window: Option<(MetadataKey, MetadataKey)>,
         visit: &mut dyn FnMut(WalkEvent<'_>),
         depth: u32,
+        seen: &mut HashSet<(u16, u64)>,
     ) {
         if let Some((start, end)) = window
             && (last_key < start || first_key > end)
         {
             return;
         }
+        let extents = page.copies.as_slice();
         if depth > MAX_TREE_DEPTH {
             visit(WalkEvent::Lost(&Damage {
                 extents: extents.to_vec(),
@@ -801,7 +831,21 @@ impl<D: BlockDevice> Salvage<D> {
             }));
             return;
         }
-        match self.load_node(extents, first_key, last_key) {
+        if let Some(first) = extents.first()
+            && !seen.insert((first.device_index, first.offset))
+        {
+            visit(WalkEvent::Lost(&Damage {
+                extents: extents.to_vec(),
+                reasons: vec![ReadFailure::Corrupt(
+                    first.device_index,
+                    "tree page reachable twice",
+                )],
+                first_key,
+                last_key,
+            }));
+            return;
+        }
+        match self.load_node(page, first_key, last_key) {
             Err(damage) => visit(WalkEvent::Lost(&damage)),
             Ok(Node::Leaf(items)) => {
                 for (key, value) in &items {
@@ -819,7 +863,15 @@ impl<D: BlockDevice> Salvage<D> {
                         .get(index + 1)
                         .map(|(next, _)| previous_key(*next))
                         .unwrap_or(last_key);
-                    self.walk_node(child, *separator, child_last, window, visit, depth + 1);
+                    self.walk_node(
+                        child,
+                        *separator,
+                        child_last,
+                        window,
+                        visit,
+                        depth + 1,
+                        seen,
+                    );
                 }
             }
         }
@@ -981,38 +1033,47 @@ impl<D: BlockDevice> Salvage<D> {
         let mut runs: Vec<(u64, u64, RunSource)> = Vec::new();
         let mut map_damage: Vec<Damage> = Vec::new();
         self.walk_range(start, end, &mut |event| match event {
-            WalkEvent::Item(
-                key,
-                MetadataValue::FileExtent {
-                    extents,
-                    data_offset,
-                    logical_len,
-                },
-            ) => runs.push((
-                key.offset,
-                *logical_len,
-                RunSource::Mirrored {
-                    extents: extents.clone(),
-                    data_offset: *data_offset,
-                },
-            )),
-            WalkEvent::Item(
-                key,
-                MetadataValue::StripedExtent {
-                    extent,
-                    parity_extents,
-                    data_offset,
-                    logical_len,
-                },
-            ) => runs.push((
-                key.offset,
-                *logical_len,
-                RunSource::Striped {
-                    extent: *extent,
-                    parity_extents: parity_extents.clone(),
-                    data_offset: *data_offset,
-                },
-            )),
+            WalkEvent::Item(key, MetadataValue::FileRun(run)) => {
+                for (logical, len, k, at) in record_ranges(
+                    key.offset,
+                    run.count(),
+                    run.full_payload(),
+                    |k| run.record_len(k) - crate::format::RECORD_HEADER_LEN as u64,
+                    run.data_offset,
+                    run.logical_len,
+                ) {
+                    runs.push((
+                        logical,
+                        len,
+                        RunSource::Mirrored {
+                            extents: run.record_copies(k),
+                            expect: run.expect(k),
+                            data_offset: at,
+                        },
+                    ));
+                }
+            }
+            WalkEvent::Item(key, MetadataValue::StripedRun(run)) => {
+                for (logical, len, k, at) in record_ranges(
+                    key.offset,
+                    run.count(),
+                    run.full_payload(),
+                    |k| run.pieces[k].length - crate::format::RECORD_HEADER_LEN as u64,
+                    run.data_offset,
+                    run.logical_len,
+                ) {
+                    runs.push((
+                        logical,
+                        len,
+                        RunSource::Striped {
+                            extent: run.pieces[k],
+                            expect: run.expect(k),
+                            run: run.clone(),
+                            data_offset: at,
+                        },
+                    ));
+                }
+            }
             WalkEvent::Item(..) => {}
             WalkEvent::Lost(damage) => {
                 let lo = if damage.first_key < start {
@@ -1026,7 +1087,7 @@ impl<D: BlockDevice> Salvage<D> {
                     damage
                         .last_key
                         .offset
-                        .saturating_add(crate::fs::FILE_DATA_CHUNK as u64)
+                        .saturating_add(crate::runs::MAX_RUN_SPAN)
                         .min(size)
                 };
                 if lo < hi {
@@ -1102,8 +1163,9 @@ impl<D: BlockDevice> Salvage<D> {
                 }
                 RunSource::Mirrored {
                     extents,
+                    expect,
                     data_offset,
-                } => match self.read_record_any(extents, &[RecordKind::FileData]) {
+                } => match self.read_record_any(extents, &[RecordKind::FileData], Some(*expect)) {
                     Ok((copy, bytes)) => {
                         write_payload(sink, &bytes, data_offset + skip, len)?;
                         if copy == 0 {
@@ -1120,14 +1182,15 @@ impl<D: BlockDevice> Salvage<D> {
                 },
                 RunSource::Striped {
                     extent,
-                    parity_extents,
+                    expect,
+                    run,
                     data_offset,
-                } => match self.read_record_copy(*extent, &[RecordKind::FileData]) {
+                } => match self.read_record_copy(*extent, &[RecordKind::FileData], Some(*expect)) {
                     Ok(bytes) => {
                         write_payload(sink, &bytes, data_offset + skip, len)?;
                         ExtentVerdict::Intact
                     }
-                    Err(first) => match self.reconstruct_piece(*extent, parity_extents, first) {
+                    Err(first) => match self.reconstruct_piece(*extent, *expect, run, first) {
                         Ok(bytes) => {
                             write_payload(sink, &bytes, data_offset + skip, len)?;
                             ExtentVerdict::ReconstructedFromParity
@@ -1167,7 +1230,7 @@ impl<D: BlockDevice> Salvage<D> {
                 _,
                 MetadataValue::RetainedRoot {
                     tx_id,
-                    metadata_roots,
+                    root,
                     created_at_ns,
                     name,
                 },
@@ -1175,7 +1238,7 @@ impl<D: BlockDevice> Salvage<D> {
                 tx_id: *tx_id,
                 name: name.clone(),
                 created_at_ns: *created_at_ns,
-                roots: metadata_roots.clone(),
+                root: root.clone(),
             }),
             WalkEvent::Item(..) => {}
             WalkEvent::Lost(lost) => damage.push(lost.clone()),
@@ -1184,40 +1247,25 @@ impl<D: BlockDevice> Salvage<D> {
     }
 
     pub fn enter_snapshot(&mut self, snapshot: &SnapshotCandidate) -> Result<()> {
-        read_mapped_record(
-            &self.devices,
-            &self.member_map,
-            *snapshot
-                .roots
-                .first()
-                .ok_or(ScaleFsError::Corrupt("snapshot has no root replicas"))?,
-            &[
-                RecordKind::MetadataLeaf,
-                RecordKind::MetadataInternal,
-                RecordKind::MetadataInternalMirrored,
-            ],
-        )
-        .or_else(|_| {
-            snapshot
-                .roots
-                .iter()
-                .skip(1)
-                .find_map(|extent| {
-                    read_mapped_record(
-                        &self.devices,
-                        &self.member_map,
-                        *extent,
-                        &[
-                            RecordKind::MetadataLeaf,
-                            RecordKind::MetadataInternal,
-                            RecordKind::MetadataInternalMirrored,
-                        ],
-                    )
-                    .ok()
-                })
-                .ok_or(ScaleFsError::Corrupt("no snapshot root replica decodes"))
-        })?;
-        self.root = snapshot.roots.clone();
+        if snapshot.root.copies.is_empty() {
+            return Err(ScaleFsError::Corrupt("snapshot has no root replicas"));
+        }
+        snapshot
+            .root
+            .copies
+            .iter()
+            .find_map(|extent| {
+                read_mapped_record(
+                    &self.devices,
+                    &self.member_map,
+                    *extent,
+                    PAGE_KINDS,
+                    Some(snapshot.root.expect),
+                )
+                .ok()
+            })
+            .ok_or(ScaleFsError::Corrupt("no snapshot root replica decodes"))?;
+        self.root = snapshot.root.clone();
         Ok(())
     }
 
@@ -1243,12 +1291,17 @@ impl<D: BlockDevice> Salvage<D> {
     fn reconstruct_piece(
         &self,
         target: Extent,
-        parity_extents: &[Extent],
+        expect: Expect,
+        run: &crate::runs::StripedRun,
         first_failure: ReadFailure,
     ) -> std::result::Result<Vec<u8>, Vec<ReadFailure>> {
         let mut reasons = vec![first_failure];
-        for parity_extent in parity_extents {
-            let descriptor = match self.read_record_copy(*parity_extent, &[RecordKind::Parity]) {
+        for (row, parity_extent) in run.parity.iter().enumerate() {
+            let descriptor = match self.read_record_copy(
+                *parity_extent,
+                &[RecordKind::Parity],
+                Some(run.parity_expect(row)),
+            ) {
                 Ok(bytes) => match crate::stripes::decode_parity_record(&bytes) {
                     Ok(descriptor) => descriptor,
                     Err(error) => {
@@ -1290,8 +1343,14 @@ impl<D: BlockDevice> Salvage<D> {
                 if index == column {
                     continue;
                 }
-                match self.read_record_copy(*piece, &[RecordKind::FileData]) {
-                    Ok(bytes) => available.push((index, bytes)),
+                match self.read_record_copy(*piece, &[RecordKind::FileData], None) {
+                    Ok(bytes) if Expect::of(&bytes).crc == descriptor.data_crcs[index] => {
+                        available.push((index, bytes))
+                    }
+                    Ok(_) => {
+                        reasons.push(ReadFailure::Stale(piece.device_index));
+                        erased.push(index);
+                    }
                     Err(failure) => {
                         reasons.push(failure);
                         erased.push(index);
@@ -1299,7 +1358,11 @@ impl<D: BlockDevice> Salvage<D> {
                 }
             }
             for (row, piece) in descriptor.parity_pieces.iter().enumerate() {
-                match self.read_record_copy(*piece, &[RecordKind::Parity]) {
+                match self.read_record_copy(
+                    *piece,
+                    &[RecordKind::Parity],
+                    Some(run.parity_expect(row)),
+                ) {
                     Ok(bytes) => {
                         if let Ok(parity) = crate::stripes::decode_parity_record(&bytes)
                             && usize::from(parity.parity_index) == row
@@ -1325,7 +1388,7 @@ impl<D: BlockDevice> Salvage<D> {
             };
             let mut bytes = rebuilt.swap_remove(0);
             bytes.truncate(target.length as usize);
-            if decode_record(&bytes).is_err() {
+            if expect.verify(&bytes).is_err() {
                 reasons.push(ReadFailure::Corrupt(
                     parity_extent.device_index,
                     "stripe reconstruction failed checksum verification",
@@ -1341,14 +1404,43 @@ impl<D: BlockDevice> Salvage<D> {
 enum RunSource {
     Mirrored {
         extents: Vec<Extent>,
+        expect: Expect,
         data_offset: u64,
     },
     Striped {
         extent: Extent,
-        parity_extents: Vec<Extent>,
+        expect: Expect,
+        run: crate::runs::StripedRun,
         data_offset: u64,
     },
     MapLost,
+}
+
+fn record_ranges(
+    item_start: u64,
+    count: usize,
+    full: u64,
+    payload_of: impl Fn(usize) -> u64,
+    data_offset: u64,
+    logical_len: u64,
+) -> Vec<(u64, u64, usize, u64)> {
+    let window_end = data_offset + logical_len;
+    let mut out = Vec::new();
+    for k in 0..count {
+        let record_start = k as u64 * full;
+        let record_end = record_start + payload_of(k);
+        let from = record_start.max(data_offset);
+        let to = record_end.min(window_end);
+        if from < to {
+            out.push((
+                item_start + (from - data_offset),
+                to - from,
+                k,
+                from - record_start,
+            ));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1445,7 +1537,7 @@ const MAX_TREE_DEPTH: u32 = 64;
 
 enum Node {
     Leaf(Vec<(MetadataKey, MetadataValue)>),
-    Internal(Vec<(MetadataKey, Vec<Extent>)>),
+    Internal(Vec<(MetadataKey, PageRef)>),
 }
 
 #[derive(Debug, Clone)]
@@ -1486,7 +1578,7 @@ pub struct SnapshotCandidate {
     pub tx_id: u64,
     pub name: String,
     pub created_at_ns: i64,
-    pub roots: Vec<Extent>,
+    pub root: PageRef,
 }
 
 #[derive(Debug)]
@@ -1496,6 +1588,22 @@ pub struct Survey {
     pub directories: u64,
     pub damage: Vec<Damage>,
     pub disconnected: Vec<u64>,
+}
+
+const PAGE_KINDS: &[RecordKind] = &[RecordKind::MetadataLeaf, RecordKind::MetadataInternal];
+
+fn no_root() -> PageRef {
+    PageRef {
+        copies: Vec::new(),
+        expect: Expect { crc: 0, tx: 0 },
+    }
+}
+
+fn commit_root(commit: &Commit) -> PageRef {
+    PageRef {
+        copies: vec![commit.metadata_root.extent],
+        expect: commit.metadata_root.expect,
+    }
 }
 
 fn previous_key(key: MetadataKey) -> MetadataKey {
@@ -1530,13 +1638,17 @@ fn read_local_record<D: BlockDevice>(
     device: &ReadOnly<D>,
     extent: Extent,
     kinds: &[RecordKind],
+    expect: Option<Expect>,
 ) -> Result<Vec<u8>> {
     if extent.length == 0 || extent.length > MAX_RECORD_READ {
         return Err(ScaleFsError::Corrupt("implausible record extent"));
     }
     let mut bytes = vec![0u8; extent.length as usize];
     device.read_at(extent.offset, &mut bytes)?;
-    let record = decode_record(&bytes)?;
+    let record = match expect {
+        Some(expect) => expect.verify(&bytes)?,
+        None => decode_record(&bytes)?,
+    };
     if !kinds.contains(&record.kind) {
         return Err(ScaleFsError::Corrupt("unexpected record kind"));
     }
@@ -1548,6 +1660,7 @@ fn read_one_mapped<D: BlockDevice>(
     member_map: &[Option<usize>],
     extent: Extent,
     kinds: &[RecordKind],
+    expect: Option<Expect>,
 ) -> std::result::Result<Vec<u8>, ReadFailure> {
     let index = extent.device_index;
     let Some(&Some(slot)) = member_map.get(index as usize) else {
@@ -1560,8 +1673,13 @@ fn read_one_mapped<D: BlockDevice>(
     if let Err(error) = devices[slot].read_at(extent.offset, &mut bytes) {
         return Err(ReadFailure::Io(index, error.to_string()));
     }
-    let record = match decode_record(&bytes) {
+    let verdict = match expect {
+        Some(expect) => expect.verify(&bytes),
+        None => decode_record(&bytes),
+    };
+    let record = match verdict {
         Ok(record) => record,
+        Err(error) if is_stale(&error) => return Err(ReadFailure::Stale(index)),
         Err(error) => return Err(ReadFailure::Corrupt(index, corrupt_reason(&error))),
     };
     if !kinds.contains(&record.kind) {
@@ -1575,8 +1693,9 @@ fn read_mapped_record<D: BlockDevice>(
     member_map: &[Option<usize>],
     extent: Extent,
     kinds: &[RecordKind],
+    expect: Option<Expect>,
 ) -> Result<Vec<u8>> {
-    read_one_mapped(devices, member_map, extent, kinds)
+    read_one_mapped(devices, member_map, extent, kinds, expect)
         .map_err(|_| ScaleFsError::Corrupt("no readable copy"))
 }
 
@@ -1676,13 +1795,13 @@ mod tests {
         view.read_at(superblock_slots(view.len())[0], &mut block)
             .unwrap();
         let superblock = decode_superblock(&block).unwrap();
-        let commit_extent = superblock.newest_commit.unwrap();
+        let commit_extent = superblock.newest_commit.unwrap().extent;
         let mut bytes = vec![0u8; commit_extent.length as usize];
         view.read_at(commit_extent.offset, &mut bytes).unwrap();
         let commit = decode_commit(&bytes).unwrap();
         let roster = commit.aux_root.map(|aux| {
-            let mut bytes = vec![0u8; aux.length as usize];
-            view.read_at(aux.offset, &mut bytes).unwrap();
+            let mut bytes = vec![0u8; aux.extent.length as usize];
+            view.read_at(aux.extent.offset, &mut bytes).unwrap();
             decode_topology(&bytes).unwrap()
         });
         (superblock, commit, roster)
@@ -1829,7 +1948,7 @@ mod tests {
                 let Ok(superblock) = decode_superblock(&slot_bytes(device, which)) else {
                     continue;
                 };
-                let Some(commit_extent) = superblock.newest_commit else {
+                let Some(commit_extent) = superblock.newest_commit.map(|r| r.extent) else {
                     continue;
                 };
                 let mut bytes = vec![0u8; commit_extent.length as usize];
@@ -1842,7 +1961,9 @@ mod tests {
                 if commit.tx_id == newest_tx {
                     continue;
                 }
-                let Some(aux) = commit.aux_root else { continue };
+                let Some(aux) = commit.aux_root.map(|r| r.extent) else {
+                    continue;
+                };
                 if corrupted.contains(&(slot, aux.offset)) {
                     continue;
                 }
@@ -1959,7 +2080,7 @@ mod tests {
         let (devices, _) = mirror_pool(3, 2);
         let (mut superblock, _, _) = chain_of(&devices[0]);
         superblock.feature_incompat |= 1 << 7;
-        let encoded = encode_superblock(&superblock).unwrap();
+        let encoded = encode_superblock(&superblock, 1).unwrap();
         {
             let view = surgery(&devices[0]);
             for which in 0..2 {
@@ -1974,6 +2095,28 @@ mod tests {
         assert!(!session.has_view());
         assert!(report.notes.iter().any(|n| n.contains("identity only")));
         assert!(report.devices.iter().all(|d| d.newest_tx.is_none()));
+    }
+
+    #[test]
+    fn earlier_format_pools_are_refused_with_the_recreate_message() {
+        let (devices, _) = mirror_pool(3, 2);
+        let v1 = crate::format::tests::hex_bytes(crate::format::tests::VERSION_ONE_SUPERBLOCK);
+        for device in &devices {
+            let view = surgery(device);
+            for offset in superblock_slots(view.len()) {
+                view.write_at(offset, &v1).unwrap();
+            }
+        }
+        let err = Salvage::assemble(devices).err().expect("refused");
+        assert!(
+            matches!(err, ScaleFsError::EarlierFormat { version: 1 }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("create a new pool and move the files"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2102,13 +2245,13 @@ mod tests {
     }
 
     fn leaf_holding(session: &Salvage<Arc<MemoryBlockDevice>>, key: MetadataKey) -> Vec<Extent> {
-        let mut extents = session.root_extents().to_vec();
+        let mut extents = session.root.clone();
         loop {
             match session
                 .load_node(&extents, MetadataKey::MIN, MetadataKey::MAX)
                 .expect("healthy fixture")
             {
-                Node::Leaf(_) => return extents,
+                Node::Leaf(_) => return extents.copies,
                 Node::Internal(children) => {
                     let mut chosen = children[0].1.clone();
                     for (separator, child) in &children {
@@ -2226,14 +2369,33 @@ mod tests {
             item_type: crate::tree::ITEM_FILE_EXTENT,
             offset: u64::MAX,
         };
+        let header = crate::format::RECORD_HEADER_LEN as u64;
         let mut runs = Vec::new();
         session
             .walk_range(start, end, &mut |event| match event {
-                WalkEvent::Item(key, MetadataValue::FileExtent { extents, .. }) => {
-                    runs.push((key.offset, extents.clone()));
+                WalkEvent::Item(key, MetadataValue::FileRun(run)) => {
+                    for (logical, _, k, _) in record_ranges(
+                        key.offset,
+                        run.count(),
+                        run.full_payload(),
+                        |k| run.record_len(k) - header,
+                        run.data_offset,
+                        run.logical_len,
+                    ) {
+                        runs.push((logical, run.record_copies(k)));
+                    }
                 }
-                WalkEvent::Item(key, MetadataValue::StripedExtent { extent, .. }) => {
-                    runs.push((key.offset, vec![*extent]));
+                WalkEvent::Item(key, MetadataValue::StripedRun(run)) => {
+                    for (logical, _, k, _) in record_ranges(
+                        key.offset,
+                        run.count(),
+                        run.full_payload(),
+                        |k| run.pieces[k].length - header,
+                        run.data_offset,
+                        run.logical_len,
+                    ) {
+                        runs.push((logical, vec![run.pieces[k]]));
+                    }
                 }
                 _ => {}
             })
@@ -2398,22 +2560,21 @@ mod tests {
         let start = MetadataKey {
             object_id: object,
             item_type: crate::tree::ITEM_FILE_EXTENT,
-            offset: logical,
+            offset: 0,
+        };
+        let end = MetadataKey {
+            offset: u64::MAX,
+            ..start
         };
         let mut stripe: Vec<Extent> = Vec::new();
         healthy
-            .walk_range(start, start, &mut |event| {
-                if let WalkEvent::Item(
-                    _,
-                    MetadataValue::StripedExtent {
-                        extent,
-                        parity_extents,
-                        ..
-                    },
-                ) = event
+            .walk_range(start, end, &mut |event| {
+                if let WalkEvent::Item(key, MetadataValue::StripedRun(run)) = event
+                    && key.offset <= logical
+                    && logical < key.offset + run.logical_len
                 {
-                    stripe.push(*extent);
-                    stripe.extend_from_slice(parity_extents);
+                    stripe.extend_from_slice(&run.pieces);
+                    stripe.extend_from_slice(&run.parity);
                 }
             })
             .unwrap();

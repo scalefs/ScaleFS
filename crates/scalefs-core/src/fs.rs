@@ -1,24 +1,26 @@
 use crate::device::BlockDevice;
 use crate::dirent;
 use crate::error::{Result, ScaleFsError};
+use crate::format::Expect;
 use crate::layout::{CaseSensitivity, Extent};
 use crate::pool::Pool;
 use crate::records::{
     FEATURE_RO_COMPAT_HARDLINKS, FEATURE_RO_COMPAT_SPECIAL_FILES, FEATURE_RO_COMPAT_XATTRS,
-    decode_file_data, encode_file_data,
+    encode_file_data,
 };
 use crate::rs::ParityEncoder;
+use crate::runs::{FileRun, MAX_RUN_RECORDS, MAX_RUN_SPAN, StripedRun};
 use crate::stripes::{ParityRecord, encode_parity_record, parity_record_len};
 use crate::tree::{
     DirEntry, EntryKind, FILE_ATTR_ARCHIVE, ITEM_FILE_EXTENT, ITEM_INODE, ITEM_POOL_STATE,
     ITEM_SPECIAL, ITEM_XATTR, InodeAttrs, MAX_VALUE_LEN, MODE_BLOCK_DEVICE, MODE_CHAR_DEVICE,
     MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET, MODE_SYMLINK, MODE_TYPE_MASK, MetadataKey,
-    MetadataTree, MetadataValue, XATTR_VALUE_MAX, XattrEntry,
+    MetadataValue, TreeRef, XATTR_VALUE_MAX, XattrEntry,
 };
 use crate::unicode::UnicodeVersion;
 use crate::zones::{AllocPurpose, ZoneClass};
 
-pub const FILE_DATA_CHUNK: usize = 32768;
+pub const FILE_DATA_CHUNK: usize = 32 * 1024 - crate::format::RECORD_HEADER_LEN;
 
 fn inode_key(object_id: u64) -> MetadataKey {
     MetadataKey {
@@ -61,31 +63,23 @@ pub const XATTR_SET_CREATE: u32 = 1;
 pub const XATTR_SET_REPLACE: u32 = 2;
 
 #[derive(Debug, Clone)]
-pub(crate) enum RunSource {
-    Mirrored(Vec<Extent>),
-    Striped {
-        extent: Extent,
-        parity_extents: Vec<Extent>,
-    },
+pub(crate) enum LiveRun {
+    Mirrored(FileRun),
+    Striped(StripedRun),
 }
 
-impl RunSource {
-    fn value(&self, data_offset: u64, logical_len: u64) -> MetadataValue {
+impl LiveRun {
+    fn logical_len(&self) -> u64 {
         match self {
-            RunSource::Mirrored(extents) => MetadataValue::FileExtent {
-                extents: extents.clone(),
-                data_offset,
-                logical_len,
-            },
-            RunSource::Striped {
-                extent,
-                parity_extents,
-            } => MetadataValue::StripedExtent {
-                extent: *extent,
-                parity_extents: parity_extents.clone(),
-                data_offset,
-                logical_len,
-            },
+            LiveRun::Mirrored(run) => run.logical_len,
+            LiveRun::Striped(run) => run.logical_len,
+        }
+    }
+
+    fn slice(&self, skip: u64, len: u64) -> MetadataValue {
+        match self {
+            LiveRun::Mirrored(run) => MetadataValue::FileRun(run.slice(skip, len)),
+            LiveRun::Striped(run) => MetadataValue::StripedRun(run.slice(skip, len)),
         }
     }
 }
@@ -93,84 +87,76 @@ impl RunSource {
 #[derive(Debug, Clone)]
 pub(crate) struct LiveExtent {
     start: u64,
-    source: RunSource,
-    data_offset: u64,
-    logical_len: u64,
+    run: LiveRun,
 }
 
 impl LiveExtent {
     fn end(&self) -> u64 {
-        self.start + self.logical_len
+        self.start + self.run.logical_len()
+    }
+
+    fn of(key: MetadataKey, value: MetadataValue) -> Option<LiveExtent> {
+        let run = match value {
+            MetadataValue::FileRun(run) => LiveRun::Mirrored(run),
+            MetadataValue::StripedRun(run) => LiveRun::Striped(run),
+            _ => return None,
+        };
+        Some(LiveExtent {
+            start: key.offset,
+            run,
+        })
     }
 }
 
-pub(crate) fn getattr_in(tree: &MetadataTree, object_id: u64) -> Result<InodeAttrs> {
-    match tree.get(inode_key(object_id)) {
+#[derive(Debug, Clone)]
+pub(crate) struct EmittedStripe {
+    pub placed: usize,
+    pub pieces: Vec<Extent>,
+    pub crcs: Vec<u32>,
+    pub parity: Vec<Extent>,
+    pub parity_crcs: Vec<u32>,
+    pub parity_tx: u64,
+}
+
+pub(crate) fn getattr_in(tree: TreeRef<'_>, object_id: u64) -> Result<InodeAttrs> {
+    tree.get_with(inode_key(object_id), |value| match value {
         Some(MetadataValue::Inode(attrs)) => Ok(*attrs),
         Some(_) => Err(ScaleFsError::Corrupt("non-inode value at an inode key")),
         None => Err(ScaleFsError::NotFound),
-    }
+    })?
 }
 
 pub(crate) fn live_extents_overlapping(
-    tree: &MetadataTree,
+    tree: TreeRef<'_>,
     object_id: u64,
     start: u64,
     end: u64,
-) -> Vec<LiveExtent> {
+) -> Result<Vec<LiveExtent>> {
     if start >= end {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let window_from = start.saturating_sub(FILE_DATA_CHUNK as u64 - 1);
-    tree.range(
-        extent_key(object_id, window_from),
-        extent_key(object_id, end - 1),
-    )
-    .iter()
-    .filter_map(|(key, value)| {
-        let (source, data_offset, logical_len) = match value {
-            MetadataValue::FileExtent {
-                extents,
-                data_offset,
-                logical_len,
-            } => (
-                RunSource::Mirrored(extents.clone()),
-                *data_offset,
-                *logical_len,
-            ),
-            MetadataValue::StripedExtent {
-                extent,
-                parity_extents,
-                data_offset,
-                logical_len,
-            } => (
-                RunSource::Striped {
-                    extent: *extent,
-                    parity_extents: parity_extents.clone(),
-                },
-                *data_offset,
-                *logical_len,
-            ),
-            _ => return None,
-        };
-        debug_assert!(
-            logical_len <= FILE_DATA_CHUNK as u64,
-            "extent run longer than one data chunk breaks the bounded lookup"
-        );
-        let run = LiveExtent {
-            start: key.offset,
-            source,
-            data_offset,
-            logical_len,
-        };
-        (run.end() > start && run.start < end).then_some(run)
-    })
-    .collect()
+    let mut out = Vec::new();
+    let lookback = extent_key(object_id, start.saturating_sub(MAX_RUN_SPAN - 1));
+    if let Some((key, value)) = tree.last_in(lookback, extent_key(object_id, start))?
+        && let Some(live) = LiveExtent::of(key, value)
+        && live.end() > start
+    {
+        out.push(live);
+    }
+    if start + 1 < end {
+        for (key, value) in tree.range(
+            extent_key(object_id, start + 1),
+            extent_key(object_id, end - 1),
+        )? {
+            out.extend(LiveExtent::of(key, value));
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn read_in<D: BlockDevice>(
     pool: &Pool<D>,
-    tree: &MetadataTree,
+    tree: TreeRef<'_>,
     object_id: u64,
     offset: u64,
     len: usize,
@@ -191,29 +177,48 @@ pub(crate) fn read_in<D: BlockDevice>(
     let end = offset + read_len as u64;
     let mut out = vec![0u8; read_len];
 
-    for live in live_extents_overlapping(tree, object_id, offset, end) {
-        let overlap_start = live.start.max(offset);
-        let overlap_end = live.end().min(end);
-        if overlap_start >= overlap_end {
+    for live in live_extents_overlapping(tree, object_id, offset, end)? {
+        let from = live.start.max(offset);
+        let to = live.end().min(end);
+        if from >= to {
             continue;
         }
-        let record = match &live.source {
-            RunSource::Mirrored(extents) => pool.read_record(extents)?,
-            RunSource::Striped {
-                extent,
-                parity_extents,
-            } => pool.read_striped(*extent, parity_extents)?,
-        };
-        let payload = decode_file_data(&record)?;
-        let src_from = (live.data_offset + (overlap_start - live.start)) as usize;
-        let src_to = src_from + (overlap_end - overlap_start) as usize;
-        let payload = payload
-            .get(src_from..src_to)
-            .ok_or(ScaleFsError::Corrupt("file extent overruns its record"))?;
-        let dst_from = (overlap_start - offset) as usize;
-        out[dst_from..dst_from + payload.len()].copy_from_slice(payload);
+        let skip = from - live.start;
+        let dst = &mut out[(from - offset) as usize..(to - offset) as usize];
+        match &live.run {
+            LiveRun::Mirrored(run) => {
+                pool.read_run_window(run, run.window(skip, to - from), dst)?;
+            }
+            LiveRun::Striped(run) => {
+                pool.read_striped_window(run, run.window(skip, to - from), dst)?;
+            }
+        }
     }
     Ok(out)
+}
+
+struct RunBuilder {
+    start: u64,
+    zones: Vec<(u16, u64)>,
+    run: FileRun,
+}
+
+impl RunBuilder {
+    fn continues(&self, len: u64, placements: &[(u16, crate::zones::Allocation)]) -> bool {
+        let run = &self.run;
+        let count = run.count() as u64;
+        run.count() < MAX_RUN_RECORDS
+            && run.last_len == run.copies[0].length
+            && len <= run.copies[0].length
+            && placements.len() == run.copies.len()
+            && run.copies.iter().all(|copy| {
+                placements.iter().any(|(member, allocation)| {
+                    *member == copy.device_index
+                        && allocation.offset == copy.offset + count * run.stride
+                        && self.zones.contains(&(*member, allocation.zone_index))
+                })
+            })
+    }
 }
 
 impl<D: BlockDevice> Pool<D> {
@@ -226,11 +231,11 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn getattr(&self, object_id: u64) -> Result<InodeAttrs> {
-        getattr_in(&self.tree, object_id)
+        getattr_in(self.tree(), object_id)
     }
 
     fn put_attrs(&mut self, object_id: u64, attrs: InodeAttrs) -> Result<()> {
-        self.tree
+        self.tree_mut()
             .insert(inode_key(object_id), MetadataValue::Inode(attrs))
     }
 
@@ -278,11 +283,11 @@ impl<D: BlockDevice> Pool<D> {
             item_type: ITEM_POOL_STATE,
             offset: 0,
         };
-        let next = match self.tree.get(key) {
-            Some(MetadataValue::PoolState { next_object_id }) => *next_object_id,
+        let next = match self.tree().get(key)? {
+            Some(MetadataValue::PoolState { next_object_id }) => next_object_id,
             _ => return Err(ScaleFsError::Corrupt("pool state item is missing")),
         };
-        self.tree.insert(
+        self.tree_mut().insert(
             key,
             MetadataValue::PoolState {
                 next_object_id: next + 1,
@@ -301,18 +306,18 @@ impl<D: BlockDevice> Pool<D> {
     pub fn lookup(&self, parent: u64, name: &str) -> Result<DirEntry> {
         self.require_dir(parent)?;
         let (seed, version, case) = self.naming();
-        dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
+        dirent::lookup_entry(self.tree(), seed, version, case, parent, name)?
             .ok_or(ScaleFsError::NotFound)
     }
 
     pub fn readdir(&self, dir: u64) -> Result<Vec<DirEntry>> {
         self.require_dir(dir)?;
-        Ok(dirent::list_entries(&self.tree, dir))
+        dirent::list_entries(self.tree(), dir)
     }
 
     pub fn readdir_hashed(&self, dir: u64) -> Result<Vec<dirent::HashedEntry>> {
         self.require_dir(dir)?;
-        Ok(dirent::list_entries_hashed(&self.tree, dir))
+        dirent::list_entries_hashed(self.tree(), dir)
     }
 
     pub fn create_file(&mut self, parent: u64, name: &str, mode: u32, now_ns: i64) -> Result<u64> {
@@ -335,7 +340,7 @@ impl<D: BlockDevice> Pool<D> {
         self.require_dir(parent)?;
         dirent::validate_name(name)?;
         let (seed, version, case) = self.naming();
-        if dirent::lookup_entry(&self.tree, seed, version, case, parent, name).is_some() {
+        if dirent::lookup_entry(self.tree(), seed, version, case, parent, name)?.is_some() {
             return Err(ScaleFsError::AlreadyExists);
         }
 
@@ -371,7 +376,7 @@ impl<D: BlockDevice> Pool<D> {
             },
         )?;
         if let Err(error) = dirent::add_entry(
-            &mut self.tree,
+            self.tree_mut(),
             seed,
             version,
             case,
@@ -380,7 +385,7 @@ impl<D: BlockDevice> Pool<D> {
             object_id,
             kind,
         ) {
-            self.tree.remove(inode_key(object_id));
+            self.tree_mut().remove(inode_key(object_id))?;
             return Err(error);
         }
         self.touch_modified(parent, now_ns)?;
@@ -392,7 +397,7 @@ impl<D: BlockDevice> Pool<D> {
             return Err(ScaleFsError::InvalidArgument("symlink target length"));
         }
         let object_id = self.create_object(parent, name, 0o777, EntryKind::Symlink, now_ns)?;
-        self.tree.insert(
+        self.tree_mut().insert(
             special_key(object_id),
             MetadataValue::Special {
                 data: target.to_vec(),
@@ -429,7 +434,7 @@ impl<D: BlockDevice> Pool<D> {
         match kind {
             EntryKind::File => {}
             EntryKind::CharDevice | EntryKind::BlockDevice => {
-                self.tree.insert(
+                self.tree_mut().insert(
                     special_key(object_id),
                     MetadataValue::Special {
                         data: rdev.to_le_bytes().to_vec(),
@@ -446,8 +451,8 @@ impl<D: BlockDevice> Pool<D> {
         if !self.getattr(object_id)?.is_symlink() {
             return Err(ScaleFsError::InvalidArgument("not a symbolic link"));
         }
-        match self.tree.get(special_key(object_id)) {
-            Some(MetadataValue::Special { data }) => Ok(data.clone()),
+        match self.tree().get(special_key(object_id))? {
+            Some(MetadataValue::Special { data }) => Ok(data),
             _ => Err(ScaleFsError::Corrupt("symbolic link has no target")),
         }
     }
@@ -456,7 +461,7 @@ impl<D: BlockDevice> Pool<D> {
         if !self.getattr(object_id)?.is_device() {
             return Err(ScaleFsError::InvalidArgument("not a device node"));
         }
-        match self.tree.get(special_key(object_id)) {
+        match self.tree().get(special_key(object_id))? {
             Some(MetadataValue::Special { data }) if data.len() == 8 => {
                 Ok(u64::from_le_bytes(data.as_slice().try_into().unwrap()))
             }
@@ -507,8 +512,8 @@ impl<D: BlockDevice> Pool<D> {
             return Err(ScaleFsError::OutOfSpace);
         }
         let key = xattr_key(object, self.xattr_hash(name));
-        let mut entries = match self.tree.get(key) {
-            Some(MetadataValue::XattrEntries(entries)) => entries.clone(),
+        let mut entries = match self.tree().get(key)? {
+            Some(MetadataValue::XattrEntries(entries)) => entries,
             Some(_) => return Err(ScaleFsError::Corrupt("non-bucket value at an xattr key")),
             None => Vec::new(),
         };
@@ -533,7 +538,7 @@ impl<D: BlockDevice> Pool<D> {
             }
         }
         self.mark_xattrs_feature();
-        self.tree
+        self.tree_mut()
             .insert(key, MetadataValue::XattrEntries(entries))
             .map_err(|err| match err {
                 ScaleFsError::InvalidArgument(_) => ScaleFsError::OutOfSpace,
@@ -546,23 +551,25 @@ impl<D: BlockDevice> Pool<D> {
     pub fn get_xattr(&self, object: u64, name: &str) -> Result<Vec<u8>> {
         self.getattr(object)?;
         let key = xattr_key(object, self.xattr_hash(name));
-        if let Some(MetadataValue::XattrEntries(entries)) = self.tree.get(key)
-            && let Ok(at) = entries.binary_search_by(|entry| entry.name.as_str().cmp(name))
-        {
-            return Ok(entries[at].value.clone());
-        }
-        Err(ScaleFsError::NotFound)
+        self.tree().get_with(key, |value| {
+            if let Some(MetadataValue::XattrEntries(entries)) = value
+                && let Ok(at) = entries.binary_search_by(|entry| entry.name.as_str().cmp(name))
+            {
+                return Ok(entries[at].value.clone());
+            }
+            Err(ScaleFsError::NotFound)
+        })?
     }
 
     pub fn list_xattrs(&self, object: u64) -> Result<Vec<String>> {
         self.getattr(object)?;
         let mut names = Vec::new();
         for (_, value) in self
-            .tree
-            .range(xattr_key(object, 0), xattr_key(object, u64::MAX))
+            .tree()
+            .range(xattr_key(object, 0), xattr_key(object, u64::MAX))?
         {
             if let MetadataValue::XattrEntries(entries) = value {
-                names.extend(entries.iter().map(|entry| entry.name.clone()));
+                names.extend(entries.into_iter().map(|entry| entry.name));
             }
         }
         Ok(names)
@@ -572,18 +579,17 @@ impl<D: BlockDevice> Pool<D> {
         self.ensure_mutable()?;
         let mut attrs = self.getattr(object)?;
         let key = xattr_key(object, self.xattr_hash(name));
-        let Some(MetadataValue::XattrEntries(entries)) = self.tree.get(key) else {
+        let Some(MetadataValue::XattrEntries(mut entries)) = self.tree().get(key)? else {
             return Err(ScaleFsError::NotFound);
         };
-        let mut entries = entries.clone();
         let Ok(at) = entries.binary_search_by(|entry| entry.name.as_str().cmp(name)) else {
             return Err(ScaleFsError::NotFound);
         };
         entries.remove(at);
         if entries.is_empty() {
-            self.tree.remove(key);
+            self.tree_mut().remove(key)?;
         } else {
-            self.tree
+            self.tree_mut()
                 .insert(key, MetadataValue::XattrEntries(entries))?;
         }
         attrs.ctime_ns = now_ns;
@@ -608,7 +614,7 @@ impl<D: BlockDevice> Pool<D> {
         }
         let (seed, version, case) = self.naming();
         dirent::add_entry(
-            &mut self.tree,
+            self.tree_mut(),
             seed,
             version,
             case,
@@ -628,21 +634,21 @@ impl<D: BlockDevice> Pool<D> {
         self.ensure_mutable()?;
         self.require_dir(parent)?;
         let (seed, version, case) = self.naming();
-        let entry = dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
+        let entry = dirent::lookup_entry(self.tree(), seed, version, case, parent, name)?
             .ok_or(ScaleFsError::NotFound)?;
         if entry.kind == EntryKind::Directory {
             return Err(ScaleFsError::IsDirectory);
         }
 
         let attrs = self.getattr(entry.inode).ok();
-        dirent::remove_entry(&mut self.tree, seed, version, case, parent, name)?;
+        dirent::remove_entry(self.tree_mut(), seed, version, case, parent, name)?;
         match attrs {
             Some(mut attrs) if attrs.nlink > 1 => {
                 attrs.nlink -= 1;
                 attrs.ctime_ns = now_ns;
                 self.put_attrs(entry.inode, attrs)?;
             }
-            _ => self.remove_object(entry.inode),
+            _ => self.remove_object(entry.inode)?,
         }
         self.touch_modified(parent, now_ns)
     }
@@ -651,41 +657,34 @@ impl<D: BlockDevice> Pool<D> {
         self.ensure_mutable()?;
         self.require_dir(parent)?;
         let (seed, version, case) = self.naming();
-        let entry = dirent::lookup_entry(&self.tree, seed, version, case, parent, name)
+        let entry = dirent::lookup_entry(self.tree(), seed, version, case, parent, name)?
             .ok_or(ScaleFsError::NotFound)?;
         if entry.kind != EntryKind::Directory {
             return Err(ScaleFsError::NotDirectory);
         }
-        if dirent::entry_count(&self.tree, entry.inode) != 0 {
+        if dirent::entry_count(self.tree(), entry.inode)? != 0 {
             return Err(ScaleFsError::DirectoryNotEmpty);
         }
 
-        dirent::remove_entry(&mut self.tree, seed, version, case, parent, name)?;
-        self.remove_object(entry.inode);
+        dirent::remove_entry(self.tree_mut(), seed, version, case, parent, name)?;
+        self.remove_object(entry.inode)?;
         self.touch_modified(parent, now_ns)
     }
 
-    fn remove_object(&mut self, object_id: u64) {
-        self.tree.remove(inode_key(object_id));
-        self.tree.remove(special_key(object_id));
-        let xattrs: Vec<MetadataKey> = self
-            .tree
-            .range(xattr_key(object_id, 0), xattr_key(object_id, u64::MAX))
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
-        for key in xattrs {
-            self.tree.remove(key);
+    fn remove_object(&mut self, object_id: u64) -> Result<()> {
+        let xattrs = self
+            .tree()
+            .keys(xattr_key(object_id, 0), xattr_key(object_id, u64::MAX))?;
+        let extents = self
+            .tree()
+            .keys(extent_key(object_id, 0), extent_key(object_id, u64::MAX))?;
+        let tree = self.tree_mut();
+        for key in xattrs.into_iter().chain(extents) {
+            tree.remove(key)?;
         }
-        let extents: Vec<MetadataKey> = self
-            .tree
-            .range(extent_key(object_id, 0), extent_key(object_id, u64::MAX))
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
-        for key in extents {
-            self.tree.remove(key);
-        }
+        tree.remove(special_key(object_id))?;
+        tree.remove(inode_key(object_id))?;
+        Ok(())
     }
 
     pub fn rename(
@@ -701,36 +700,60 @@ impl<D: BlockDevice> Pool<D> {
         self.require_dir(new_parent)?;
         dirent::validate_name(new_name)?;
         let (seed, version, case) = self.naming();
-        let entry = dirent::lookup_entry(&self.tree, seed, version, case, old_parent, old_name)
+        let entry = dirent::lookup_entry(self.tree(), seed, version, case, old_parent, old_name)?
             .ok_or(ScaleFsError::NotFound)?;
         let same_place = old_parent == new_parent
             && dirent::fold_name(version, case, old_name)
                 == dirent::fold_name(version, case, new_name);
         if !same_place
-            && dirent::lookup_entry(&self.tree, seed, version, case, new_parent, new_name).is_some()
+            && dirent::lookup_entry(self.tree(), seed, version, case, new_parent, new_name)?
+                .is_some()
         {
             return Err(ScaleFsError::AlreadyExists);
         }
         if entry.kind == EntryKind::Directory
             && old_parent != new_parent
-            && self.would_cycle(entry.inode, new_parent)
+            && (entry.inode == new_parent || self.subtree_contains(entry.inode, new_parent)?)
         {
             return Err(ScaleFsError::InvalidArgument(
                 "cannot move a directory into its own subtree",
             ));
         }
 
-        dirent::remove_entry(&mut self.tree, seed, version, case, old_parent, old_name)?;
-        dirent::add_entry(
-            &mut self.tree,
-            seed,
-            version,
-            case,
-            new_parent,
-            new_name,
-            entry.inode,
-            entry.kind,
-        )?;
+        let bucket = |dir: u64, name: &str| MetadataKey {
+            object_id: dir,
+            item_type: crate::tree::ITEM_DIRENT,
+            offset: dirent::dirent_hash(seed, &dirent::fold_name(version, case, name)),
+        };
+        let mut saved: Vec<(MetadataKey, Option<MetadataValue>)> = Vec::with_capacity(2);
+        for key in [bucket(old_parent, old_name), bucket(new_parent, new_name)] {
+            saved.push((key, self.tree().get(key)?));
+        }
+        let tree = self.tree_mut();
+        let moved =
+            dirent::remove_entry(tree, seed, version, case, old_parent, old_name).and_then(|_| {
+                dirent::add_entry(
+                    tree,
+                    seed,
+                    version,
+                    case,
+                    new_parent,
+                    new_name,
+                    entry.inode,
+                    entry.kind,
+                )
+            });
+        if let Err(error) = moved {
+            for (key, value) in saved {
+                match value {
+                    Some(value) => tree.insert(key, value)?,
+                    None => {
+                        tree.remove(key)?;
+                    }
+                }
+            }
+            return Err(error);
+        }
         self.touch_modified(old_parent, now_ns)?;
         if new_parent != old_parent {
             self.touch_modified(new_parent, now_ns)?;
@@ -741,49 +764,55 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn would_cycle(&self, source: u64, new_parent: u64) -> bool {
-        source == new_parent || self.subtree_contains(source, new_parent)
+        source == new_parent || self.subtree_contains(source, new_parent).unwrap_or(true)
     }
 
-    fn subtree_contains(&self, dir: u64, needle: u64) -> bool {
+    fn subtree_contains(&self, dir: u64, needle: u64) -> Result<bool> {
+        let mut seen = std::collections::HashSet::from([dir]);
         let mut stack = vec![dir];
         while let Some(current) = stack.pop() {
-            for entry in dirent::list_entries(&self.tree, current) {
+            for entry in dirent::list_entries(self.tree(), current)? {
                 if entry.kind == EntryKind::Directory {
                     if entry.inode == needle {
-                        return true;
+                        return Ok(true);
+                    }
+                    if !seen.insert(entry.inode) {
+                        return Err(ScaleFsError::Corrupt(
+                            "a directory is reachable twice: the tree loops",
+                        ));
                     }
                     stack.push(entry.inode);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     #[cfg(test)]
     fn live_extents(&self, object_id: u64) -> Vec<LiveExtent> {
-        live_extents_overlapping(&self.tree, object_id, 0, u64::MAX)
+        live_extents_overlapping(self.tree(), object_id, 0, u64::MAX).unwrap()
     }
 
     fn clear_range(&mut self, object_id: u64, start: u64, end: u64) -> Result<()> {
         if start >= end {
             return Ok(());
         }
-        for live in live_extents_overlapping(&self.tree, object_id, start, end) {
+        let tree = self.tree_mut();
+        for live in live_extents_overlapping(*tree, object_id, start, end)? {
             if live.end() <= start || live.start >= end {
                 continue;
             }
-            self.tree.remove(extent_key(object_id, live.start));
+            tree.remove(extent_key(object_id, live.start))?;
             if live.start < start {
-                self.tree.insert(
+                tree.insert(
                     extent_key(object_id, live.start),
-                    live.source.value(live.data_offset, start - live.start),
+                    live.run.slice(0, start - live.start),
                 )?;
             }
             if live.end() > end {
-                self.tree.insert(
+                tree.insert(
                     extent_key(object_id, end),
-                    live.source
-                        .value(live.data_offset + (end - live.start), live.end() - end),
+                    live.run.slice(end - live.start, live.end() - end),
                 )?;
             }
         }
@@ -814,44 +843,13 @@ impl<D: BlockDevice> Pool<D> {
         let staged: Vec<(MetadataKey, MetadataValue)> = if self.parity_width() > 0 {
             self.stage_striped(object_id, offset, data)?
         } else {
-            let mut staged = Vec::with_capacity(data.len().div_ceil(FILE_DATA_CHUNK));
-            let mut written = 0usize;
-            while written < data.len() {
-                let chunk = &data[written..(written + FILE_DATA_CHUNK).min(data.len())];
-                let record = encode_file_data(chunk);
-                let placements = self.place_mirrored(
-                    ZoneClass::Data,
-                    record.len() as u64,
-                    AllocPurpose::Normal,
-                )?;
-                let mut extents = Vec::with_capacity(placements.len());
-                for (member, allocation) in placements {
-                    let slot = self
-                        .member_slot(member)
-                        .expect("data is placed on present members");
-                    self.write_record_padded(slot, allocation.offset, &record)?;
-                    extents.push(Extent {
-                        device_index: member,
-                        offset: allocation.offset,
-                        length: record.len() as u64,
-                    });
-                }
-                staged.push((
-                    extent_key(object_id, offset + written as u64),
-                    MetadataValue::FileExtent {
-                        extents,
-                        data_offset: 0,
-                        logical_len: chunk.len() as u64,
-                    },
-                ));
-                written += chunk.len();
-            }
-            staged
+            self.stage_mirrored(object_id, offset, data)?
         };
 
         self.clear_range(object_id, offset, end)?;
+        let tree = self.tree_mut();
         for (key, value) in staged {
-            self.tree.insert(key, value)?;
+            tree.insert(key, value)?;
         }
 
         attrs.size = attrs.size.max(end);
@@ -859,6 +857,77 @@ impl<D: BlockDevice> Pool<D> {
         attrs.ctime_ns = now_ns;
         attrs.attrs |= FILE_ATTR_ARCHIVE;
         self.put_attrs(object_id, attrs)
+    }
+
+    fn stage_mirrored(
+        &mut self,
+        object_id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Vec<(MetadataKey, MetadataValue)>> {
+        let tx = self.committed_tx + 1;
+        let mut staged = Vec::new();
+        let mut building: Option<RunBuilder> = None;
+        let mut written = 0usize;
+        while written < data.len() {
+            let chunk = &data[written..(written + FILE_DATA_CHUNK).min(data.len())];
+            let record = encode_file_data(tx, chunk);
+            let len = record.len() as u64;
+            let placements = self.place_mirrored(ZoneClass::Data, len, AllocPurpose::Normal)?;
+            for (member, allocation) in &placements {
+                let slot = self
+                    .member_slot(*member)
+                    .expect("data is placed on present members");
+                self.write_record_padded(slot, allocation.offset, &record)?;
+            }
+            let crc = Expect::of(&record).crc;
+            match &mut building {
+                Some(builder) if builder.continues(len, &placements) => {
+                    builder.run.crcs.push(crc);
+                    builder.run.last_len = len;
+                    builder.run.logical_len += chunk.len() as u64;
+                }
+                _ => {
+                    if let Some(done) = building.take() {
+                        staged.push((
+                            extent_key(object_id, done.start),
+                            MetadataValue::FileRun(done.run),
+                        ));
+                    }
+                    building = Some(RunBuilder {
+                        start: offset + written as u64,
+                        zones: placements
+                            .iter()
+                            .map(|(member, allocation)| (*member, allocation.zone_index))
+                            .collect(),
+                        run: FileRun {
+                            copies: placements
+                                .iter()
+                                .map(|(member, allocation)| Extent {
+                                    device_index: *member,
+                                    offset: allocation.offset,
+                                    length: len,
+                                })
+                                .collect(),
+                            stride: placements[0].1.length,
+                            last_len: len,
+                            tx,
+                            crcs: vec![crc],
+                            data_offset: 0,
+                            logical_len: chunk.len() as u64,
+                        },
+                    });
+                }
+            }
+            written += chunk.len();
+        }
+        if let Some(done) = building {
+            staged.push((
+                extent_key(object_id, done.start),
+                MetadataValue::FileRun(done.run),
+            ));
+        }
+        Ok(staged)
     }
 
     fn stage_striped(
@@ -869,37 +938,38 @@ impl<D: BlockDevice> Pool<D> {
     ) -> Result<Vec<(MetadataKey, MetadataValue)>> {
         let target_width = usize::from(self.data_width()).max(1);
         let chunks: Vec<&[u8]> = data.chunks(FILE_DATA_CHUNK).collect();
-        let mut staged = Vec::with_capacity(chunks.len());
+        let mut staged = Vec::new();
         let mut consumed = 0usize;
         while consumed < chunks.len() {
             let request = (chunks.len() - consumed).min(target_width);
             let group = &chunks[consumed..consumed + request];
-            let records: Vec<Vec<u8>> = group.iter().map(|chunk| encode_file_data(chunk)).collect();
-            let (placed, data_extents, parity_extents) = self.emit_stripe(&records)?;
-
-            for (index, chunk) in group[..placed].iter().enumerate() {
-                staged.push((
-                    extent_key(
-                        object_id,
-                        offset + ((consumed + index) * FILE_DATA_CHUNK) as u64,
-                    ),
-                    MetadataValue::StripedExtent {
-                        extent: data_extents[index],
-                        parity_extents: parity_extents.clone(),
-                        data_offset: 0,
-                        logical_len: chunk.len() as u64,
-                    },
-                ));
-            }
+            let tx = self.committed_tx + 1;
+            let records: Vec<Vec<u8>> = group
+                .iter()
+                .map(|chunk| encode_file_data(tx, chunk))
+                .collect();
+            let stripe = self.emit_stripe(&records)?;
+            let placed = stripe.placed;
+            let logical_len = group[..placed].iter().map(|chunk| chunk.len() as u64).sum();
+            staged.push((
+                extent_key(object_id, offset + (consumed * FILE_DATA_CHUNK) as u64),
+                MetadataValue::StripedRun(StripedRun {
+                    pieces: stripe.pieces,
+                    crcs: stripe.crcs,
+                    tx,
+                    parity: stripe.parity,
+                    parity_crcs: stripe.parity_crcs,
+                    parity_tx: stripe.parity_tx,
+                    data_offset: 0,
+                    logical_len,
+                }),
+            ));
             consumed += placed;
         }
         Ok(staged)
     }
 
-    pub(crate) fn emit_stripe(
-        &mut self,
-        records: &[Vec<u8>],
-    ) -> Result<(usize, Vec<Extent>, Vec<Extent>)> {
+    pub(crate) fn emit_stripe(&mut self, records: &[Vec<u8>]) -> Result<EmittedStripe> {
         let parity_width = usize::from(self.parity_width());
         let lens: Vec<u64> = records.iter().map(|record| record.len() as u64).collect();
 
@@ -943,26 +1013,41 @@ impl<D: BlockDevice> Pool<D> {
                 .expect("stripes are placed on present members");
             self.write_record_padded(slot, allocation.offset, record)?;
         }
+        let crcs: Vec<u32> = records
+            .iter()
+            .map(|record| Expect::of(record).crc)
+            .collect();
+        let parity_tx = self.committed_tx + 1;
+        let mut parity_crcs = Vec::with_capacity(parity_places.len());
         for (row, ((member, allocation), parity)) in parity_places.iter().zip(rows).enumerate() {
             let record = ParityRecord {
                 parity_index: row as u8,
                 coverage_len: coverage as u64,
                 data_pieces: data_extents.clone(),
+                data_crcs: crcs.clone(),
                 parity_pieces: parity_extents.clone(),
                 parity,
             };
-            let bytes = encode_parity_record(&record)?;
+            let bytes = encode_parity_record(&record, parity_tx)?;
             debug_assert_eq!(bytes.len() as u64, parity_len);
+            parity_crcs.push(Expect::of(&bytes).crc);
             let slot = self
                 .member_slot(*member)
                 .expect("stripes are placed on present members");
             self.write_record_padded(slot, allocation.offset, &bytes)?;
         }
-        Ok((placed, data_extents, parity_extents))
+        Ok(EmittedStripe {
+            placed,
+            pieces: data_extents,
+            crcs,
+            parity: parity_extents,
+            parity_crcs,
+            parity_tx,
+        })
     }
 
     pub fn read(&self, object_id: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
-        read_in(self, &self.tree, object_id, offset, len)
+        read_in(self, self.tree(), object_id, offset, len)
     }
 
     pub fn truncate(&mut self, object_id: u64, new_size: u64, now_ns: i64) -> Result<()> {
@@ -1014,15 +1099,19 @@ mod tests {
     }
 
     fn new_pool() -> Pool<MemoryBlockDevice> {
-        let device = MemoryBlockDevice::new(crate::gpt::member_image_len(
-            geometry().capacity_bytes(),
-        ) as usize);
+        pool_with(geometry())
+    }
+
+    fn pool_with(geometry: Geometry) -> Pool<MemoryBlockDevice> {
+        let device = MemoryBlockDevice::new(
+            crate::gpt::member_image_len(geometry.capacity_bytes()) as usize,
+        );
         Pool::create(
             device,
             CreateParams {
                 pool_id: PoolId([0x11; 16]),
                 device_id: DeviceId([0x22; 16]),
-                geometry: geometry(),
+                geometry,
                 case_sensitivity: CaseSensitivity::InsensitivePreserving,
                 dirent_hash_seed: 0x5EED_CAFE_F00D_0001,
                 label: "tank".to_string(),
@@ -1100,7 +1189,7 @@ mod tests {
 
         assert_eq!(pool.read(file, 0, 2 * FILE_DATA_CHUNK).unwrap(), old);
         assert_eq!(pool.getattr(file).unwrap().size, 2 * FILE_DATA_CHUNK as u64);
-        assert_eq!(pool.live_extents(file).len(), 2);
+        assert_eq!(pool.live_extents(file).len(), 1);
         pool.commit(AllocPurpose::Normal, LATER).unwrap();
         drop(pool);
         let device = std::sync::Arc::into_inner(device).expect("sole owner");
@@ -1194,15 +1283,50 @@ mod tests {
         assert!(pool.read(file, 200_000, 10).unwrap().is_empty());
     }
 
+    fn run_counts(pool: &Pool<MemoryBlockDevice>, file: u64) -> Vec<usize> {
+        pool.live_extents(file)
+            .iter()
+            .map(|live| match &live.run {
+                LiveRun::Mirrored(run) => run.count(),
+                LiveRun::Striped(run) => run.count(),
+            })
+            .collect()
+    }
+
     #[test]
-    fn large_writes_split_into_chunked_records() {
+    fn large_writes_become_runs_of_chunked_records() {
+        let records = 100_000usize.div_ceil(FILE_DATA_CHUNK);
+        let data = pattern(100_000, 3);
+
+        let mut roomy = pool_with(Geometry {
+            zone_size: 4 << 20,
+            ..geometry()
+        });
+        let file = roomy.create_file(ROOT_INODE, "big", 0o644, NOW).unwrap();
+        roomy.write(file, 0, &data, NOW).unwrap();
+        assert_eq!(run_counts(&roomy, file), vec![records]);
+        let extents = roomy.live_extents(file);
+        let LiveRun::Mirrored(run) = &extents[0].run else {
+            panic!("a mirrored run");
+        };
+        assert_eq!(run.copies[0].length, 32 * 1024);
+        assert_eq!(run.stride, 32 * 1024);
+        assert_eq!(roomy.read(file, 0, 100_000).unwrap(), data);
+
+        let big = pattern(MAX_RUN_RECORDS * FILE_DATA_CHUNK + 5000, 4);
+        let file = roomy.create_file(ROOT_INODE, "bigger", 0o644, NOW).unwrap();
+        roomy.write(file, 0, &big, NOW).unwrap();
+        assert_eq!(run_counts(&roomy, file), vec![MAX_RUN_RECORDS, 1]);
+        assert_eq!(roomy.read(file, 0, big.len()).unwrap(), big);
+        let mib = pattern(1 << 20, 6);
+        let file = roomy.create_file(ROOT_INODE, "mib", 0o644, NOW).unwrap();
+        roomy.write(file, 0, &mib, NOW).unwrap();
+        assert_eq!(run_counts(&roomy, file).len(), 1);
+
         let mut pool = new_pool();
         let file = pool.create_file(ROOT_INODE, "big", 0o644, NOW).unwrap();
-        let data = pattern(100_000, 3);
         pool.write(file, 0, &data, NOW).unwrap();
-
-        let extents = pool.live_extents(file);
-        assert_eq!(extents.len(), 100_000usize.div_ceil(FILE_DATA_CHUNK));
+        assert_eq!(run_counts(&pool, file), vec![2, 2]);
         assert_eq!(pool.read(file, 0, 100_000).unwrap(), data);
         assert_eq!(
             pool.read(file, FILE_DATA_CHUNK as u64 - 10, 20).unwrap(),
@@ -1268,6 +1392,171 @@ mod tests {
     #[test]
     fn reads_match_an_oracle_across_every_window() {
         oracle_sweep(&mut new_pool());
+    }
+
+    type Edit = fn(&mut dyn FnMut(EditOp), u64);
+
+    enum EditOp {
+        Write(u64, Vec<u8>),
+        Truncate(u64),
+        Punch(u64, u64),
+    }
+
+    fn run_boundaries<D: BlockDevice>(pool: &mut Pool<D>) -> Vec<Vec<usize>> {
+        let chunk = FILE_DATA_CHUNK as u64;
+        let len = 6 * chunk + 1234;
+        let edits: Vec<(&str, Edit)> = vec![
+            ("run start", |apply, _| {
+                apply(EditOp::Write(0, pattern(10, 1)))
+            }),
+            ("mid-record", |apply, chunk| {
+                apply(EditOp::Write(chunk / 2, pattern(100, 2)))
+            }),
+            ("one record exactly", |apply, chunk| {
+                apply(EditOp::Write(chunk, pattern(chunk as usize, 3)))
+            }),
+            ("run end", |apply, chunk| {
+                apply(EditOp::Write(6 * chunk + 1224, pattern(10, 4)))
+            }),
+            ("trim to one record", |apply, chunk| {
+                apply(EditOp::Truncate(chunk / 3))
+            }),
+            ("split in the middle", |apply, chunk| {
+                apply(EditOp::Punch(2 * chunk + 100, 2 * chunk - 200))
+            }),
+            ("truncate on a record boundary", |apply, chunk| {
+                apply(EditOp::Truncate(3 * chunk))
+            }),
+            ("across several records", |apply, chunk| {
+                apply(EditOp::Write(
+                    chunk - 7,
+                    pattern(4 * chunk as usize + 16, 5),
+                ))
+            }),
+        ];
+        let mut shapes = Vec::new();
+        for (name, edit) in edits {
+            let file = pool.create_file(ROOT_INODE, name, 0o644, NOW).unwrap();
+            let data = pattern(len as usize, 9);
+            pool.write(file, 0, &data, NOW).unwrap();
+            let mut oracle = data;
+            edit(
+                &mut |op| match op {
+                    EditOp::Write(at, bytes) => {
+                        pool.write(file, at, &bytes, LATER).unwrap();
+                        let end = at as usize + bytes.len();
+                        if oracle.len() < end {
+                            oracle.resize(end, 0);
+                        }
+                        oracle[at as usize..end].copy_from_slice(&bytes);
+                    }
+                    EditOp::Truncate(to) => {
+                        pool.truncate(file, to, LATER).unwrap();
+                        oracle.truncate(to as usize);
+                    }
+                    EditOp::Punch(at, n) => {
+                        pool.punch_hole(file, at, n, LATER).unwrap();
+                        oracle[at as usize..(at + n) as usize].fill(0);
+                    }
+                },
+                chunk,
+            );
+            for round in 0..2 {
+                assert_eq!(
+                    pool.read(file, 0, oracle.len() + 10).unwrap(),
+                    oracle,
+                    "{name}: whole file (round {round})"
+                );
+                let boundaries = (0..=7).map(|k| k * chunk).chain([chunk / 2, len - 10]);
+                for boundary in boundaries {
+                    for delta in [-2i64, -1, 0, 1, 2] {
+                        let Ok(at) = u64::try_from(boundary as i64 + delta) else {
+                            continue;
+                        };
+                        for read_len in [1usize, 7, chunk as usize, 2 * chunk as usize + 3] {
+                            let from = (at as usize).min(oracle.len());
+                            let to = (at as usize + read_len).min(oracle.len());
+                            assert_eq!(
+                                pool.read(file, at, read_len).unwrap(),
+                                &oracle[from..to],
+                                "{name}: window {at}+{read_len} (round {round})"
+                            );
+                        }
+                    }
+                }
+                pool.commit(AllocPurpose::Normal, LATER).unwrap();
+            }
+            shapes.push(
+                pool.live_extents(file)
+                    .iter()
+                    .map(|live| match &live.run {
+                        LiveRun::Mirrored(run) => run.count(),
+                        LiveRun::Striped(run) => run.count(),
+                    })
+                    .collect(),
+            );
+        }
+        shapes
+    }
+
+    #[test]
+    fn runs_trim_and_split_at_every_boundary() {
+        let shapes = run_boundaries(&mut pool_with(Geometry {
+            zone_size: 4 << 20,
+            ..geometry()
+        }));
+        assert_eq!(
+            shapes,
+            vec![
+                vec![1, 7],
+                vec![1, 1, 7],
+                vec![1, 1, 5],
+                vec![7, 1],
+                vec![1],
+                vec![3, 4],
+                vec![3],
+                vec![1, 5, 2],
+            ]
+        );
+        run_boundaries(&mut pool_with(Geometry {
+            zone_count: 128,
+            ..geometry()
+        }));
+    }
+
+    #[test]
+    fn striped_runs_trim_and_split_at_every_boundary() {
+        use crate::pool::{MemberSpec, PoolParams};
+        let geometry = Geometry {
+            zone_size: 1 << 20,
+            ..geometry()
+        };
+        let members: Vec<MemberSpec<MemoryBlockDevice>> = (0..6)
+            .map(|i| MemberSpec {
+                device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                    geometry.capacity_bytes(),
+                ) as usize),
+                device_id: DeviceId([0x50 + i as u8; 16]),
+                geometry,
+            })
+            .collect();
+        let mut pool = Pool::create_multi(
+            members,
+            PoolParams {
+                pool_id: PoolId([0x13; 16]),
+                case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                dirent_hash_seed: 3,
+                label: "rows".to_string(),
+                created_at_ns: NOW,
+                mirror_width: 2,
+                data_width: 4,
+                parity_width: 1,
+            },
+        )
+        .unwrap();
+        let shapes = run_boundaries(&mut pool);
+        assert_eq!(shapes[4], vec![1], "trim to one piece");
+        assert_eq!(shapes[6], vec![3], "three pieces of the first row");
     }
 
     #[test]
@@ -1649,7 +1938,7 @@ mod tests {
         let link = pool.symlink(ROOT_INODE, "link", b"somewhere", NOW).unwrap();
         pool.unlink(ROOT_INODE, "link", LATER).unwrap();
         assert!(matches!(pool.getattr(link), Err(ScaleFsError::NotFound)));
-        assert!(pool.tree.get(special_key(link)).is_none());
+        assert!(pool.tree().get(special_key(link)).unwrap().is_none());
     }
 
     #[test]
@@ -1702,8 +1991,9 @@ mod tests {
         pool.unlink(ROOT_INODE, "b", LATER).unwrap();
         assert!(matches!(pool.getattr(file), Err(ScaleFsError::NotFound)));
         assert!(
-            pool.tree
+            pool.tree()
                 .range(extent_key(file, 0), extent_key(file, u64::MAX))
+                .unwrap()
                 .is_empty(),
             "the last unlink must release the extents"
         );
@@ -1736,7 +2026,7 @@ mod tests {
         let file = pool.create_file(ROOT_INODE, "f", 0o644, NOW).unwrap();
         let mut attrs = pool.getattr(file).unwrap();
         attrs.nlink = LINK_MAX;
-        pool.tree
+        pool.tree_mut()
             .insert(inode_key(file), MetadataValue::Inode(attrs))
             .unwrap();
         assert!(matches!(
@@ -1807,7 +2097,7 @@ mod tests {
         pool.unlink(ROOT_INODE, "s", LATER).unwrap();
         assert_eq!(pool.readlink(sym).unwrap(), b"target");
         pool.unlink(ROOT_INODE, "s2", LATER).unwrap();
-        assert!(pool.tree.get(special_key(sym)).is_none());
+        assert!(pool.tree().get(special_key(sym)).unwrap().is_none());
     }
 
     #[test]
@@ -1849,8 +2139,9 @@ mod tests {
 
         pool.unlink(ROOT_INODE, "f", LATER).unwrap();
         assert!(
-            pool.tree
+            pool.tree()
                 .range(xattr_key(file, 0), xattr_key(file, u64::MAX))
+                .unwrap()
                 .is_empty(),
             "xattr keys must die with their object"
         );

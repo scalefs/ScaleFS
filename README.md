@@ -129,11 +129,7 @@ scalefs daemon attach tank /dev/sdb,/dev/sdc
   mount_smbfs //backup:s3cret@127.0.0.1:4455/tank /Volumes/tank
   ```
 
-  `scalefs daemon share` prints the exact mapping command to run. See `docs/platform-mounts.md` for the full mount story, including the planned first-party Windows driver and macOS FSKit extension.
-
-# Development
-- Source layout: a Rust workspace under `crates/` (`scalefs-core`, `scalefs-ipc`, `scalefs-mount`, `scalefs-daemon`, `scalefs-cli`, `scalefs-ffi`)
-- External dependencies are intentionally kept to a strict minimum; see `docs/dependency-policy.md`
+  `scalefs daemon share` prints the exact mapping command to run.
 
 # Legal notice
 ScaleFS is a trademark of ScaleFS LLC, the organization that maintains the ScaleFS open source project.

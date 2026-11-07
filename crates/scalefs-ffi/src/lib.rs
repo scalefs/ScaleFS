@@ -64,6 +64,11 @@ fn guarded<T>(fallback: T, body: impl FnOnce() -> T) -> T {
 
 pub struct ScalefsSalvage {
     session: Mutex<Salvage<RawBlockDevice>>,
+    members: Vec<std::path::PathBuf>,
+}
+
+fn resolved(path: &str) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
 }
 
 #[unsafe(no_mangle)]
@@ -110,6 +115,7 @@ pub unsafe extern "C" fn scalefs_salvage_open(
         match Salvage::assemble_with(devices, &options) {
             Ok(session) => Box::into_raw(Box::new(ScalefsSalvage {
                 session: Mutex::new(session),
+                members: supplied.iter().map(|path| resolved(path)).collect(),
             })),
             Err(error) => {
                 set_last_error(format!("nothing to salvage: {error}"));
@@ -524,6 +530,22 @@ pub unsafe extern "C" fn scalefs_salvage_copy_file(
     ) else {
         return std::ptr::null_mut();
     };
+    if scalefs_core::is_device_path(std::path::Path::new(&dest)) {
+        set_last_error(format!(
+            "refusing to write salvaged data to the device '{dest}'"
+        ));
+        return std::ptr::null_mut();
+    }
+    if !session.is_null() {
+        #[allow(unsafe_code)]
+        let members = unsafe { &(*session).members };
+        if std::path::Path::new(&dest).exists() && members.contains(&resolved(&dest)) {
+            set_last_error(format!(
+                "refusing to write over '{dest}': it is a member this session reads"
+            ));
+            return std::ptr::null_mut();
+        }
+    }
     with_session(session, std::ptr::null_mut(), move |salvage| {
         let object_id = match resolve(salvage, &source) {
             Ok(object_id) => object_id,
@@ -971,5 +993,35 @@ mod tests {
             scalefs_salvage_close(std::ptr::null_mut());
             scalefs_string_free(std::ptr::null_mut());
         }
+    }
+    #[test]
+    fn copy_out_refuses_a_destination_that_is_a_session_member() {
+        let (dir, images) = damaged_pool("onto-member");
+        let before = std::fs::read(&images[0]).unwrap();
+        let session = open_session(&images, 0);
+        assert!(!session.is_null(), "open failed: {}", last_error());
+        let source = CString::new("/hello.bin").unwrap();
+        let dest = CString::new(images[0].as_str()).unwrap();
+        #[allow(unsafe_code)]
+        let copied = unsafe { scalefs_salvage_copy_file(session, source.as_ptr(), dest.as_ptr()) };
+        if !copied.is_null() {
+            #[allow(unsafe_code)]
+            unsafe {
+                scalefs_string_free(copied)
+            };
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            scalefs_salvage_close(session)
+        };
+        let after = std::fs::read(&images[0]).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            copied.is_null(),
+            "the copy onto a member was accepted ({} bytes before, {} after)",
+            before.len(),
+            after.len()
+        );
+        assert!(before == after, "the member image changed");
     }
 }

@@ -147,6 +147,7 @@ fn recorded_mounts(entry: &Arc<Attached>) -> Vec<crate::state::RecordedMount> {
             mountpoint: active.mountpoint.display().to_string(),
             read_only: active.read_only,
             kernel_device: None,
+            close_durability: None,
         }],
         _ => Vec::new(),
     }
@@ -334,7 +335,7 @@ fn drain_off_thread(entry: &Arc<Attached>, generation: u64, state: ActiveMount) 
 }
 
 #[cfg(target_os = "linux")]
-const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 
 #[cfg(target_os = "linux")]
 fn bounded_join_all(handles: Vec<std::thread::JoinHandle<()>>, deadline: std::time::Duration) {
@@ -499,6 +500,9 @@ impl Registry {
                 match &error {
                     scalefs_core::PlanError::NoPools | scalefs_core::PlanError::NoMatch(_) => {
                         (ErrorCode::NotFound, error.to_string())
+                    }
+                    scalefs_core::PlanError::EarlierFormat(_) => {
+                        (ErrorCode::Unsupported, error.to_string())
                     }
                     _ => (ErrorCode::Conflict, error.to_string()),
                 }
@@ -1496,8 +1500,8 @@ impl Registry {
             Some(Value::Bool(flag)) => *flag,
             Some(_) => return Err(bad("repair must be a boolean")()),
         };
-        self.start_job(params, "scrub", move |pool, _entry| {
-            let report = pool.scrub(repair)?;
+        self.start_online_job(params, "scrub", move |entry| {
+            let report = scrub_in_steps(entry, repair)?;
             Ok(object(vec![
                 ("healthy", Value::Bool(report.healthy())),
                 (
@@ -1521,6 +1525,7 @@ impl Registry {
                     "copies_missing",
                     Value::Int(i128::from(report.copies_missing)),
                 ),
+                ("copies_stale", Value::Int(i128::from(report.copies_stale))),
             ]))
         })
     }
@@ -1792,54 +1797,7 @@ impl Registry {
         + Send
         + 'static,
     ) -> Result<Value, OpError> {
-        let name = required_name(params)?;
-        let id = self.next_job.fetch_add(1, Ordering::SeqCst) + 1;
-        let job = Arc::new(Job {
-            id,
-            kind,
-            pool_name: name.clone(),
-            state: Mutex::new(JobState::Running),
-        });
-
-        let entry = {
-            let pools = self.pools.lock().expect("registry lock");
-            let entry = pools.get(&name).map(Arc::clone).ok_or_else(|| {
-                (
-                    ErrorCode::NotFound,
-                    format!("no pool is attached as '{name}'"),
-                )
-            })?;
-            if entry.wrecked.load(Ordering::SeqCst) {
-                return Err((
-                    ErrorCode::Internal,
-                    format!(
-                        "pool '{name}' was fenced off by a crashed job; \
-                         detach and import it again"
-                    ),
-                ));
-            }
-            if entry.eject_pending.load(Ordering::SeqCst) {
-                return Err((
-                    ErrorCode::Conflict,
-                    format!("pool '{name}' is being ejected; no new job can start"),
-                ));
-            }
-            if let Err(owner) =
-                entry
-                    .busy
-                    .compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                return Err((
-                    ErrorCode::Busy,
-                    format!("pool '{name}' is busy with job {owner}"),
-                ));
-            }
-            self.jobs
-                .lock()
-                .expect("jobs lock")
-                .insert(id, Arc::clone(&job));
-            entry
-        };
+        let (id, job, entry) = self.claim_job(params, kind)?;
 
         let worker_job = Arc::clone(&job);
         let worker_entry = Arc::clone(&entry);
@@ -1907,6 +1865,109 @@ impl Registry {
                 "could not start a worker thread".to_string(),
             );
             entry.busy.store(0, Ordering::SeqCst);
+            return Err((
+                ErrorCode::Internal,
+                "could not start a worker thread".to_string(),
+            ));
+        }
+        Ok(object(vec![("job", Value::Int(i128::from(id)))]))
+    }
+
+    fn claim_job(
+        &self,
+        params: &Value,
+        kind: &'static str,
+    ) -> Result<(u64, Arc<Job>, Arc<Attached>), OpError> {
+        let name = required_name(params)?;
+        let id = self.next_job.fetch_add(1, Ordering::SeqCst) + 1;
+        let job = Arc::new(Job {
+            id,
+            kind,
+            pool_name: name.clone(),
+            state: Mutex::new(JobState::Running),
+        });
+
+        let entry = {
+            let pools = self.pools.lock().expect("registry lock");
+            let entry = pools.get(&name).map(Arc::clone).ok_or_else(|| {
+                (
+                    ErrorCode::NotFound,
+                    format!("no pool is attached as '{name}'"),
+                )
+            })?;
+            if entry.wrecked.load(Ordering::SeqCst) {
+                return Err((
+                    ErrorCode::Internal,
+                    format!(
+                        "pool '{name}' was fenced off by a crashed job; \
+                         detach and import it again"
+                    ),
+                ));
+            }
+            if entry.eject_pending.load(Ordering::SeqCst) {
+                return Err((
+                    ErrorCode::Conflict,
+                    format!("pool '{name}' is being ejected; no new job can start"),
+                ));
+            }
+            if let Err(owner) =
+                entry
+                    .busy
+                    .compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                return Err((
+                    ErrorCode::Busy,
+                    format!("pool '{name}' is busy with job {owner}"),
+                ));
+            }
+            self.jobs
+                .lock()
+                .expect("jobs lock")
+                .insert(id, Arc::clone(&job));
+            entry
+        };
+        Ok((id, job, entry))
+    }
+
+    fn start_online_job(
+        &self,
+        params: &Value,
+        kind: &'static str,
+        work: impl FnOnce(&Attached) -> Result<Value, OpError> + Send + 'static,
+    ) -> Result<Value, OpError> {
+        let (id, job, entry) = self.claim_job(params, kind)?;
+        let worker_job = Arc::clone(&job);
+        let spawned = std::thread::Builder::new()
+            .name(format!("scalefsd-job-{id}"))
+            .spawn(move || {
+                let _settle = JobSettle {
+                    job: Arc::clone(&worker_job),
+                    entry: Arc::clone(&entry),
+                };
+                let outcome = work(&entry);
+                if outcome.is_ok()
+                    && let (Ok(pool), Ok(mut status)) = (entry.pool.read(), entry.status.lock())
+                {
+                    *status = full_status(&entry, &pool);
+                }
+                *worker_job.state.lock().expect("job state") = match outcome {
+                    Ok(result) => JobState::Done(result),
+                    Err((code, message)) => JobState::Failed(code, message),
+                };
+            });
+        if spawned.is_err() {
+            *job.state.lock().expect("job state") = JobState::Failed(
+                ErrorCode::Internal,
+                "could not start a worker thread".to_string(),
+            );
+            if let Some(entry) = self
+                .pools
+                .lock()
+                .expect("registry lock")
+                .get(&job.pool_name)
+            {
+                entry.busy.store(0, Ordering::SeqCst);
+            }
             return Err((
                 ErrorCode::Internal,
                 "could not start a worker thread".to_string(),
@@ -2436,7 +2497,13 @@ fn refuse_accidental_overwrite(path: &str, force: bool) -> Result<(), OpError> {
     }
     let probed = scalefs_core::probe_path(Path::new(path));
     let holds = match probed.contents {
-        scalefs_core::Contents::Blank | scalefs_core::Contents::Unreadable => return Ok(()),
+        scalefs_core::Contents::Blank => return Ok(()),
+        scalefs_core::Contents::Unreadable => format!(
+            "contents that could not be read ({})",
+            probed
+                .error
+                .unwrap_or_else(|| "no detail from the probe".to_string())
+        ),
         scalefs_core::Contents::Pool(probe) => format!(
             "a ScaleFS pool ('{}', {})",
             probe.label,
@@ -2500,6 +2567,45 @@ fn map_error(error: ScaleFsError) -> OpError {
     (code, text)
 }
 
+const SCRUB_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+const SCRUB_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+
+fn scrub_in_steps(entry: &Attached, repair: bool) -> Result<scalefs_core::ScrubReport, OpError> {
+    let damaged = || -> OpError {
+        (
+            ErrorCode::Internal,
+            "the pool's state was damaged earlier; detach and import it again".to_string(),
+        )
+    };
+    let mut cursor = entry.pool.read().map_err(|_| damaged())?.scrub_start();
+    loop {
+        let mut pool = entry.pool.write().map_err(|_| damaged())?;
+        let deadline = std::time::Instant::now() + SCRUB_STEP;
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.scrub_step(&mut cursor, repair, Some(deadline))
+        }));
+        let done = match step {
+            Ok(result) => result.map_err(|error| code_for(&error))?,
+            Err(_) => {
+                if let Some(core) = entry.core.get() {
+                    core.poison();
+                }
+                entry.wrecked.store(true, Ordering::SeqCst);
+                return Err((
+                    ErrorCode::Internal,
+                    "the job crashed; the pool is fenced off — detach and import it again"
+                        .to_string(),
+                ));
+            }
+        };
+        if done {
+            return pool.scrub_finish(cursor).map_err(|error| code_for(&error));
+        }
+        drop(pool);
+        std::thread::sleep(SCRUB_PAUSE);
+    }
+}
+
 fn code_for(error: &ScaleFsError) -> (ErrorCode, String) {
     let code = match error {
         ScaleFsError::Corrupt(_) => ErrorCode::Corrupt,
@@ -2507,6 +2613,7 @@ fn code_for(error: &ScaleFsError) -> (ErrorCode, String) {
         ScaleFsError::NotFound => ErrorCode::NotFound,
         ScaleFsError::Unsupported(_) => ErrorCode::Unsupported,
         ScaleFsError::UnsupportedUnicodeVersion { .. } => ErrorCode::Unsupported,
+        ScaleFsError::EarlierFormat { .. } => ErrorCode::Unsupported,
         ScaleFsError::MissingMembers { .. } => ErrorCode::Conflict,
         ScaleFsError::Io(_) => ErrorCode::Io,
         ScaleFsError::AlreadyExists
@@ -2818,6 +2925,7 @@ mod tests {
             mountpoint: "S:".to_string(),
             read_only: false,
             kernel_device: Some(r"\\.\ScaleFsCtl".to_string()),
+            close_durability: Some(scalefs_mount::dataplane::CloseDurability::CommitOnClose),
         };
         #[cfg(windows)]
         registry.record_serve_mount("fence", Some(letter.clone()));
@@ -3043,6 +3151,45 @@ mod tests {
         drop(lone);
         registry.detach(&name_params()).unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_eject_commits_a_close_a_bounded_serving_deferred() {
+        use scalefs_mount::dataplane::PrepareVerdict;
+        for attempt in 0..5 {
+            let (registry, _store, dir) =
+                registry_with_recorded_pool(&format!("ejectbounded{attempt}"));
+            let serving = registry.share_handle("fence").unwrap();
+            let core = serving.core.clone().expect("a writable pool's core");
+            let committed = || serving.pool.read().unwrap().committed_tx();
+            let started = std::time::Instant::now();
+            let before = committed();
+            let file = core
+                .create(scalefs_core::ROOT_INODE, "closed", 0o644, 0, 0)
+                .unwrap();
+            core.write(file.inode, 0, b"written, then closed").unwrap();
+            core.commit_within(std::time::Duration::from_secs(5))
+                .unwrap();
+            let deferred = committed() == before;
+            let witness = serving.guard.witness();
+            let verdict = registry.eject_commit("fence", 9, Some(&witness));
+            let after = committed();
+            let span = started.elapsed();
+            drop(serving);
+            registry.detach(&name_params()).unwrap();
+            let _ = std::fs::remove_dir_all(dir);
+            if span >= std::time::Duration::from_millis(400) {
+                continue;
+            }
+            assert!(deferred, "the bounded close committed by itself");
+            assert_eq!(verdict, PrepareVerdict::Ack);
+            assert!(
+                after > before,
+                "the eject was confirmed before the deferred close was committed"
+            );
+            return;
+        }
+        panic!("five attempts in a row overran the debounce quiet window");
     }
 
     #[test]
@@ -4546,3 +4693,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+#[path = "pools_fault_tests.rs"]
+mod fault_tests;

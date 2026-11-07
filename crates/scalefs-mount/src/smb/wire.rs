@@ -4,6 +4,7 @@ use scalefs_core::wire::{Cursor, put_u16, put_u32, put_u64};
 pub const SMB2_MAGIC: [u8; 4] = [0xFE, b'S', b'M', b'B'];
 pub const DIALECT_311: u16 = 0x0311;
 pub const HEADER_LEN: usize = 64;
+pub const MAX_READ_SIZE: u32 = 1 << 20;
 
 pub mod command {
     pub const NEGOTIATE: u16 = 0x0000;
@@ -234,7 +235,7 @@ impl NegotiateResponse<'_> {
         out.extend_from_slice(&self.server_guid);
         put_u32(out, 0);
         put_u32(out, 1 << 20);
-        put_u32(out, 1 << 20);
+        put_u32(out, MAX_READ_SIZE);
         put_u32(out, 1 << 20);
         put_u64(out, self.system_time);
         put_u64(out, 0);
@@ -276,7 +277,7 @@ pub fn wildcard_negotiate_body(
     out.extend_from_slice(&server_guid);
     put_u32(&mut out, 0x0000_0004);
     put_u32(&mut out, 1 << 20);
-    put_u32(&mut out, 1 << 20);
+    put_u32(&mut out, MAX_READ_SIZE);
     put_u32(&mut out, 1 << 20);
     put_u64(&mut out, system_time);
     put_u64(&mut out, 0);

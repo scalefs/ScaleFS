@@ -79,6 +79,17 @@ mod ffi {
         pub fn GetCurrentProcessId() -> u32;
         pub fn CloseHandle(handle: isize) -> i32;
         pub fn GetDriveTypeW(root: *const u16) -> u32;
+        pub fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+
+    #[link(name = "userenv", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn CreateEnvironmentBlock(
+            environment: *mut *mut c_void,
+            token: isize,
+            inherit: i32,
+        ) -> i32;
+        pub fn DestroyEnvironmentBlock(environment: *mut c_void) -> i32;
     }
 }
 
@@ -86,6 +97,7 @@ const WTS_ACTIVE: i32 = 0;
 const WTS_CONNECTED: i32 = 1;
 const WTS_DISCONNECTED: i32 = 4;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 const DRIVE_NO_ROOT_DIR: u32 = 1;
 const ERROR_NO_TOKEN: i32 = 1008;
 
@@ -186,13 +198,75 @@ fn user_sessions() -> Vec<u32> {
     found
 }
 
-fn announce_in(session: u32, letter: char, change: Change) -> std::io::Result<()> {
+struct UserToken(isize);
+
+impl Drop for UserToken {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        tests::record_close(self.0);
+        #[allow(unsafe_code)]
+        unsafe {
+            ffi::CloseHandle(self.0)
+        };
+    }
+}
+
+fn user_token(session: u32) -> std::io::Result<UserToken> {
     let mut token = 0isize;
     #[allow(unsafe_code)]
     if unsafe { ffi::WTSQueryUserToken(session, &mut token) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let exe = std::env::current_exe()?;
+    Ok(UserToken(token))
+}
+
+struct Environment(*mut core::ffi::c_void);
+
+impl Environment {
+    fn of(token: &UserToken) -> std::io::Result<Environment> {
+        let mut block: *mut core::ffi::c_void = std::ptr::null_mut();
+        #[allow(unsafe_code)]
+        if unsafe { ffi::CreateEnvironmentBlock(&mut block, token.0, 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Environment(block))
+    }
+}
+
+impl Drop for Environment {
+    fn drop(&mut self) {
+        #[allow(unsafe_code)]
+        unsafe {
+            ffi::DestroyEnvironmentBlock(self.0)
+        };
+    }
+}
+
+fn system_directory() -> std::io::Result<Vec<u16>> {
+    let mut buffer = vec![0u16; 260];
+    #[allow(unsafe_code)]
+    let len = unsafe { ffi::GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if len == 0 || len as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(len as usize + 1);
+    Ok(buffer)
+}
+
+fn announce_in(session: u32, letter: char, change: Change) -> std::io::Result<()> {
+    let token = user_token(session)?;
+    start_helper(token, letter, change, std::env::current_exe)
+}
+
+fn start_helper(
+    token: UserToken,
+    letter: char,
+    change: Change,
+    exe: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    let exe = exe()?;
+    let environment = Environment::of(&token)?;
+    let directory = system_directory()?;
     let application = wide(&exe.display().to_string());
     let mut command_line = wide(&format!(
         "\"{}\" session-announce {} {letter}:",
@@ -229,15 +303,15 @@ fn announce_in(session: u32, letter: char, change: Change) -> std::io::Result<()
     #[allow(unsafe_code)]
     let started = unsafe {
         ffi::CreateProcessAsUserW(
-            token,
+            token.0,
             application.as_ptr(),
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             0,
-            CREATE_NO_WINDOW,
-            std::ptr::null(),
-            std::ptr::null(),
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            environment.0,
+            directory.as_ptr(),
             &startup,
             &mut process,
         )
@@ -245,7 +319,7 @@ fn announce_in(session: u32, letter: char, change: Change) -> std::io::Result<()
     let error = std::io::Error::last_os_error();
     #[allow(unsafe_code)]
     unsafe {
-        for handle in [process.thread, process.process, token] {
+        for handle in [process.thread, process.process] {
             if handle != 0 {
                 ffi::CloseHandle(handle);
             }
@@ -255,4 +329,108 @@ fn announce_in(session: u32, letter: char, change: Change) -> std::io::Result<()
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static CLOSED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+    pub(super) fn record_close(raw: isize) {
+        CLOSED.lock().unwrap().push(raw);
+    }
+
+    #[allow(unsafe_code)]
+    mod probe {
+        #[link(name = "kernel32", kind = "raw-dylib")]
+        unsafe extern "system" {
+            pub fn GetCurrentProcess() -> isize;
+        }
+        #[link(name = "advapi32", kind = "raw-dylib")]
+        unsafe extern "system" {
+            pub fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn variables(environment: &Environment) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut at = environment.0 as *const u16;
+        loop {
+            let mut len = 0usize;
+            while unsafe { *at.add(len) } != 0 {
+                len += 1;
+            }
+            if len == 0 {
+                return out;
+            }
+            out.push(String::from_utf16_lossy(unsafe {
+                std::slice::from_raw_parts(at, len)
+            }));
+            at = unsafe { at.add(len + 1) };
+        }
+    }
+
+    #[test]
+    fn a_failed_start_closes_the_session_token() {
+        use std::os::windows::io::IntoRawHandle;
+        let stand_in = std::fs::File::open(std::env::current_exe().unwrap())
+            .unwrap()
+            .into_raw_handle() as isize;
+        let started = start_helper(UserToken(stand_in), 'P', Change::Removal, || {
+            Err(std::io::Error::other("injected: no helper path"))
+        });
+        assert!(started.is_err());
+        assert!(
+            CLOSED.lock().unwrap().contains(&stand_in),
+            "the token was closed on the early return"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_helper_environment_is_the_users_own() {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+        let mut raw = 0isize;
+        let opened = unsafe {
+            probe::OpenProcessToken(
+                probe::GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+                &mut raw,
+            )
+        };
+        assert_ne!(opened, 0, "{}", std::io::Error::last_os_error());
+        let token = UserToken(raw);
+        let environment = Environment::of(&token).unwrap();
+        let variables = variables(&environment);
+        let get = |name: &str| {
+            variables.iter().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                key.eq_ignore_ascii_case(name).then(|| value.to_string())
+            })
+        };
+        assert_eq!(get("USERNAME"), std::env::var("USERNAME").ok());
+        assert_eq!(get("USERPROFILE"), std::env::var("USERPROFILE").ok());
+        assert!(std::env::var("CARGO").is_ok(), "cargo sets this for tests");
+        assert_eq!(get("CARGO"), None, "nothing of this process's environment");
+        assert!(
+            system_directory()
+                .map(|units| ffi_text(&units)
+                    .to_ascii_lowercase()
+                    .ends_with("\\system32"))
+                .unwrap_or(false)
+        );
+    }
+
+    fn ffi_text(units: &[u16]) -> String {
+        let end = units
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(units.len());
+        String::from_utf16_lossy(&units[..end])
+    }
 }

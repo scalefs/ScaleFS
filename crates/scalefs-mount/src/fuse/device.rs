@@ -31,17 +31,13 @@ mod ffi {
             nfds: core::ffi::c_ulong,
             timeout: core::ffi::c_int,
         ) -> core::ffi::c_int;
-        pub fn fcntl(
-            fd: core::ffi::c_int,
-            cmd: core::ffi::c_int,
-            arg: core::ffi::c_int,
-        ) -> core::ffi::c_int;
+        pub fn fcntl(fd: core::ffi::c_int, cmd: core::ffi::c_int, ...) -> core::ffi::c_int;
     }
 }
 
-const MS_RDONLY: u64 = 0x1;
-const MS_NOSUID: u64 = 0x2;
-const MS_NODEV: u64 = 0x4;
+const MS_RDONLY: core::ffi::c_ulong = 0x1;
+const MS_NOSUID: core::ffi::c_ulong = 0x2;
+const MS_NODEV: core::ffi::c_ulong = 0x4;
 const MNT_DETACH: i32 = 0x2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
@@ -52,6 +48,20 @@ const ENOTCONN: i32 = 107;
 const STOP_POLL_MS: i32 = 500;
 
 pub const REQUEST_BUFFER: usize = (1 << 20) + 4096;
+
+fn c_path(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains a NUL byte",
+        ));
+    }
+    let mut out = bytes.to_vec();
+    out.push(0);
+    Ok(out)
+}
 
 fn c_string(text: &str) -> std::io::Result<Vec<u8>> {
     if text.as_bytes().contains(&0) {
@@ -85,7 +95,7 @@ impl FuseMount {
             .read(true)
             .write(true)
             .open("/dev/fuse")?;
-        let target = c_string(&mountpoint.to_string_lossy())?;
+        let target = c_path(mountpoint)?;
         let source = c_string("scalefs")?;
         let fstype = c_string("fuse")?;
         let data = c_string(&format!(
@@ -206,7 +216,7 @@ impl FuseMount {
             return;
         }
         self.detached = true;
-        if let Ok(target) = c_string(&self.mountpoint.to_string_lossy()) {
+        if let Ok(target) = c_path(&self.mountpoint) {
             #[allow(unsafe_code)]
             unsafe {
                 ffi::umount2(target.as_ptr().cast(), MNT_DETACH)
@@ -220,7 +230,7 @@ impl FuseMount {
 }
 
 pub fn detach_mountpoint(mountpoint: &Path) -> std::io::Result<()> {
-    let target = c_string(&mountpoint.to_string_lossy())?;
+    let target = c_path(mountpoint)?;
     #[allow(unsafe_code)]
     let rc = unsafe { ffi::umount2(target.as_ptr().cast(), MNT_DETACH) };
     if rc != 0 {
@@ -230,7 +240,7 @@ pub fn detach_mountpoint(mountpoint: &Path) -> std::io::Result<()> {
 }
 
 pub fn unmount_mountpoint(mountpoint: &Path) -> std::io::Result<()> {
-    let target = c_string(&mountpoint.to_string_lossy())?;
+    let target = c_path(mountpoint)?;
     #[allow(unsafe_code)]
     let rc = unsafe { ffi::umount2(target.as_ptr().cast(), 0) };
     if rc != 0 {

@@ -66,7 +66,7 @@ fn sessions_negotiate_and_answer() {
 
     let version = client.call("version", Value::Null).unwrap();
     assert_eq!(version.get("protocol").unwrap().as_u64(), Some(1));
-    assert_eq!(version.get("format").unwrap().as_u64(), Some(1));
+    assert_eq!(version.get("format").unwrap().as_u64(), Some(2));
     assert_eq!(
         version.get("daemon").unwrap().as_str(),
         Some(env!("CARGO_PKG_VERSION"))
@@ -1474,5 +1474,469 @@ fn pool_serve_kernel_device_validation() {
         )
         .unwrap();
     daemon.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+const FSYNC_ON_CLOSE: u16 = 1;
+
+struct Plane {
+    stream: std::net::TcpStream,
+    next_id: u32,
+}
+
+impl Plane {
+    fn open(endpoint: &str, token: &str) -> Plane {
+        let stream = std::net::TcpStream::connect(endpoint).unwrap();
+        let mut plane = Plane { stream, next_id: 1 };
+        let mut hello = 1u16.to_le_bytes().to_vec();
+        hello.extend_from_slice(&[0x77; 16]);
+        hello.extend_from_slice(&Plane::bytes(token.as_bytes()));
+        let (code, _) = plane.call(1, 0, &hello);
+        assert_eq!(code, 0, "HELLO refused");
+        plane
+    }
+
+    fn bytes(payload: &[u8]) -> Vec<u8> {
+        let mut out = (payload.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn try_call(&mut self, op: u16, flags: u16, body: &[u8]) -> std::io::Result<(i16, Vec<u8>)> {
+        use std::io::{Read, Write};
+        let req_id = self.next_id;
+        self.next_id += 1;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+        frame.extend_from_slice(&req_id.to_le_bytes());
+        frame.extend_from_slice(&op.to_le_bytes());
+        frame.extend_from_slice(&flags.to_le_bytes());
+        frame.extend_from_slice(body);
+        self.stream.write_all(&frame)?;
+        let mut len = [0u8; 4];
+        self.stream.read_exact(&mut len)?;
+        let mut reply = vec![0u8; u32::from_le_bytes(len) as usize];
+        self.stream.read_exact(&mut reply)?;
+        Ok((
+            i16::from_le_bytes(reply[4..6].try_into().unwrap()),
+            reply[8..].to_vec(),
+        ))
+    }
+
+    fn call(&mut self, op: u16, flags: u16, body: &[u8]) -> (i16, Vec<u8>) {
+        self.try_call(op, flags, body).unwrap()
+    }
+
+    fn ok(&mut self, op: u16, flags: u16, body: &[u8]) -> Vec<u8> {
+        let (code, reply) = self.call(op, flags, body);
+        assert_eq!(code, 0, "op {op} failed");
+        reply
+    }
+
+    fn create(&mut self, name: &str) -> u64 {
+        let mut body = 1u64.to_le_bytes().to_vec();
+        body.extend_from_slice(&Plane::bytes(name.as_bytes()));
+        body.extend_from_slice(&0o644u32.to_le_bytes());
+        body.extend_from_slice(&[0u8; 8]);
+        let attr = self.ok(9, 0, &body);
+        u64::from_le_bytes(attr[0..8].try_into().unwrap())
+    }
+
+    fn write_body(inode: u64, data: &[u8]) -> Vec<u8> {
+        let mut body = inode.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&Plane::bytes(data));
+        body
+    }
+
+    fn write(&mut self, inode: u64, data: &[u8]) {
+        self.ok(8, 0, &Plane::write_body(inode, data));
+    }
+
+    fn fsync(&mut self, inode: u64, flags: u16) {
+        let mut body = inode.to_le_bytes().to_vec();
+        body.push(0);
+        self.ok(25, flags, &body);
+    }
+
+    fn read_file(&mut self, name: &str) -> Vec<u8> {
+        let mut body = 1u64.to_le_bytes().to_vec();
+        body.extend_from_slice(&Plane::bytes(name.as_bytes()));
+        let (code, attr) = self.call(3, 0, &body);
+        if code != 0 {
+            return Vec::new();
+        }
+        let inode = u64::from_le_bytes(attr[0..8].try_into().unwrap());
+        let mut body = inode.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&4096u32.to_le_bytes());
+        let reply = self.ok(7, 0, &body);
+        reply[4..].to_vec()
+    }
+
+    fn bye_and_wait(mut self) {
+        use std::io::Read;
+        let (code, _) = self.call(26, 0, &[]);
+        assert_eq!(code, 0);
+        let mut rest = Vec::new();
+        let _ = self.stream.read_to_end(&mut rest);
+    }
+}
+
+struct Keeper {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Keeper {
+    fn start(endpoint: &str, token: &str, name: &str) -> Keeper {
+        let mut plane = Plane::open(endpoint, token);
+        let inode = plane.create(name);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let body = Plane::write_body(inode, b"keep busy");
+                    if !matches!(plane.try_call(8, 0, &body), Ok((0, _))) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+        };
+        Keeper {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl DaemonUnderTest {
+    fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::mem::forget(self);
+    }
+}
+
+fn serve_tank(client: &mut Client, policy: &[(&str, Value)]) -> Value {
+    let mut params = vec![("pool", Value::Str("tank".into()))];
+    params.extend(policy.iter().cloned());
+    client.call("pool.serve", object(params)).unwrap()
+}
+
+fn endpoint_and_token(served: &Value) -> (String, String) {
+    (
+        served
+            .get("endpoint")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string(),
+        served.get("token").unwrap().as_str().unwrap().to_string(),
+    )
+}
+
+fn bounded(ms: i128) -> Vec<(&'static str, Value)> {
+    vec![
+        ("close_durability", Value::Str("bounded".into())),
+        ("close_bound_ms", Value::Int(ms)),
+    ]
+}
+
+fn commit_on_close() -> Vec<(&'static str, Value)> {
+    vec![("close_durability", Value::Str("commit-on-close".into()))]
+}
+
+fn crash_after(
+    tag: &str,
+    members: [&str; 2],
+    policy: &[(&str, Value)],
+    name: &str,
+    content: &[u8],
+    step: impl FnOnce(&mut Client, Plane),
+) -> Duration {
+    let daemon = DaemonUnderTest::spawn(tag);
+    let mut client = daemon.client();
+    client
+        .call("pool.attach", attach_params("tank", &members, false))
+        .unwrap();
+    let (endpoint, token) = endpoint_and_token(&serve_tank(&mut client, policy));
+    let keeper = Keeper::start(&endpoint, &token, &format!("keeper-{tag}"));
+    let mut plane = Plane::open(&endpoint, &token);
+    let file = plane.create(name);
+    plane.fsync(file, 0);
+    plane.write(file, content);
+    plane.fsync(file, FSYNC_ON_CLOSE);
+    let answered = std::time::Instant::now();
+    step(&mut client, plane);
+    let span = answered.elapsed();
+    daemon.kill();
+    drop(keeper);
+    span
+}
+
+fn read_back(tag: &str, members: [&str; 2], name: &str) -> Vec<u8> {
+    let daemon = DaemonUnderTest::spawn(tag);
+    let mut client = daemon.client();
+    client
+        .call("pool.attach", attach_params("tank", &members, false))
+        .unwrap();
+    let (endpoint, token) = endpoint_and_token(&serve_tank(&mut client, &[]));
+    let mut plane = Plane::open(&endpoint, &token);
+    let content = plane.read_file(name);
+    plane.bye_and_wait();
+    client
+        .call(
+            "pool.serve_stop",
+            object(vec![("pool", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    client
+        .call(
+            "pool.detach",
+            object(vec![("name", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    daemon.shutdown();
+    content
+}
+
+#[test]
+fn pool_serve_reports_its_close_policy() {
+    let (dir, a, b) = scratch_pool("closepolicy");
+    let daemon = DaemonUnderTest::spawn("closepolicy");
+    let mut client = daemon.client();
+    client
+        .call("pool.attach", attach_params("tank", &[&a, &b], false))
+        .unwrap();
+    let stop = |client: &mut Client| {
+        client
+            .call(
+                "pool.serve_stop",
+                object(vec![("pool", Value::Str("tank".into()))]),
+            )
+            .unwrap();
+    };
+
+    let served = serve_tank(&mut client, &[]);
+    assert_eq!(
+        served.get("close_durability").and_then(Value::as_str),
+        Some("bounded"),
+    );
+    assert_eq!(
+        served.get("close_bound_ms").and_then(Value::as_u64),
+        Some(1000)
+    );
+    stop(&mut client);
+
+    let served = serve_tank(&mut client, &commit_on_close());
+    assert_eq!(
+        served.get("close_durability").and_then(Value::as_str),
+        Some("commit-on-close"),
+    );
+    assert_eq!(served.get("close_bound_ms"), None);
+    stop(&mut client);
+
+    let served = serve_tank(&mut client, &bounded(2500));
+    assert_eq!(
+        served.get("close_durability").and_then(Value::as_str),
+        Some("bounded"),
+    );
+    assert_eq!(
+        served.get("close_bound_ms").and_then(Value::as_u64),
+        Some(2500)
+    );
+    let listing = client.call("serve.list", Value::Null).unwrap();
+    let rows = listing.get("serving").unwrap().as_array().unwrap();
+    assert_eq!(
+        rows[0].get("close_durability").and_then(Value::as_str),
+        Some("bounded"),
+    );
+    assert_eq!(
+        rows[0].get("close_bound_ms").and_then(Value::as_u64),
+        Some(2500)
+    );
+    stop(&mut client);
+
+    match client.call("pool.serve", {
+        let mut params = vec![("pool", Value::Str("tank".into()))];
+        params.extend(bounded(60_000));
+        object(params)
+    }) {
+        Err(CallError::Daemon { code, .. }) => assert_eq!(code, "bad_request"),
+        other => panic!("expected bad_request, got {other:?}"),
+    }
+    let listing = client.call("serve.list", Value::Null).unwrap();
+    assert!(
+        listing
+            .get("serving")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused serve must not register"
+    );
+
+    client
+        .call(
+            "pool.detach",
+            object(vec![("name", Value::Str("tank".into()))]),
+        )
+        .unwrap();
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_crash_right_after_a_written_close_keeps_it_only_under_commit_on_close() {
+    let (dir, a, b) = scratch_pool_sized("closecrash", 256);
+    let members = [a.as_str(), b.as_str()];
+    crash_after(
+        "closecrash-commit",
+        members,
+        &commit_on_close(),
+        "committed",
+        b"committed at close",
+        |_, _| {},
+    );
+    let deferred = (0..5)
+        .map(|attempt| format!("deferred-{attempt}"))
+        .find(|name| {
+            let span = crash_after(
+                &format!("closecrash-{name}"),
+                members,
+                &[],
+                name,
+                b"left to the group commit",
+                |_, _| {},
+            );
+            span < Duration::from_millis(500)
+        })
+        .expect("five attempts in a row took half the window to crash");
+    assert_eq!(
+        read_back("closecrash-after", members, "committed"),
+        b"committed at close".to_vec(),
+        "a commit-on-close serving's written close did not survive a crash"
+    );
+    assert!(
+        read_back("closecrash-after2", members, &deferred).is_empty(),
+        "the default serving's close was committed before the crash: nothing was deferred"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn every_durability_point_commits_a_deferred_close_before_it_answers() {
+    let (dir, a, b) = scratch_pool_sized("closepoints", 256);
+    let members = [a.as_str(), b.as_str()];
+    crash_after(
+        "closepoints-flush",
+        members,
+        &bounded(5000),
+        "flushed",
+        b"closed, then flushed",
+        |_, mut plane| {
+            let mut lookup = 1u64.to_le_bytes().to_vec();
+            lookup.extend_from_slice(&Plane::bytes(b"flushed"));
+            let attr = plane.ok(3, 0, &lookup);
+            plane.fsync(u64::from_le_bytes(attr[0..8].try_into().unwrap()), 0);
+        },
+    );
+    crash_after(
+        "closepoints-bye",
+        members,
+        &bounded(5000),
+        "unmounted",
+        b"closed, then the session ended",
+        |_, plane| plane.bye_and_wait(),
+    );
+    crash_after(
+        "closepoints-stop",
+        members,
+        &bounded(5000),
+        "stopped",
+        b"closed, then the serving stopped",
+        |client, _plane| {
+            client
+                .call(
+                    "pool.serve_stop",
+                    object(vec![("pool", Value::Str("tank".into()))]),
+                )
+                .unwrap();
+        },
+    );
+    for (name, content) in [
+        ("flushed", &b"closed, then flushed"[..]),
+        ("unmounted", &b"closed, then the session ended"[..]),
+        ("stopped", &b"closed, then the serving stopped"[..]),
+    ] {
+        assert_eq!(
+            read_back(&format!("closepoints-read-{name}"), members, name),
+            content.to_vec(),
+            "'{name}': the durability point answered before committing the deferred close"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_bounded_close_is_committed_within_its_bound() {
+    let (dir, a, b) = scratch_pool_sized("closebound", 256);
+    let members = [a.as_str(), b.as_str()];
+    for (tag, policy, name) in [
+        ("closebound-1s", Vec::new(), "one-second"),
+        ("closebound-5s", bounded(5000), "five-seconds"),
+    ] {
+        crash_after(tag, members, &policy, name, b"closed", |_, _| {
+            std::thread::sleep(Duration::from_millis(2500));
+        });
+    }
+    assert_eq!(
+        read_back("closebound-read-1s", members, "one-second"),
+        b"closed".to_vec(),
+        "a 1 s bounded close was not committed 2.5 s later"
+    );
+    assert!(
+        read_back("closebound-read-5s", members, "five-seconds").is_empty(),
+        "a 5 s bounded close was committed after 2.5 s: something other than the bound committed it"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn daemon_shutdown_commits_a_deferred_close() {
+    let (dir, a, b) = scratch_pool_sized("closeshutdown", 256);
+    let members = [a.as_str(), b.as_str()];
+    let daemon = DaemonUnderTest::spawn("closeshutdown");
+    let mut client = daemon.client();
+    client
+        .call("pool.attach", attach_params("tank", &members, false))
+        .unwrap();
+    let (endpoint, token) = endpoint_and_token(&serve_tank(&mut client, &bounded(5000)));
+    let keeper = Keeper::start(&endpoint, &token, "keeper-closeshutdown");
+    let mut plane = Plane::open(&endpoint, &token);
+    let file = plane.create("closed");
+    plane.fsync(file, 0);
+    plane.write(file, b"closed, then the daemon stopped");
+    plane.fsync(file, FSYNC_ON_CLOSE);
+    daemon.shutdown();
+    drop(plane);
+    drop(keeper);
+    assert_eq!(
+        read_back("closeshutdown-after", members, "closed"),
+        b"closed, then the daemon stopped".to_vec(),
+        "the deferred close did not survive a clean daemon shutdown"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -42,6 +42,10 @@ pub mod op {
     pub const EJECT_COMMIT: u16 = 0x0102;
 }
 
+pub mod request_flags {
+    pub const FSYNC_ON_CLOSE: u16 = 1 << 0;
+}
+
 pub mod eject {
     pub const ACK: u8 = 0;
     pub const NAK_FENCE_HELD: u8 = 1;

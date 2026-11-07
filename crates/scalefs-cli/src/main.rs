@@ -1,4 +1,6 @@
 mod bench_cmds;
+mod bench_meta;
+mod bench_scale;
 mod daemon_cmds;
 mod device_cmds;
 mod file_cmds;
@@ -26,6 +28,8 @@ fn main() -> ExitCode {
         }
         Some("pool") => pool_cmds::cmd_pool(&args[1..]),
         Some("bench") => bench_cmds::cmd_bench(&args[1..]),
+        Some("bench-meta") => bench_meta::cmd_bench_meta(&args[1..]),
+        Some("bench-scale") => bench_scale::cmd_bench_scale(&args[1..]),
         Some("device") => device_cmds::cmd_device(&args[1..]),
         Some("fs") => file_cmds::cmd_fs(&args[1..]),
         Some("snapshot") => snapshot_cmds::cmd_snapshot(&args[1..]),
@@ -174,8 +178,12 @@ fn help_text() -> String {
         "  daemon unshare <name>        Stop an SMB share\n",
         "  daemon shares                List SMB shares\n",
         "  daemon serve <pool> [--read-only] [--unix-socket <path>] [--kernel-device <dev>] [--mount <letter>:|auto]\n",
+        "               [--close-durability bounded|commit-on-close] [--close-bound-ms <1000-5000>]\n",
         "                               Serve the pool's data plane (native-volume\n",
-        "                               gateways; loopback TCP by default)\n",
+        "                               gateways; loopback TCP by default). A written\n",
+        "                               close is committed within the bound (1000 ms\n",
+        "                               by default); commit-on-close commits it before\n",
+        "                               the close returns\n",
         "  daemon serve-stop <pool> [--force]\n",
         "                               Stop serving the pool's data plane\n",
         "                               (--force dismounts a busy kernel volume)\n",

@@ -420,6 +420,9 @@ impl<D: SharedDevice> SmbShare<D> {
         let Ok(req) = ReadRequest::decode(body) else {
             return Response::error(status::INVALID_PARAMETER);
         };
+        if req.length > super::wire::MAX_READ_SIZE {
+            return Response::error(status::INVALID_PARAMETER);
+        }
         let Some(inode) = self
             .resolve(req.file_id)
             .and_then(|f| self.file(f))
@@ -737,6 +740,10 @@ impl<D: SharedDevice> Handler for SmbShare<D> {
     }
 
     fn dispatch(&self, header: &Header, body: &[u8]) -> Response {
+        let _perf = scalefs_core::perftrace::op(
+            scalefs_core::perftrace::Surface::Smb,
+            u32::from(header.command),
+        );
         match header.command {
             command::NEGOTIATE => self.negotiate(),
             command::SESSION_SETUP => self.session_setup(body),

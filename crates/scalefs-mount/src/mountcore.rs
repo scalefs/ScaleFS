@@ -106,6 +106,8 @@ struct Dirt {
     epoch: u64,
     committed: u64,
     committing: bool,
+    held: bool,
+    close_due: Option<Instant>,
 }
 
 impl Durability {
@@ -122,6 +124,8 @@ impl Durability {
                 epoch: 0,
                 committed: 0,
                 committing: false,
+                held: false,
+                close_due: None,
             }),
             signal: Condvar::new(),
         }
@@ -168,30 +172,42 @@ fn commit_ticketed<D: SharedDevice>(
     pool: &RwLock<Pool<D>>,
     durability: &Durability,
 ) -> Result<(), MountError> {
-    let (ticket, covers, staged_at_plan) = {
+    let plan_timer = scalefs_core::perftrace::start(scalefs_core::perftrace::C::CommitPlan, 0);
+    let (ticket, covers, staged_at_plan, promised) = {
         let mut pool = pool.write().map_err(|_| MountError::Io)?;
-        let (covers, staged_at_plan) = {
-            let dirt = durability.dirt.lock().map_err(|_| MountError::Io)?;
+        let (covers, staged_at_plan, promised) = {
+            let mut dirt = durability.dirt.lock().map_err(|_| MountError::Io)?;
             if dirt.poisoned {
                 return Err(MountError::Io);
             }
             if !dirt.dirty {
                 return Ok(());
             }
-            (dirt.epoch, dirt.staged_bytes)
+            (dirt.epoch, dirt.staged_bytes, dirt.close_due.take())
         };
         match pool.commit_plan(AllocPurpose::Normal, now_ns()) {
-            Ok(ticket) => (ticket, covers, staged_at_plan),
+            Ok(ticket) => (ticket, covers, staged_at_plan, promised),
             Err(error) => {
                 if let Ok(mut dirt) = durability.dirt.lock() {
                     dirt.stalled = true;
+                    restore_close_due(&mut dirt, promised);
                 }
                 durability.signal.notify_all();
                 return Err(mount_error(&error));
             }
         }
     };
-    let executed = ticket.execute();
+    drop(plan_timer);
+    let planned_bytes = scalefs_core::perftrace::enabled().then(|| ticket.planned_io().1);
+    let executed = {
+        let _t = scalefs_core::perftrace::start(scalefs_core::perftrace::C::CommitExecute, 0);
+        ticket.execute()
+    };
+    if let Some(bytes) = planned_bytes {
+        scalefs_core::perftrace::add(scalefs_core::perftrace::C::CommitIo, 0, bytes);
+    }
+    let _publish_timer =
+        scalefs_core::perftrace::start(scalefs_core::perftrace::C::CommitPublish, 0);
     let result = {
         let mut pool = pool.write().map_err(|_| MountError::Io)?;
         let settle = |durability: &Durability| {
@@ -201,6 +217,9 @@ fn commit_ticketed<D: SharedDevice>(
                 dirt.staged_bytes = dirt.staged_bytes.saturating_sub(staged_at_plan);
                 dirt.stalled = false;
                 dirt.first_dirty = dirt.dirty.then(Instant::now);
+                if !dirt.dirty {
+                    dirt.close_due = None;
+                }
             }
         };
         match executed {
@@ -226,6 +245,7 @@ fn commit_ticketed<D: SharedDevice>(
                 Err(error) => {
                     if let Ok(mut dirt) = durability.dirt.lock() {
                         dirt.stalled = true;
+                        restore_close_due(&mut dirt, promised);
                     }
                     Err(mount_error(&error))
                 }
@@ -236,10 +256,17 @@ fn commit_ticketed<D: SharedDevice>(
     result
 }
 
+fn restore_close_due(dirt: &mut Dirt, promised: Option<Instant>) {
+    if let Some(due) = promised {
+        dirt.close_due = Some(dirt.close_due.map_or(due, |current| current.min(due)));
+    }
+}
+
 fn commit_group<D: SharedDevice>(
     pool: &RwLock<Pool<D>>,
     durability: &Durability,
 ) -> Result<(), MountError> {
+    let _t = scalefs_core::perftrace::start(scalefs_core::perftrace::C::CommitGroup, 0);
     {
         let mut dirt = durability.dirt.lock().map_err(|_| MountError::Io)?;
         let needed = dirt.epoch;
@@ -296,6 +323,12 @@ fn debounce_loop<D: SharedDevice>(pool: &Arc<RwLock<Pool<D>>>, durability: &Arc<
                     if since >= DEBOUNCE_QUIET {
                         break;
                     }
+                    let close_left = dirt
+                        .close_due
+                        .map(|due| due.saturating_duration_since(Instant::now()));
+                    if close_left == Some(Duration::ZERO) {
+                        break;
+                    }
                     let quiet_left = DEBOUNCE_QUIET - since;
                     let nap = match dirt.first_dirty {
                         Some(first) => {
@@ -303,6 +336,7 @@ fn debounce_loop<D: SharedDevice>(pool: &Arc<RwLock<Pool<D>>>, durability: &Arc<
                         }
                         None => quiet_left,
                     };
+                    let nap = close_left.map_or(nap, |left| nap.min(left));
                     let Ok(waited) = durability.signal.wait_timeout(dirt, nap) else {
                         return;
                     };
@@ -389,7 +423,20 @@ fn claim_ownership<D: BlockDevice>(
 }
 
 fn is_orphanage_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(ORPHANAGE)
+    if name.eq_ignore_ascii_case(ORPHANAGE) {
+        return true;
+    }
+    if !name.starts_with('.') || name.len() > ORPHANAGE.len() * 4 {
+        return false;
+    }
+    let fold = |text: &str| {
+        scalefs_core::dirent::fold_name(
+            scalefs_core::NEWEST_SUPPORTED_UNICODE_VERSION,
+            scalefs_core::CaseSensitivity::InsensitivePreserving,
+            text,
+        )
+    };
+    fold(name) == fold(ORPHANAGE)
 }
 
 pub fn is_reserved(parent: u64, name: &str) -> bool {
@@ -520,7 +567,10 @@ impl<D: SharedDevice> MountCore<D> {
         if self.poisoned() {
             return Err(MountError::Io);
         }
-        match self.pool.read() {
+        let wait = scalefs_core::perftrace::start(scalefs_core::perftrace::C::PoolReadWait, 0);
+        let guard = self.pool.read();
+        drop(wait);
+        match guard {
             Ok(pool) => Ok(op(&pool)),
             Err(_) => Err(MountError::Io),
         }
@@ -530,7 +580,10 @@ impl<D: SharedDevice> MountCore<D> {
         if self.poisoned() {
             return Err(MountError::Io);
         }
-        match self.pool.write() {
+        let wait = scalefs_core::perftrace::start(scalefs_core::perftrace::C::PoolWriteWait, 0);
+        let guard = self.pool.write();
+        drop(wait);
+        match guard {
             Ok(mut pool) => Ok(op(&mut pool)),
             Err(_) => Err(MountError::Io),
         }
@@ -560,10 +613,12 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn getattr(&self, inode: u64) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Getattr, 0);
         self.with_pool(|pool| self.make_attr(pool, inode))?
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Lookup, 0);
         if is_reserved(parent, name) {
             return Err(MountError::NotFound);
         }
@@ -574,6 +629,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn readdir(&self, inode: u64) -> Result<Vec<DirEntry>, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Readdir, 0);
         self.with_pool(|pool| {
             let entries = pool.readdir(inode).map_err(|e| mount_error(&e))?;
             Ok(entries
@@ -584,6 +640,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn readdir_hashed(&self, inode: u64) -> Result<Vec<HashedEntry>, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Readdir, 0);
         self.with_pool(|pool| {
             let entries = pool.readdir_hashed(inode).map_err(|e| mount_error(&e))?;
             Ok(entries
@@ -594,10 +651,12 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn read(&self, inode: u64, offset: u64, len: usize) -> Result<Vec<u8>, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Read, 0);
         self.with_pool(|pool| pool.read(inode, offset, len).map_err(|e| mount_error(&e)))?
     }
 
     pub fn statfs(&self) -> Result<StatFs, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Statfs, 0);
         self.with_pool(|pool| {
             let block = u64::from(pool.superblock().geometry.logical_block_size);
             let mut capacity = 0u64;
@@ -622,6 +681,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn walk(&self, path: &str) -> Result<u64, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Walk, 0);
         self.with_pool(|pool| {
             let mut inode = ROOT_INODE;
             for component in path.split(['\\', '/']).filter(|c| !c.is_empty()) {
@@ -647,6 +707,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn release(&self, inode: u64) {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Release, 0);
         let free = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -684,6 +745,7 @@ impl<D: SharedDevice> MountCore<D> {
         uid: u32,
         gid: u32,
     ) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Create, 0);
         let durability = self.durability()?;
         if is_reserved(parent, name) {
             return Err(MountError::Denied);
@@ -706,6 +768,7 @@ impl<D: SharedDevice> MountCore<D> {
         uid: u32,
         gid: u32,
     ) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Mkdir, 0);
         let durability = self.durability()?;
         if is_reserved(parent, name) {
             return Err(MountError::Denied);
@@ -728,6 +791,7 @@ impl<D: SharedDevice> MountCore<D> {
         uid: u32,
         gid: u32,
     ) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::OtherMut, 0);
         let durability = self.durability()?;
         if is_reserved(parent, name) {
             return Err(MountError::Denied);
@@ -755,6 +819,7 @@ impl<D: SharedDevice> MountCore<D> {
         uid: u32,
         gid: u32,
     ) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::OtherMut, 0);
         let durability = self.durability()?;
         if is_reserved(parent, name) {
             return Err(MountError::Denied);
@@ -780,6 +845,7 @@ impl<D: SharedDevice> MountCore<D> {
         value: &[u8],
         flags: u32,
     ) -> Result<(), MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::OtherMut, 0);
         let durability = self.durability()?;
         if !xattr_namespace_allowed(name) {
             return Err(MountError::NotSupported);
@@ -804,6 +870,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn removexattr(&self, inode: u64, name: &str) -> Result<(), MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::OtherMut, 0);
         let durability = self.durability()?;
         if !xattr_namespace_allowed(name) {
             return Err(MountError::NotSupported);
@@ -822,6 +889,7 @@ impl<D: SharedDevice> MountCore<D> {
         new_parent: u64,
         new_name: &str,
     ) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::OtherMut, 0);
         let durability = self.durability()?;
         if is_reserved(new_parent, new_name) {
             return Err(MountError::Denied);
@@ -841,6 +909,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn write(&self, inode: u64, offset: u64, data: &[u8]) -> Result<u32, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Write, 0);
         let durability = self.durability()?;
         self.with_pool_mut(|pool| {
             pool.write(inode, offset, data, now_ns())
@@ -851,6 +920,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn unlink(&self, parent: u64, name: &str) -> Result<(), MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Unlink, 0);
         let durability = self.durability()?;
         if is_reserved(parent, name) {
             return Err(MountError::NotFound);
@@ -878,6 +948,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn rmdir(&self, parent: u64, name: &str) -> Result<(), MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Rmdir, 0);
         let durability = self.durability()?;
         if is_reserved(parent, name) {
             return Err(MountError::NotFound);
@@ -914,6 +985,7 @@ impl<D: SharedDevice> MountCore<D> {
         new_name: &str,
         replace: bool,
     ) -> Result<(), MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Rename, 0);
         let durability = self.durability()?;
         if is_reserved(old_parent, old_name) {
             return Err(MountError::NotFound);
@@ -934,7 +1006,11 @@ impl<D: SharedDevice> MountCore<D> {
             }
             let mut state = self.state.lock().map_err(|_| MountError::Io)?;
             match pool.lookup(new_parent, new_name) {
-                Ok(existing) if existing.inode == source.inode => {}
+                Ok(existing) if existing.inode == source.inode => {
+                    if old_parent != new_parent || existing.name != source.name {
+                        return Ok(());
+                    }
+                }
                 Ok(_) if !replace => return Err(MountError::Exists),
                 Ok(existing) => {
                     let source_is_dir = source.kind == EntryKind::Directory;
@@ -991,6 +1067,7 @@ impl<D: SharedDevice> MountCore<D> {
         inode: u64,
         is_dir: bool,
     ) -> Result<(), MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::UnlinkHandle, 0);
         let durability = self.durability()?;
         if is_reserved(parent, name) {
             return Ok(());
@@ -1026,6 +1103,7 @@ impl<D: SharedDevice> MountCore<D> {
     }
 
     pub fn setattr(&self, inode: u64, change: SetAttr) -> Result<MountAttr, MountError> {
+        let _pt = scalefs_core::perftrace::start(scalefs_core::perftrace::C::Setattr, 0);
         let durability = self.durability()?;
         self.with_pool_mut(|pool| {
             let now = now_ns();
@@ -1093,10 +1171,16 @@ impl<D: SharedDevice> MountCore<D> {
             dirt = waited;
         }
         dirt.committing = true;
+        dirt.held = true;
+        let owed = dirt.close_due.is_some() && dirt.dirty && !dirt.poisoned;
         drop(dirt);
-        MaintenanceHold {
+        let hold = MaintenanceHold {
             durability: Some(Arc::clone(&writes.durability)),
+        };
+        if owed {
+            let _ = commit_ticketed(&self.pool, &writes.durability);
         }
+        hold
     }
 
     pub fn commit_if_dirty(&self) -> Result<(), MountError> {
@@ -1108,6 +1192,32 @@ impl<D: SharedDevice> MountCore<D> {
 
     pub fn commit(&self) -> Result<(), MountError> {
         self.commit_if_dirty()
+    }
+
+    pub fn commit_within(&self, bound: Duration) -> Result<(), MountError> {
+        let Some(writes) = &self.writes else {
+            return Ok(());
+        };
+        let timer_running = writes
+            .timer
+            .lock()
+            .is_ok_and(|timer| timer.as_ref().is_some_and(|handle| !handle.is_finished()));
+        {
+            let mut dirt = writes.durability.dirt.lock().map_err(|_| MountError::Io)?;
+            if dirt.poisoned {
+                return Err(MountError::Io);
+            }
+            if timer_running && !dirt.stalled && !dirt.shutdown && !dirt.held {
+                if dirt.dirty {
+                    let due = Instant::now() + bound;
+                    dirt.close_due = Some(dirt.close_due.map_or(due, |current| current.min(due)));
+                    drop(dirt);
+                    writes.durability.signal.notify_all();
+                }
+                return Ok(());
+            }
+        }
+        commit_group(&self.pool, &writes.durability)
     }
 }
 
@@ -1131,6 +1241,7 @@ impl Drop for MaintenanceHold {
         if let Some(durability) = &self.durability {
             if let Ok(mut dirt) = durability.dirt.lock() {
                 dirt.committing = false;
+                dirt.held = false;
             }
             durability.signal.notify_all();
         }
@@ -1272,6 +1383,72 @@ mod tests {
             core.with_pool(|pool| pool.committed_tx()).unwrap(),
             before + 1
         );
+    }
+
+    #[test]
+    fn a_bounded_close_during_a_maintenance_hold_commits_before_it_is_answered() {
+        let core = Arc::new(fresh_rw());
+        let file = core.create(ROOT_INODE, "held", 0o644, 0, 0).unwrap();
+        core.write(file.inode, 0, b"written, then closed").unwrap();
+        let before = core.with_pool(|pool| pool.committed_tx()).unwrap();
+
+        let hold = core.maintenance_hold();
+        let closer = {
+            let core = Arc::clone(&core);
+            std::thread::spawn(move || {
+                let answer = core.commit_within(Duration::from_secs(1));
+                let committed = core.with_pool(|pool| pool.committed_tx()).unwrap();
+                (answer, committed)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !closer.is_finished(),
+            "a close under a maintenance hold was answered before any commit could run"
+        );
+        assert_eq!(core.with_pool(|pool| pool.committed_tx()).unwrap(), before);
+        drop(hold);
+        let (answer, committed_when_answered) = closer.join().expect("no panic");
+        answer.expect("the close commits once the job ends");
+        assert!(
+            committed_when_answered > before,
+            "the close was answered before its writes were committed"
+        );
+        core.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_maintenance_hold_first_commits_the_bounded_closes_already_answered() {
+        let core = fresh_rw();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let name = format!("closed{attempts}");
+            let file = core.create(ROOT_INODE, &name, 0o644, 0, 0).unwrap();
+            core.commit().unwrap();
+            let before = core.with_pool(|pool| pool.committed_tx()).unwrap();
+            let started = Instant::now();
+            core.write(file.inode, 0, b"written, then closed").unwrap();
+            core.commit_within(Duration::from_secs(5)).unwrap();
+            let deferred = core.with_pool(|pool| pool.committed_tx()).unwrap() == before;
+            let hold = core.maintenance_hold();
+            let committed = core.with_pool(|pool| pool.committed_tx()).unwrap();
+            let span = started.elapsed();
+            drop(hold);
+            if span < DEBOUNCE_QUIET * 4 / 5 {
+                assert!(deferred, "the bounded close committed by itself");
+                assert!(
+                    committed > before,
+                    "the hold was handed over with an answered close still uncommitted"
+                );
+                break;
+            }
+            assert!(
+                attempts < 5,
+                "five attempts in a row overran the quiet window"
+            );
+        }
+        core.shutdown().unwrap();
     }
 
     #[test]
@@ -1497,6 +1674,168 @@ mod tests {
             "committed suspiciously early ({elapsed:?}) — not via the max-age path",
         );
         core.shutdown().unwrap();
+    }
+
+    fn bounded_core<D: SharedDevice + Send + Sync + 'static>(
+        device: D,
+        label: &str,
+    ) -> (MountCore<D>, Arc<RwLock<Pool<D>>>) {
+        let mut pool = Pool::create(
+            device,
+            CreateParams {
+                geometry: geometry(),
+                pool_id: PoolId([0x2C; 16]),
+                device_id: DeviceId([0x2D; 16]),
+                case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                dirent_hash_seed: 9,
+                label: label.to_string(),
+                created_at_ns: NOW,
+            },
+        )
+        .unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let shared = Arc::new(RwLock::new(pool));
+        (MountCore::read_write(Arc::clone(&shared)), shared)
+    }
+
+    fn memory_device() -> Arc<MemoryBlockDevice> {
+        Arc::new(MemoryBlockDevice::new(
+            scalefs_core::member_image_len(geometry().capacity_bytes()) as usize,
+        ))
+    }
+
+    #[test]
+    fn a_bounded_close_commits_within_its_bound_under_a_steady_writer() {
+        let (core, shared) = bounded_core(memory_device(), "bound");
+        let baseline = shared.read().unwrap().committed_tx();
+        let log = core.create(ROOT_INODE, "log", 0o644, 0, 0).unwrap();
+        let closed = core.create(ROOT_INODE, "closed", 0o644, 0, 0).unwrap();
+        core.write(closed.inode, 0, b"written, then closed")
+            .unwrap();
+        let closed_at = Instant::now();
+        core.commit_within(Duration::from_secs(1)).unwrap();
+        let mut offset = 0u64;
+        let committed_at = loop {
+            if shared.read().unwrap().committed_tx() > baseline {
+                break closed_at.elapsed();
+            }
+            assert!(
+                closed_at.elapsed() < DEBOUNCE_MAX_AGE,
+                "a bounded close was not committed within its bound"
+            );
+            core.write(log.inode, offset, b"x").unwrap();
+            offset += 1;
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(
+            committed_at >= Duration::from_millis(900),
+            "committed after {committed_at:?}: sooner than the bound asked"
+        );
+        assert!(
+            committed_at < Duration::from_secs(3),
+            "committed after {committed_at:?}: by the max-age backstop, not the bound"
+        );
+        core.shutdown().unwrap();
+    }
+
+    struct SlowFlush(MemoryBlockDevice);
+
+    impl BlockDevice for SlowFlush {
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> scalefs_core::Result<()> {
+            self.0.read_at(offset, buf)
+        }
+
+        fn write_at(&self, offset: u64, data: &[u8]) -> scalefs_core::Result<()> {
+            self.0.write_at(offset, data)
+        }
+
+        fn flush(&self) -> scalefs_core::Result<()> {
+            std::thread::sleep(Duration::from_millis(5));
+            self.0.flush()
+        }
+    }
+
+    #[test]
+    fn bounded_closes_share_a_commit_per_window() {
+        let geometry = Geometry {
+            zone_count: 1024,
+            ..geometry()
+        };
+        let device = Arc::new(SlowFlush(MemoryBlockDevice::new(
+            scalefs_core::member_image_len(geometry.capacity_bytes()) as usize,
+        )));
+        let mut pool = Pool::create(
+            device,
+            CreateParams {
+                geometry,
+                pool_id: PoolId([0x2E; 16]),
+                device_id: DeviceId([0x2F; 16]),
+                case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                dirent_hash_seed: 9,
+                label: "window".to_string(),
+                created_at_ns: NOW,
+            },
+        )
+        .unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let shared = Arc::new(RwLock::new(pool));
+        let core = Arc::new(MountCore::read_write(Arc::clone(&shared)));
+        let baseline = shared.read().unwrap().committed_tx();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let core = Arc::clone(&core);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let log = core.create(ROOT_INODE, "log", 0o644, 0, 0).unwrap();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    core.write(log.inode, 0, b"x").unwrap();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        let started = Instant::now();
+        let mut closes = 0u32;
+        while started.elapsed() < Duration::from_millis(3200) {
+            let file = core
+                .create(ROOT_INODE, &format!("f{closes}"), 0o644, 0, 0)
+                .unwrap();
+            core.write(file.inode, 0, b"small file").unwrap();
+            core.commit_within(Duration::from_secs(1)).unwrap();
+            closes += 1;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let commits = shared.read().unwrap().committed_tx() - baseline;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(closes >= 20, "only {closes} closes ran");
+        assert!(
+            (2..=6).contains(&commits),
+            "{commits} commits for {closes} bounded closes in 3.2 s (one per ~1 s window expected)"
+        );
+        core.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_bounded_close_on_a_failing_pool_reports_the_failure() {
+        let device = scalefs_core::FaultDevice::new(scalefs_core::member_image_len(
+            geometry().capacity_bytes(),
+        ) as usize);
+        let switch = device.switch();
+        let (core, _shared) = bounded_core(Arc::new(device), "failing");
+        let file = core.create(ROOT_INODE, "f", 0o644, 0, 0).unwrap();
+        core.write(file.inode, 0, b"staged").unwrap();
+        switch.fail();
+        assert!(core.commit().is_err(), "the commit was meant to fail");
+        assert!(
+            core.commit_within(Duration::from_secs(1)).is_err(),
+            "a bounded close on a failing pool answered success"
+        );
+        switch.heal();
+        drop(core);
     }
 
     #[test]

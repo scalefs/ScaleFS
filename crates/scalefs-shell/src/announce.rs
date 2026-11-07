@@ -57,6 +57,17 @@ impl Change {
     }
 }
 
+pub fn announce_from_helper(letter: char, change: Change) {
+    announce_here(letter, change);
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let profile = std::env::var("USERPROFILE").unwrap_or_default();
+    ffi::debug_line(&format!(
+        "scalefsd session-announce: {} {}: announced (user {user}, profile {profile})",
+        change.word(),
+        letter.to_ascii_uppercase()
+    ));
+}
+
 pub fn announce_here(letter: char, change: Change) {
     let letter = letter.to_ascii_uppercase();
     if !letter.is_ascii_uppercase() {

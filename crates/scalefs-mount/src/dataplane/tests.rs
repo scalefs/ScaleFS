@@ -6,9 +6,9 @@ use scalefs_core::layout::{CaseSensitivity, DeviceId, PoolId};
 use scalefs_core::pool::{CreateParams, Pool};
 use scalefs_core::{Geometry, MemoryBlockDevice};
 
-use super::wire::{op, setattr_mask, status};
-use super::{SessionEnd, SessionParams, serve_connection};
-use crate::mountcore::MountCore;
+use super::wire::{op, request_flags, setattr_mask, status};
+use super::{CloseDurability, SessionEnd, SessionParams, serve_connection};
+use crate::mountcore::{DEBOUNCE_QUIET, MountCore};
 
 const NOW: i64 = 1_700_000_000_000_000_000;
 const POOL_ID: [u8; 16] = [0x77; 16];
@@ -25,7 +25,13 @@ fn geometry() -> Geometry {
     }
 }
 
+type TestPool = Arc<RwLock<Pool<Arc<MemoryBlockDevice>>>>;
+
 fn new_core() -> Arc<MountCore<Arc<MemoryBlockDevice>>> {
+    new_core_and_pool().0
+}
+
+fn new_core_and_pool() -> (Arc<MountCore<Arc<MemoryBlockDevice>>>, TestPool) {
     let device = Arc::new(MemoryBlockDevice::new(scalefs_core::member_image_len(
         geometry().capacity_bytes(),
     ) as usize));
@@ -42,12 +48,21 @@ fn new_core() -> Arc<MountCore<Arc<MemoryBlockDevice>>> {
         },
     )
     .unwrap();
-    Arc::new(MountCore::read_write(Arc::new(RwLock::new(pool))))
+    let pool = Arc::new(RwLock::new(pool));
+    (Arc::new(MountCore::read_write(Arc::clone(&pool))), pool)
 }
 
 fn serve(
     core: Arc<MountCore<Arc<MemoryBlockDevice>>>,
     read_only: bool,
+) -> (TcpStream, std::thread::JoinHandle<SessionEnd>) {
+    serve_with_policy(core, read_only, CloseDurability::default())
+}
+
+fn serve_with_policy(
+    core: Arc<MountCore<Arc<MemoryBlockDevice>>>,
+    read_only: bool,
+    close_durability: CloseDurability,
 ) -> (TcpStream, std::thread::JoinHandle<SessionEnd>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -55,10 +70,11 @@ fn serve(
         pool_id: POOL_ID,
         token: TOKEN.to_vec(),
         read_only,
+        close_durability,
     };
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        serve_connection(&mut stream, &core, &session, None)
+        serve_connection(&mut stream, &core, &session, None, None)
     });
     (TcpStream::connect(addr).unwrap(), server)
 }
@@ -74,13 +90,17 @@ impl Client {
     }
 
     fn call(&mut self, op_code: u16, body: &[u8]) -> (i16, Vec<u8>) {
+        self.call_flagged(op_code, 0, body)
+    }
+
+    fn call_flagged(&mut self, op_code: u16, flags: u16, body: &[u8]) -> (i16, Vec<u8>) {
         let req_id = self.next_id;
         self.next_id += 1;
         let mut frame = Vec::with_capacity(12 + body.len());
         frame.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
         frame.extend_from_slice(&req_id.to_le_bytes());
         frame.extend_from_slice(&op_code.to_le_bytes());
-        frame.extend_from_slice(&0u16.to_le_bytes());
+        frame.extend_from_slice(&flags.to_le_bytes());
         frame.extend_from_slice(body);
         self.stream.write_all(&frame).unwrap();
 
@@ -183,10 +203,11 @@ fn serve_with_barrier(
         pool_id: POOL_ID,
         token: TOKEN.to_vec(),
         read_only: false,
+        close_durability: CloseDurability::default(),
     };
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        serve_connection(&mut stream, &core, &session, Some(barrier.as_ref()))
+        serve_connection(&mut stream, &core, &session, Some(barrier.as_ref()), None)
     });
     (TcpStream::connect(addr).unwrap(), server)
 }
@@ -505,10 +526,11 @@ fn read_only_sessions_advertise_and_refuse() {
         pool_id: POOL_ID,
         token: TOKEN.to_vec(),
         read_only: true,
+        close_durability: CloseDurability::default(),
     };
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        serve_connection(&mut stream, &core, &session, None)
+        serve_connection(&mut stream, &core, &session, None, None)
     });
     let mut client = Client::new(TcpStream::connect(addr).unwrap());
 
@@ -551,4 +573,178 @@ fn hostile_bodies_answer_protocol_errors() {
     assert_eq!(code, status::PROTOCOL);
     client.bye();
     server.join().unwrap();
+}
+
+fn create_file(client: &mut Client, name: &str) -> u64 {
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&bytes_field(name.as_bytes()));
+    body.extend_from_slice(&0o644u32.to_le_bytes());
+    body.extend_from_slice(&[0u8; 8]);
+    attr_inode(&client.ok(op::CREATE, &body))
+}
+
+fn write_body(inode: u64, offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut body = inode.to_le_bytes().to_vec();
+    body.extend_from_slice(&offset.to_le_bytes());
+    body.extend_from_slice(&bytes_field(data));
+    body
+}
+
+fn fsync_body(inode: u64) -> Vec<u8> {
+    let mut body = inode.to_le_bytes().to_vec();
+    body.push(0);
+    body
+}
+
+fn inside_the_quiet_window<T>(mut attempt: impl FnMut(u32) -> (std::time::Duration, T)) -> T {
+    for n in 0..5 {
+        let (span, seen) = attempt(n);
+        if span < DEBOUNCE_QUIET * 4 / 5 {
+            return seen;
+        }
+    }
+    panic!("five attempts in a row overran the debounce quiet window");
+}
+
+fn close_once(client: &mut Client, pool: &TestPool, name: &str, flagged: bool) -> (u64, u64) {
+    let file = create_file(client, name);
+    let flags = if flagged {
+        request_flags::FSYNC_ON_CLOSE
+    } else {
+        0
+    };
+    inside_the_quiet_window(|n| {
+        client.ok(op::FSYNC, &fsync_body(file));
+        let started = std::time::Instant::now();
+        let before = pool.read().unwrap().committed_tx();
+        client.ok(
+            op::WRITE,
+            &write_body(file, u64::from(n) * 16, b"closed data"),
+        );
+        let (code, _) = client.call_flagged(op::FSYNC, flags, &fsync_body(file));
+        assert_eq!(code, status::OK, "the FSYNC failed");
+        let after = pool.read().unwrap().committed_tx();
+        (started.elapsed(), (before, after))
+    })
+}
+
+#[test]
+fn a_written_close_commits_before_it_is_answered_on_a_commit_on_close_serving() {
+    let (core, pool) = new_core_and_pool();
+    let (stream, server) =
+        serve_with_policy(Arc::clone(&core), false, CloseDurability::CommitOnClose);
+    let mut client = Client::new(stream);
+    client.hello();
+    let (before, after) = close_once(&mut client, &pool, "closed", true);
+    assert!(
+        after > before,
+        "a commit-on-close serving answered a written close before committing it"
+    );
+    client.bye();
+    assert_eq!(server.join().unwrap(), SessionEnd::Bye);
+}
+
+#[test]
+fn the_default_serving_commits_a_written_close_within_a_second() {
+    assert_eq!(
+        CloseDurability::default(),
+        CloseDurability::Bounded(std::time::Duration::from_secs(1))
+    );
+    let (core, pool) = new_core_and_pool();
+    let (stream, server) = serve(Arc::clone(&core), false);
+    let mut client = Client::new(stream);
+    client.hello();
+    let (before, after) = close_once(&mut client, &pool, "closed", true);
+    let answered = std::time::Instant::now();
+    assert_eq!(
+        after, before,
+        "the default serving committed inside the written close"
+    );
+    while pool.read().unwrap().committed_tx() == before {
+        assert!(
+            answered.elapsed() < std::time::Duration::from_secs(3),
+            "the closed file's writes were not committed within the window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        answered.elapsed() < std::time::Duration::from_millis(1500),
+        "committed {:?} after the close was answered: later than its one-second window",
+        answered.elapsed()
+    );
+    client.bye();
+    assert_eq!(server.join().unwrap(), SessionEnd::Bye);
+}
+
+#[test]
+fn a_bounded_serving_answers_a_written_close_before_committing_it() {
+    let (core, pool) = new_core_and_pool();
+    let (stream, server) = serve_with_policy(
+        Arc::clone(&core),
+        false,
+        CloseDurability::Bounded(std::time::Duration::from_secs(5)),
+    );
+    let mut client = Client::new(stream);
+    client.hello();
+    let (before, after) = close_once(&mut client, &pool, "closed", true);
+    assert_eq!(
+        after, before,
+        "a bounded serving committed inside the written close"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while pool.read().unwrap().committed_tx() == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the closed file's writes were never committed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    client.bye();
+    assert_eq!(server.join().unwrap(), SessionEnd::Bye);
+}
+
+#[test]
+fn an_explicit_flush_on_a_bounded_serving_commits_before_it_is_answered() {
+    let (core, pool) = new_core_and_pool();
+    let (stream, server) = serve_with_policy(
+        Arc::clone(&core),
+        false,
+        CloseDurability::Bounded(std::time::Duration::from_secs(5)),
+    );
+    let mut client = Client::new(stream);
+    client.hello();
+    let (before, after) = close_once(&mut client, &pool, "flushed", false);
+    assert!(
+        after > before,
+        "an explicit flush on a bounded serving was answered before its commit"
+    );
+    client.bye();
+    assert_eq!(server.join().unwrap(), SessionEnd::Bye);
+}
+
+#[test]
+fn a_flagged_close_on_a_read_only_serving_is_answered() {
+    let (core, pool) = new_core_and_pool();
+    let read_only = Arc::new(MountCore::read_only(Arc::clone(&pool)));
+    drop(core);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let session = SessionParams {
+        pool_id: POOL_ID,
+        token: TOKEN.to_vec(),
+        read_only: true,
+        close_durability: CloseDurability::Bounded(std::time::Duration::from_secs(1)),
+    };
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        serve_connection(&mut stream, &read_only, &session, None, None)
+    });
+    let mut client = Client::new(TcpStream::connect(addr).unwrap());
+    client.hello();
+    let before = pool.read().unwrap().committed_tx();
+    let (code, _) = client.call_flagged(op::FSYNC, request_flags::FSYNC_ON_CLOSE, &fsync_body(1));
+    assert_eq!(code, status::OK);
+    assert_eq!(pool.read().unwrap().committed_tx(), before);
+    client.bye();
+    assert_eq!(server.join().unwrap(), SessionEnd::Bye);
 }

@@ -354,7 +354,9 @@ impl Chaos {
                 }
                 self.settle(&pool);
             }
-            Err(ScaleFsError::OutOfSpace) => {}
+            Err(ScaleFsError::OutOfSpace) => {
+                self.observe_heal_commits(&pool);
+            }
             Err(error) => self.fail(&format!("retire refused unexpectedly: {error:?}")),
         }
     }
@@ -395,7 +397,10 @@ impl Chaos {
                         )),
                     };
                     pool = reopened;
-                    for snapshot in pool.snapshot_list() {
+                    let snapshots = pool.snapshot_list().unwrap_or_else(|error| {
+                        self.fail(&format!("snapshot_list failed: {error:?}"))
+                    });
+                    for snapshot in snapshots {
                         pool.snapshot_release(&snapshot.name)
                             .unwrap_or_else(|error| {
                                 self.fail(&format!(
@@ -462,7 +467,9 @@ impl Chaos {
         let (mut pool, _switches) = self.open_whole("run maintenance");
         match self.rng.next_u64() % 4 {
             0 => {
-                let snapshots = pool.snapshot_list();
+                let snapshots = pool
+                    .snapshot_list()
+                    .unwrap_or_else(|error| self.fail(&format!("snapshot_list failed: {error:?}")));
                 if snapshots.len() >= 6 {
                     let victim = snapshots[0].name.clone();
                     pool.snapshot_release(&victim).unwrap_or_else(|error| {
@@ -478,7 +485,9 @@ impl Chaos {
                 }
             }
             1 => {
-                let snapshots = pool.snapshot_list();
+                let snapshots = pool
+                    .snapshot_list()
+                    .unwrap_or_else(|error| self.fail(&format!("snapshot_list failed: {error:?}")));
                 if !snapshots.is_empty() {
                     let victim = snapshots[(self.rng.next_u64() as usize) % snapshots.len()]
                         .name
@@ -539,7 +548,10 @@ impl Chaos {
                 self.settle(&pool);
                 self.commit_and_settle(&mut pool);
             }
-            Err(_) => self.finish_with_writes(pool),
+            Err(_) => {
+                self.observe_heal_commits(&pool);
+                self.finish_with_writes(pool)
+            }
         }
     }
 
@@ -610,7 +622,12 @@ impl Chaos {
     }
 
     fn random_chunk(&mut self) -> Vec<u8> {
-        let len = 1024 + (self.rng.next_u64() as usize % (11 * 1024));
+        let chunk = crate::fs::FILE_DATA_CHUNK;
+        let len = if self.rng.next_u64().is_multiple_of(4) {
+            chunk + 1 + (self.rng.next_u64() as usize % (2 * chunk))
+        } else {
+            1024 + (self.rng.next_u64() as usize % (11 * 1024))
+        };
         let mut seed = self.rng.next_u64();
         (0..len)
             .map(|_| {
@@ -631,6 +648,18 @@ impl Chaos {
 
     fn pool_tx(&self, pool: &Pool<Dev>) -> u64 {
         pool.committed_tx()
+    }
+
+    fn observe_heal_commits(&mut self, pool: &Pool<Dev>) {
+        let tx = self.pool_tx(pool);
+        if tx < self.expected.0 {
+            self.fail(&format!(
+                "the live pool's committed transaction moved BACKWARDS \
+                 ({} -> {tx}) without a reopen",
+                self.expected.0,
+            ));
+        }
+        self.expected.0 = tx;
     }
 
     fn settle(&mut self, pool: &Pool<Dev>) {

@@ -1,4 +1,5 @@
 use scalefs_ipc::json::{Value, object, parse};
+use scalefs_mount::dataplane::CloseDurability;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,14 @@ pub struct RecordedMount {
     pub mountpoint: String,
     pub read_only: bool,
     pub kernel_device: Option<String>,
+    pub close_durability: Option<CloseDurability>,
+}
+
+fn recorded_close_durability(row: &Value) -> Option<CloseDurability> {
+    if row.get("close_durability").is_none() && row.get("close_bound_ms").is_none() {
+        return None;
+    }
+    Some(crate::serving::close_durability_param(row).unwrap_or(CloseDurability::CommitOnClose))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +227,7 @@ fn parse_record(entry: &Value, tombstone: bool) -> Option<RecordedPool> {
                                 .get("kernel_device")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
+                            close_durability: recorded_close_durability(row),
                         })
                     })
                     .collect()
@@ -256,6 +266,9 @@ fn record_value(pool: &RecordedPool, tombstone: bool) -> Value {
                         ];
                         if let Some(device) = &mount.kernel_device {
                             row.push(("kernel_device", Value::Str(device.clone())));
+                        }
+                        if let Some(policy) = mount.close_durability {
+                            row.extend(crate::serving::close_durability_fields(policy));
                         }
                         object(row)
                     })
@@ -891,6 +904,7 @@ mod tests {
                 mountpoint: "/mnt/tank".to_string(),
                 read_only: false,
                 kernel_device: None,
+                close_durability: None,
             }],
             eject: None,
         }];
@@ -902,6 +916,7 @@ mod tests {
                 mountpoint: "D:".to_string(),
                 read_only: false,
                 kernel_device: Some(r"\\.\ScaleFsCtl".to_string()),
+                close_durability: Some(CloseDurability::CommitOnClose),
             }],
             eject: Some(EjectState {
                 phase: EjectPhase::Ejected,
@@ -919,6 +934,62 @@ mod tests {
                 .unwrap()
                 .contains("suppressed"),
             "no safe removal, no suppressed list",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_serves_close_policy_round_trips_with_its_letter() {
+        let dir = scratch_dir("close-policy");
+        let store = StateStore::open(&dir).unwrap();
+        let letter = |mountpoint: &str, close_durability| RecordedMount {
+            mountpoint: mountpoint.to_string(),
+            read_only: false,
+            kernel_device: Some(r"\\.\ScaleFsCtl".to_string()),
+            close_durability,
+        };
+        let pools = vec![RecordedPool {
+            name: "tank".to_string(),
+            pool_id: "aa55".to_string(),
+            members: vec!["E:\\pool\\a.img".to_string()],
+            mounts: vec![
+                letter("P:", Some(CloseDurability::CommitOnClose)),
+                letter(
+                    "Q:",
+                    Some(CloseDurability::Bounded(std::time::Duration::from_millis(
+                        2500,
+                    ))),
+                ),
+                letter("R:", None),
+            ],
+            eject: None,
+        }];
+        store.save(&pools, &[]).unwrap();
+        assert_eq!(store.load(), pools);
+
+        std::fs::write(
+            store.path(),
+            br#"{"pools":[{"name":"old","pool_id":"beef","members":["/dev/sdz"],"mounts":[
+                {"mountpoint":"E:","read_only":false,"kernel_device":"\\\\.\\ScaleFsCtl"},
+                {"mountpoint":"F:","read_only":false,"kernel_device":"\\\\.\\ScaleFsCtl",
+                 "close_durability":"sometimes"},
+                {"mountpoint":"G:","read_only":false,"kernel_device":"\\\\.\\ScaleFsCtl",
+                 "close_durability":"bounded","close_bound_ms":60000}]}]}"#,
+        )
+        .unwrap();
+        let loaded = store.load();
+        let policies: Vec<_> = loaded[0]
+            .mounts
+            .iter()
+            .map(|mount| mount.close_durability)
+            .collect();
+        assert_eq!(
+            policies,
+            vec![
+                None,
+                Some(CloseDurability::CommitOnClose),
+                Some(CloseDurability::CommitOnClose),
+            ],
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

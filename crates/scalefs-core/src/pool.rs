@@ -1,17 +1,19 @@
 use crate::device::{BlockDevice, PartitionView};
 use crate::error::{Result, ScaleFsError};
-use crate::format::{RecordKind, decode_record};
+use crate::format::{Expect, RecordKind, decode_record, is_stale};
 use crate::layout::{CaseSensitivity, DeviceId, Extent, Geometry, PoolId, superblock_slots};
 use crate::records::{
     Commit, FEATURE_INCOMPAT_MULTI_DEVICE, FEATURE_INCOMPAT_PARITY, FEATURE_INCOMPAT_THIN_METADATA,
-    Superblock, decode_commit, decode_superblock, encode_commit, encode_superblock,
+    RecordRef, Superblock, commit_record_len, decode_commit, decode_superblock, encode_commit,
+    encode_superblock,
 };
+use crate::runs::{FileRun, StripedRun};
 use crate::stripes::{ParityRecord, decode_parity_record, parity_record_len};
 use crate::topology::{MemberState, Topology, TopologyMember, decode_topology, encode_topology};
 use crate::tree::{
-    ITEM_FILE_EXTENT, ITEM_INODE, ITEM_POOL_STATE, ITEM_RETAINED_ROOT, InodeAttrs, MetadataKey,
-    MetadataTree, MetadataValue, ROOT_INODE, decode_internal_record, decode_leaf_record,
-    encode_internal_record, encode_leaf_record,
+    CacheStats, ITEM_FILE_EXTENT, ITEM_INODE, ITEM_POOL_STATE, ITEM_RETAINED_ROOT, InodeAttrs,
+    MetadataKey, MetadataTree, MetadataValue, PageRef, PageSource, ROOT_INODE, TreeMut, TreeRef,
+    decode_internal_record, decode_leaf_record, encode_internal_record, encode_leaf_record,
 };
 use crate::zones::{AllocPurpose, Allocation, ZoneAllocator, ZoneClass};
 use std::collections::HashSet;
@@ -66,6 +68,8 @@ pub struct RebuildReport {
 struct StripeHeal {
     moved: std::collections::HashMap<(u16, u64), Extent>,
     parity_extents: Vec<Extent>,
+    parity_crcs: Vec<u32>,
+    parity_tx: u64,
 }
 
 impl StripeHeal {
@@ -75,14 +79,30 @@ impl StripeHeal {
             .copied()
             .unwrap_or(old)
     }
+
+    fn apply(&self, run: &StripedRun) -> StripedRun {
+        StripedRun {
+            pieces: run
+                .pieces
+                .iter()
+                .map(|piece| self.new_data_extent(*piece))
+                .collect(),
+            parity: self.parity_extents.clone(),
+            parity_crcs: self.parity_crcs.clone(),
+            parity_tx: self.parity_tx,
+            ..run.clone()
+        }
+    }
 }
 
 type StripeMembers =
-    std::collections::HashMap<(u16, u64), std::collections::BTreeSet<(u16, u64, u64)>>;
+    std::collections::HashMap<(u16, u64), std::collections::BTreeSet<(u16, u64, u64, u32)>>;
 
 type PlacedStripe = (Vec<(u16, Allocation)>, Vec<(u16, Allocation)>);
 
-type LiveStripe = (Vec<Extent>, HashSet<(u16, u64)>);
+type LiveStripe = (StripedRun, HashSet<(u16, u64)>);
+
+type CopyGroups = Vec<(Vec<u8>, Vec<(usize, Extent)>)>;
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct ScrubReport {
@@ -92,12 +112,33 @@ pub struct ScrubReport {
     pub copies_repaired: u64,
     pub copies_unrepairable: u64,
     pub copies_missing: u64,
+    pub copies_stale: u64,
+}
+
+#[derive(Debug)]
+pub struct ScrubCursor {
+    report: ScrubReport,
+    dirty: HashSet<u16>,
+    visited: HashSet<(u16, u64)>,
+    stack: Vec<PageRef>,
+    chains_checked: bool,
 }
 
 impl ScrubReport {
     pub fn healthy(&self) -> bool {
         self.copies_bad == self.copies_repaired && self.copies_unrepairable == 0
     }
+}
+
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct TreeCensus {
+    pub leaf_pages: u64,
+    pub internal_pages: u64,
+    pub page_bytes: u64,
+    pub page_disk_bytes: u64,
+    pub items: u64,
+    pub runs: u64,
+    pub run_records: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -116,6 +157,11 @@ pub struct ReclaimReport {
 }
 
 type ImportCandidate<D> = (D, Superblock, Option<(Commit, Topology)>);
+
+struct ViewRefusal {
+    error: ScaleFsError,
+    damaged: bool,
+}
 
 #[derive(Debug)]
 pub struct Pool<D: BlockDevice> {
@@ -137,7 +183,8 @@ pub struct Pool<D: BlockDevice> {
     pub(crate) tree: MetadataTree,
     pub(crate) committed_tx: u64,
     pub(crate) read_only: bool,
-    pub(crate) last_metadata_root: Vec<Extent>,
+    pub(crate) last_metadata_root: PageRef,
+    pub(crate) stale_copies: std::sync::atomic::AtomicU64,
     pub(crate) dirty_members: HashSet<u16>,
     pub(crate) force_full_commit: bool,
     pub(crate) last_roster_members: Vec<TopologyMember>,
@@ -145,6 +192,12 @@ pub struct Pool<D: BlockDevice> {
     pub(crate) probe_staleness: std::time::Duration,
     pub(crate) suspects: std::sync::Mutex<HashSet<u16>>,
     pub(crate) commit_in_flight: bool,
+}
+
+impl<D: BlockDevice> PageSource for Pool<D> {
+    fn read_page(&self, page: &PageRef) -> Result<Vec<u8>> {
+        self.read_record(&page.copies, page.expect)
+    }
 }
 
 impl<D: BlockDevice> Pool<D> {
@@ -261,7 +314,7 @@ impl<D: BlockDevice> Pool<D> {
                 aux_record: None,
                 label: params.label.clone(),
             };
-            encode_superblock(&superblock)?;
+            encode_superblock(&superblock, 1)?;
             allocators.push(ZoneAllocator::new(geometry)?);
             superblocks.push(superblock);
             devices.push(format_member_wrapper(
@@ -272,7 +325,8 @@ impl<D: BlockDevice> Pool<D> {
         }
 
         let mut tree = MetadataTree::new();
-        tree.insert(
+        let fresh = tree.in_memory();
+        fresh.insert(
             MetadataKey {
                 object_id: 0,
                 item_type: ITEM_POOL_STATE,
@@ -280,7 +334,7 @@ impl<D: BlockDevice> Pool<D> {
             },
             MetadataValue::PoolState { next_object_id: 2 },
         )?;
-        tree.insert(
+        fresh.insert(
             MetadataKey {
                 object_id: ROOT_INODE,
                 item_type: ITEM_INODE,
@@ -332,7 +386,11 @@ impl<D: BlockDevice> Pool<D> {
             tree,
             committed_tx: 0,
             read_only: false,
-            last_metadata_root: Vec::new(),
+            last_metadata_root: PageRef {
+                copies: Vec::new(),
+                expect: Expect { crc: 0, tx: 0 },
+            },
+            stale_copies: std::sync::atomic::AtomicU64::new(0),
             dirty_members: HashSet::new(),
             force_full_commit: true,
             last_roster_members: Vec::new(),
@@ -396,7 +454,8 @@ impl<D: BlockDevice> Pool<D> {
                     let mut pool = Self {
                         devices: vec![device],
                         committed_tx: commit.tx_id,
-                        last_metadata_root: vec![commit.metadata_root],
+                        last_metadata_root: root_of(&commit),
+                        stale_copies: std::sync::atomic::AtomicU64::new(0),
                         dirty_members: HashSet::new(),
                         force_full_commit: false,
                         last_roster_members: Vec::new(),
@@ -469,7 +528,7 @@ impl<D: BlockDevice> Pool<D> {
             superblock.require_supported_unicode_version()?;
             let chain = best_candidate(&device).ok().and_then(|(_, commit)| {
                 let aux = commit.aux_root?;
-                let bytes = read_extent_from_set(std::slice::from_ref(&device), aux).ok()?;
+                let bytes = read_ref(&device, aux).ok()?;
                 let roster = decode_topology(&bytes).ok()?;
                 (roster.tx_id == commit.tx_id).then_some((commit, roster))
             });
@@ -520,9 +579,13 @@ impl<D: BlockDevice> Pool<D> {
         for roster in &views {
             match Self::assemble_view(&candidates, roster, allow_degraded) {
                 Ok(plan) => return Self::adopt_view(candidates, roster, plan),
-                Err(err) => {
+                Err(refused) => {
+                    let damaged = refused.damaged;
                     if refusal.is_none() {
-                        refusal = Some(err);
+                        refusal = Some(refused.error);
+                    }
+                    if damaged {
+                        break;
                     }
                 }
             }
@@ -539,13 +602,27 @@ impl<D: BlockDevice> Pool<D> {
         candidates: &[ImportCandidate<PartitionView<D>>],
         roster: &Topology,
         allow_degraded: bool,
-    ) -> Result<Vec<Option<usize>>> {
+    ) -> std::result::Result<Vec<Option<usize>>, ViewRefusal> {
         let mut plan: Vec<Option<usize>> = vec![None; roster.members.len()];
         for (index, (_, superblock, _)) in candidates.iter().enumerate() {
             if let Some(member) = roster.member_index(superblock.device_id)
                 && roster.members[usize::from(member)].state == MemberState::Active
             {
                 plan[usize::from(member)] = Some(index);
+            }
+        }
+        let mut damaged = false;
+        for (member, slot) in roster.members.iter().zip(plan.iter_mut()) {
+            let Some(index) = *slot else { continue };
+            if candidates[index].0.len() < member.geometry.capacity_bytes() {
+                return Err(ViewRefusal {
+                    error: ScaleFsError::Corrupt("device is smaller than its recorded geometry"),
+                    damaged: false,
+                });
+            }
+            if Self::recorded_state_verifies(&candidates[index].0, member).is_err() {
+                *slot = None;
+                damaged = true;
             }
         }
         let missing: Vec<DeviceId> = roster
@@ -565,39 +642,38 @@ impl<D: BlockDevice> Pool<D> {
             usize::from(roster.mirror_width.saturating_sub(1))
         };
         if !missing.is_empty() && (!allow_degraded || missing.len() > tolerated) {
-            return Err(ScaleFsError::MissingMembers { missing });
-        }
-        for (member, slot) in roster.members.iter().zip(&plan) {
-            let Some(index) = *slot else { continue };
-            if candidates[index].0.len() < member.geometry.capacity_bytes() {
-                return Err(ScaleFsError::Corrupt(
-                    "device is smaller than its recorded geometry",
-                ));
-            }
-            let device = std::slice::from_ref(&candidates[index].0);
-            let commit_bytes = read_extent_from_set(
-                device,
-                Extent {
-                    device_index: 0,
-                    ..member.newest_commit
-                },
-            )?;
-            let commit = decode_commit(&commit_bytes)?;
-            if commit.tx_id != member.newest_tx {
-                return Err(ScaleFsError::Corrupt(
-                    "member state does not match the roster",
-                ));
-            }
-            let summary_bytes = read_extent_from_set(
-                device,
-                Extent {
-                    device_index: 0,
-                    ..member.newest_summary
-                },
-            )?;
-            decode_record(&summary_bytes)?;
+            return Err(ViewRefusal {
+                error: ScaleFsError::MissingMembers { missing },
+                damaged,
+            });
         }
         Ok(plan)
+    }
+
+    fn recorded_state_verifies(device: &PartitionView<D>, member: &TopologyMember) -> Result<()> {
+        Self::recorded_summary(device, member).map(|_| ())
+    }
+
+    fn recorded_summary(device: &PartitionView<D>, member: &TopologyMember) -> Result<Vec<u8>> {
+        let devices = std::slice::from_ref(device);
+        let commit_bytes = read_extent_from_set(
+            devices,
+            Extent {
+                device_index: 0,
+                ..member.newest_commit
+            },
+        )?;
+        let commit = decode_commit(&commit_bytes)?;
+        let summary = commit.allocator_summary;
+        if commit.tx_id != member.newest_tx
+            || summary.extent.offset != member.newest_summary.offset
+            || summary.extent.length != member.newest_summary.length
+        {
+            return Err(ScaleFsError::Corrupt(
+                "member state does not match the roster",
+            ));
+        }
+        read_ref(device, summary)
     }
 
     fn adopt_view(
@@ -627,7 +703,14 @@ impl<D: BlockDevice> Pool<D> {
             }
         }
         for leftover in taken.into_iter().flatten() {
-            orphaned.push(leftover.1.device_id);
+            let named_active = roster
+                .member_index(leftover.1.device_id)
+                .is_some_and(|member| {
+                    roster.members[usize::from(member)].state == MemberState::Active
+                });
+            if !named_active {
+                orphaned.push(leftover.1.device_id);
+            }
         }
 
         let feature_compat = superblocks
@@ -658,18 +741,22 @@ impl<D: BlockDevice> Pool<D> {
             let Some(slot) = member_slots[index] else {
                 continue;
             };
-            let summary = read_extent_from_set(
-                std::slice::from_ref(&ordered_devices[slot]),
-                Extent {
-                    device_index: 0,
-                    ..member.newest_summary
-                },
-            )?;
+            let summary = Self::recorded_summary(&ordered_devices[slot], member)?;
             allocators.push(ZoneAllocator::decode(superblocks[slot].geometry, &summary)?);
         }
-        let root_replicas = roster.metadata_root_replicas.clone();
-        let tree = MetadataTree::load(&root_replicas, &mut |copies| {
-            read_any_copy_slotted(&ordered_devices, &member_slots, copies)
+        let root_replicas = PageRef {
+            copies: roster.metadata_root_replicas.clone(),
+            expect: roster.metadata_root_expect,
+        };
+        let stale_copies = std::sync::atomic::AtomicU64::new(0);
+        let tree = MetadataTree::load(&root_replicas, &|page: &PageRef| {
+            read_any_copy_counted(
+                &ordered_devices,
+                &member_slots,
+                &page.copies,
+                Some(page.expect),
+                Some(&stale_copies),
+            )
         })?;
 
         let absent_chains: Vec<Option<TopologyMember>> = roster
@@ -683,7 +770,7 @@ impl<D: BlockDevice> Pool<D> {
         let thin_metadata_published = superblocks
             .iter()
             .any(|superblock| superblock.feature_incompat & FEATURE_INCOMPAT_THIN_METADATA != 0);
-        let pool = Self {
+        let mut pool = Self {
             devices: ordered_devices,
             superblocks,
             allocators,
@@ -720,6 +807,7 @@ impl<D: BlockDevice> Pool<D> {
             committed_tx: roster.tx_id,
             read_only,
             last_metadata_root: root_replicas,
+            stale_copies,
             dirty_members: HashSet::new(),
             force_full_commit: false,
             last_roster_members: roster.members.clone(),
@@ -728,7 +816,59 @@ impl<D: BlockDevice> Pool<D> {
             suspects: std::sync::Mutex::new(HashSet::new()),
             commit_in_flight: false,
         };
+        pool.reserve_lagging_references(roster)?;
         Ok(pool)
+    }
+
+    fn reserve_lagging_references(&mut self, roster: &Topology) -> Result<()> {
+        let lagging: Vec<(u16, usize)> = roster
+            .members
+            .iter()
+            .enumerate()
+            .filter_map(|(member, entry)| {
+                let slot = self.member_slots[member]?;
+                (entry.state == MemberState::Active && entry.newest_tx < roster.tx_id)
+                    .then_some((member as u16, slot))
+            })
+            .collect();
+        if lagging.is_empty() {
+            return Ok(());
+        }
+        let mut wanted: Vec<(usize, ZoneClass, Extent)> = Vec::new();
+        let mut note = |class: ZoneClass, extent: &Extent| {
+            if let Some(&(_, slot)) = lagging
+                .iter()
+                .find(|(member, _)| *member == extent.device_index)
+            {
+                wanted.push((slot, class, *extent));
+            }
+        };
+        self.tree().for_each(&mut |_, value| match value {
+            MetadataValue::FileRun(run) => {
+                for span in run.spans() {
+                    note(ZoneClass::Data, &span);
+                }
+            }
+            MetadataValue::StripedRun(run) => {
+                for piece in &run.pieces {
+                    note(ZoneClass::Data, piece);
+                }
+                for parity in &run.parity {
+                    note(ZoneClass::Parity, parity);
+                }
+            }
+            _ => {}
+        })?;
+        for (slot, class, extent) in wanted {
+            self.allocators[slot]
+                .reserve_ghost(class, extent.offset, extent.length)
+                .map_err(|_| {
+                    ScaleFsError::Corrupt(
+                        "a lagging member's summary conflicts with the extents the tree places on it",
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub fn orphaned_members(&self) -> &[DeviceId] {
@@ -787,10 +927,14 @@ impl<D: BlockDevice> Pool<D> {
                 "device is smaller than its formatted geometry",
             ));
         }
-        let summary = read_extent_from_set(std::slice::from_ref(device), commit.allocator_summary)?;
+        let summary = read_ref(device, commit.allocator_summary)?;
         let allocator = ZoneAllocator::decode(superblock.geometry, &summary)?;
-        let tree = MetadataTree::load(&[commit.metadata_root], &mut |copies| {
-            read_any_copy(std::slice::from_ref(device), copies)
+        let tree = MetadataTree::load(&root_of(commit), &|page: &PageRef| {
+            read_any_copy(
+                std::slice::from_ref(device),
+                &page.copies,
+                Some(page.expect),
+            )
         })?;
         Ok((allocator, tree))
     }
@@ -970,7 +1114,7 @@ impl<D: BlockDevice> Pool<D> {
             }
             Err(err) => {
                 self.allocators = saved_allocators;
-                self.tree.mark_all_dirty();
+                self.tree.plan_abandoned();
                 self.dirty_members.extend(taken_dirty);
                 self.force_full_commit |= taken_force_full;
                 self.suspects
@@ -984,6 +1128,7 @@ impl<D: BlockDevice> Pool<D> {
 
     fn plan_chain_allocations(
         allocator: &mut ZoneAllocator,
+        tx: u64,
         commit_len: u64,
         roster_len: u64,
         is_multi: bool,
@@ -997,7 +1142,7 @@ impl<D: BlockDevice> Pool<D> {
         };
         let summary_len = allocator.encoded_len();
         let summary_alloc = allocator.allocate(ZoneClass::Metadata, summary_len as u64, purpose)?;
-        let summary_bytes = allocator.encode();
+        let summary_bytes = allocator.encode(tx);
         debug_assert_eq!(summary_bytes.len(), summary_len);
         Ok((
             commit_alloc,
@@ -1017,11 +1162,13 @@ impl<D: BlockDevice> Pool<D> {
         let tx_id = self.committed_tx + 1;
         let slot_count = self.devices.len();
         let members_total = self.member_slots.len();
-        let commit_len: u64 = if self.multi.is_some() { 117 } else { 97 };
+        let commit_len = commit_record_len(self.multi.is_some());
         let mirror_width = self.multi.as_ref().map_or(1, |state| state.mirror_width);
-        let roster_len =
-            (RECORD_ENVELOPE_LEN + 32 + 100 * members_total + 20 * usize::from(mirror_width))
-                as u64;
+        let roster_len = (RECORD_ENVELOPE_LEN
+            + 32
+            + 100 * members_total
+            + 20 * usize::from(mirror_width)
+            + Expect::ENCODED_LEN) as u64;
 
         let present = self.member_slots.iter().flatten().count() as u16;
         let page_copies = if self.degrade_commit {
@@ -1030,6 +1177,9 @@ impl<D: BlockDevice> Pool<D> {
             mirror_width
         };
         let thin_metadata = page_copies < mirror_width;
+        if self.thin_metadata_published && !thin_metadata {
+            self.tree_mut().mark_all_dirty()?;
+        }
         let force_full = if thin_metadata != self.thin_metadata_published {
             for superblock in &mut self.superblocks {
                 if thin_metadata {
@@ -1046,7 +1196,7 @@ impl<D: BlockDevice> Pool<D> {
         let allocators = &mut self.allocators;
         let member_slots = &self.member_slots;
         let exclude: Vec<u16> = self.evacuating.into_iter().collect();
-        let (root_replicas, pages) = tree.plan_commit(&mut |len| {
+        let (root_replicas, pages) = tree.plan_commit(tx_id, &mut |len| {
             Ok(place_distinct_excluding(
                 allocators,
                 member_slots,
@@ -1060,7 +1210,10 @@ impl<D: BlockDevice> Pool<D> {
             .map(|(member, allocation)| (member, allocation.offset))
             .collect())
         })?;
-        let metadata_root = root_replicas[0];
+        let metadata_root = RecordRef {
+            extent: root_replicas.copies[0],
+            expect: root_replicas.expect,
+        };
 
         let full =
             self.multi.is_none() || force_full || self.last_roster_members.len() != members_total;
@@ -1110,6 +1263,7 @@ impl<D: BlockDevice> Pool<D> {
             let saved = probe_only[i].then(|| self.allocators[i].clone());
             match Self::plan_chain_allocations(
                 &mut self.allocators[i],
+                tx_id,
                 commit_len,
                 roster_len,
                 is_multi,
@@ -1134,7 +1288,7 @@ impl<D: BlockDevice> Pool<D> {
             }
         }
         if !participating.contains(&true) {
-            for extent in &root_replicas {
+            for extent in &root_replicas.copies {
                 let slot = self
                     .member_slot(extent.device_index)
                     .expect("root replicas live on present members");
@@ -1146,6 +1300,7 @@ impl<D: BlockDevice> Pool<D> {
                 }
                 let (commit_alloc, roster_alloc, summary) = Self::plan_chain_allocations(
                     &mut self.allocators[i],
+                    tx_id,
                     commit_len,
                     roster_len,
                     is_multi,
@@ -1217,7 +1372,8 @@ impl<D: BlockDevice> Pool<D> {
                     parity_width: state.parity_width,
                     mirror_width: state.mirror_width,
                     members: members.clone(),
-                    metadata_root_replicas: root_replicas.clone(),
+                    metadata_root_replicas: root_replicas.copies.clone(),
+                    metadata_root_expect: root_replicas.expect,
                 })?;
                 debug_assert_eq!(bytes.len() as u64, roster_len);
                 Some(std::sync::Arc::new(bytes))
@@ -1264,7 +1420,7 @@ impl<D: BlockDevice> Pool<D> {
         }
 
         let mut stage_commit_records = Vec::new();
-        let mut commit_extents: Vec<Option<Extent>> = vec![None; slot_count];
+        let mut commit_extents: Vec<Option<RecordRef>> = vec![None; slot_count];
         for i in 0..slot_count {
             let Some((summary_alloc, summary_bytes)) = &summaries[i] else {
                 continue;
@@ -1274,31 +1430,43 @@ impl<D: BlockDevice> Pool<D> {
                 supersedes: self.committed_tx,
                 created_at_ns,
                 metadata_root,
-                allocator_summary: Extent {
-                    device_index: 0,
-                    offset: summary_alloc.offset,
-                    length: summary_bytes.len() as u64,
-                },
-                aux_root: roster_allocs[i].as_ref().map(|alloc| Extent {
-                    device_index: 0,
-                    offset: alloc.offset,
-                    length: roster_len,
+                allocator_summary: RecordRef::to(
+                    Extent {
+                        device_index: 0,
+                        offset: summary_alloc.offset,
+                        length: summary_bytes.len() as u64,
+                    },
+                    summary_bytes,
+                ),
+                aux_root: roster_allocs[i].as_ref().map(|alloc| {
+                    let roster = roster_arc.as_ref().expect("multi pools encode a roster");
+                    RecordRef::to(
+                        Extent {
+                            device_index: 0,
+                            offset: alloc.offset,
+                            length: roster_len,
+                        },
+                        roster,
+                    )
                 }),
             };
             let commit_bytes = encode_commit(&commit)?;
             debug_assert_eq!(commit_bytes.len() as u64, commit_len);
             let commit_offset = commit_allocs[i].expect("participants allocate").offset;
+            commit_extents[i] = Some(RecordRef::to(
+                Extent {
+                    device_index: 0,
+                    offset: commit_offset,
+                    length: commit_len,
+                },
+                &commit_bytes,
+            ));
             stage_commit_records.push(PlannedWrite {
                 member: self.member_of_slot(i),
                 slot: i,
                 offset: commit_offset,
                 bytes: std::sync::Arc::new(commit_bytes),
                 pad: self.superblocks[i].geometry.logical_block_size as usize,
-            });
-            commit_extents[i] = Some(Extent {
-                device_index: 0,
-                offset: commit_offset,
-                length: commit_len,
             });
         }
 
@@ -1309,7 +1477,7 @@ impl<D: BlockDevice> Pool<D> {
             };
             let mut superblock = self.superblocks[i].clone();
             superblock.newest_commit = Some(*commit_extent);
-            let superblock_bytes = std::sync::Arc::new(encode_superblock(&superblock)?);
+            let superblock_bytes = std::sync::Arc::new(encode_superblock(&superblock, tx_id)?);
             for offset in superblock_slots(self.devices[i].len()) {
                 stage_superblocks.push(PlannedWrite {
                     member: None,
@@ -1342,6 +1510,7 @@ impl<D: BlockDevice> Pool<D> {
 
     fn publish_commit_impl(&mut self, plan: PlannedCommit) -> u64 {
         self.commit_in_flight = false;
+        self.tree.plan_published();
         self.committed_tx = plan.tx_id;
         self.thin_metadata_published = plan.thin_metadata;
         self.last_metadata_root = plan.root_replicas;
@@ -1367,7 +1536,7 @@ impl<D: BlockDevice> Pool<D> {
     fn abandon_commit_impl(&mut self, plan: PlannedCommit, suspect: Option<u16>) {
         self.commit_in_flight = false;
         self.wounded = true;
-        self.tree.mark_all_dirty();
+        self.tree.plan_abandoned();
         self.dirty_members.extend(plan.taken_dirty);
         self.force_full_commit |= plan.taken_force_full;
         {
@@ -1510,13 +1679,20 @@ impl<D: BlockDevice> Pool<D> {
             .insert(member);
     }
 
-    pub fn read_record(&self, copies: &[Extent]) -> Result<Vec<u8>> {
+    pub fn read_record(&self, copies: &[Extent], expect: Expect) -> Result<Vec<u8>> {
         let mut last_error = ScaleFsError::Corrupt("record has no copies");
+        let mut stale_seen = false;
         for extent in copies {
             match self.read_extent(*extent) {
-                Ok(bytes) => match decode_record(&bytes) {
+                Ok(bytes) => match expect.verify_in_place(&bytes) {
                     Ok(_) => return Ok(bytes),
-                    Err(err) => last_error = err,
+                    Err(err) => {
+                        if is_stale(&err) {
+                            self.note_stale_copy();
+                            stale_seen = true;
+                        }
+                        last_error = err;
+                    }
                 },
                 Err(err) => {
                     if matches!(err, ScaleFsError::Io(_)) {
@@ -1526,7 +1702,19 @@ impl<D: BlockDevice> Pool<D> {
                 }
             }
         }
+        if stale_seen {
+            return Err(ScaleFsError::Corrupt(crate::format::STALE_COPY));
+        }
         Err(last_error)
+    }
+
+    pub(crate) fn note_stale_copy(&self) {
+        self.stale_copies
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn stale_copies_seen(&self) -> u64 {
+        self.stale_copies.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn read_extent(&self, extent: Extent) -> Result<Vec<u8>> {
@@ -1547,22 +1735,198 @@ impl<D: BlockDevice> Pool<D> {
         )
     }
 
-    pub(crate) fn read_striped(&self, data: Extent, parity_extents: &[Extent]) -> Result<Vec<u8>> {
-        match self.read_extent(data) {
-            Ok(bytes) if decode_record(&bytes).is_ok() => return Ok(bytes),
-            Ok(_) => {}
-            Err(err) => {
-                if matches!(err, ScaleFsError::Io(_)) {
-                    self.note_suspect_member(data.device_index);
-                }
-            }
-        }
-        self.reconstruct_piece(data, parity_extents)
+    fn read_extent_into(&self, extent: Extent, buf: &mut Vec<u8>) -> Result<()> {
+        let slot = self
+            .member_slots
+            .get(usize::from(extent.device_index))
+            .copied()
+            .flatten()
+            .ok_or(ScaleFsError::Corrupt(
+                "extent references a device that is not present",
+            ))?;
+        read_extent_into_from_set(
+            std::slice::from_ref(&self.devices[slot]),
+            Extent {
+                device_index: 0,
+                ..extent
+            },
+            buf,
+        )
     }
 
-    fn reconstruct_piece(&self, target: Extent, parity_extents: &[Extent]) -> Result<Vec<u8>> {
+    pub(crate) fn read_run_window(
+        &self,
+        run: &FileRun,
+        w: crate::runs::RecordWindow,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let count = w.last + 1 - w.first;
+        let full = run.full_payload() as usize;
+        let header = crate::format::RECORD_HEADER_LEN;
+        let place = |k: usize| -> (usize, usize) {
+            if k == w.first {
+                (0, w.at as usize)
+            } else {
+                ((k - w.first) * full - w.at as usize, 0)
+            }
+        };
+        let mut done = vec![false; count];
+        let mut copied = 0usize;
+        let mut last_error = ScaleFsError::Corrupt("record has no copies");
+        let mut stale_seen = false;
+        with_read_buffer(|bytes| {
+            for copy in &run.copies {
+                if done.iter().all(|&placed| placed) {
+                    break;
+                }
+                let span = Extent {
+                    device_index: copy.device_index,
+                    offset: copy.offset + w.first as u64 * run.stride,
+                    length: (count as u64 - 1) * run.stride + run.record_len(w.last),
+                };
+                if let Err(err) = self.read_extent_into(span, bytes) {
+                    if matches!(err, ScaleFsError::Io(_)) {
+                        self.note_suspect_member(copy.device_index);
+                    }
+                    last_error = err;
+                    continue;
+                }
+                for (i, placed) in done.iter_mut().enumerate() {
+                    if *placed {
+                        continue;
+                    }
+                    let k = w.first + i;
+                    let at = (i as u64 * run.stride) as usize;
+                    let record = &bytes[at..at + run.record_len(k) as usize];
+                    match run.expect(k).verify_in_place(record) {
+                        Ok((RecordKind::FileData, payload)) => {
+                            let (to, from) = place(k);
+                            let available = payload.len().saturating_sub(from);
+                            let take = available.min(dst.len().saturating_sub(to));
+                            dst[to..to + take]
+                                .copy_from_slice(&record[header + from..header + from + take]);
+                            copied += take;
+                            *placed = true;
+                        }
+                        Ok(_) => last_error = ScaleFsError::Corrupt("expected a file data record"),
+                        Err(err) => {
+                            if is_stale(&err) {
+                                self.note_stale_copy();
+                                stale_seen = true;
+                            }
+                            last_error = err;
+                        }
+                    }
+                }
+            }
+        });
+        if done.iter().any(|&placed| !placed) {
+            if stale_seen {
+                return Err(ScaleFsError::Corrupt(crate::format::STALE_COPY));
+            }
+            return Err(last_error);
+        }
+        if copied != dst.len() {
+            return Err(ScaleFsError::Corrupt("file run overruns its records"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_striped_window(
+        &self,
+        run: &StripedRun,
+        w: crate::runs::RecordWindow,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let full = run.full_payload() as usize;
+        let header = crate::format::RECORD_HEADER_LEN;
+        let mut copied = 0usize;
+        with_read_buffer(|bytes| {
+            for k in w.first..=w.last {
+                let (to, from) = if k == w.first {
+                    (0, w.at as usize)
+                } else {
+                    ((k - w.first) * full - w.at as usize, 0)
+                };
+                let piece = run.pieces[k];
+                let direct = match self.read_extent_into(piece, bytes) {
+                    Ok(()) => match run.expect(k).verify_in_place(bytes) {
+                        Ok((RecordKind::FileData, payload)) => Some(payload.len()),
+                        Ok(_) => None,
+                        Err(err) => {
+                            if is_stale(&err) {
+                                self.note_stale_copy();
+                            }
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        if matches!(err, ScaleFsError::Io(_)) {
+                            self.note_suspect_member(piece.device_index);
+                        }
+                        None
+                    }
+                };
+                let payload_len = match direct {
+                    Some(len) => len,
+                    None => {
+                        let rebuilt = self.reconstruct_piece(
+                            piece,
+                            Some(run.expect(k)),
+                            &run.parity,
+                            Some(run),
+                        )?;
+                        match run.expect(k).verify_in_place(&rebuilt)? {
+                            (RecordKind::FileData, payload) => {
+                                *bytes = rebuilt;
+                                payload.len()
+                            }
+                            _ => return Err(ScaleFsError::Corrupt("expected a file data record")),
+                        }
+                    }
+                };
+                let take = payload_len
+                    .saturating_sub(from)
+                    .min(dst.len().saturating_sub(to));
+                dst[to..to + take].copy_from_slice(&bytes[header + from..header + from + take]);
+                copied += take;
+            }
+            Ok(())
+        })?;
+        if copied != dst.len() {
+            return Err(ScaleFsError::Corrupt("file run overruns its records"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_described_piece(
+        &self,
+        piece: Extent,
+        crc: u32,
+        parity_extents: &[Extent],
+        run: Option<&StripedRun>,
+    ) -> Result<Vec<u8>> {
+        if let Ok(bytes) = self.read_extent(piece)
+            && decode_record(&bytes).is_ok_and(|record| record.crc == crc)
+        {
+            return Ok(bytes);
+        }
+        let bytes = self.reconstruct_piece(piece, None, parity_extents, run)?;
+        if Expect::of(&bytes).crc != crc {
+            return Err(ScaleFsError::Corrupt(crate::format::STALE_COPY));
+        }
+        Ok(bytes)
+    }
+
+    fn reconstruct_piece(
+        &self,
+        target: Extent,
+        expect: Option<Expect>,
+        parity_extents: &[Extent],
+        run: Option<&StripedRun>,
+    ) -> Result<Vec<u8>> {
         let mut last_error = ScaleFsError::Corrupt("stripe has no readable parity record");
-        for extent in parity_extents {
+        for (row, extent) in parity_extents.iter().enumerate() {
             let bytes = match self.read_extent(*extent) {
                 Ok(bytes) => bytes,
                 Err(err) => {
@@ -1573,15 +1937,30 @@ impl<D: BlockDevice> Pool<D> {
                     continue;
                 }
             };
+            if let Some(run) = run
+                && let Err(err) = run.parity_expect(row).verify(&bytes)
+            {
+                if is_stale(&err) {
+                    self.note_stale_copy();
+                }
+                last_error = err;
+                continue;
+            }
             match decode_parity_record(&bytes) {
-                Ok(descriptor) => return self.reconstruct_from(&descriptor, target),
+                Ok(descriptor) => return self.reconstruct_from(&descriptor, target, expect, run),
                 Err(err) => last_error = err,
             }
         }
         Err(last_error)
     }
 
-    fn reconstruct_from(&self, descriptor: &ParityRecord, target: Extent) -> Result<Vec<u8>> {
+    fn reconstruct_from(
+        &self,
+        descriptor: &ParityRecord,
+        target: Extent,
+        expect: Option<Expect>,
+        run: Option<&StripedRun>,
+    ) -> Result<Vec<u8>> {
         let data_count = descriptor.data_pieces.len();
         let parity_count = descriptor.parity_pieces.len();
         let coverage = usize::try_from(descriptor.coverage_len)
@@ -1605,7 +1984,12 @@ impl<D: BlockDevice> Pool<D> {
                 continue;
             }
             match self.read_extent(*piece) {
-                Ok(bytes) if decode_record(&bytes).is_ok() => available.push((index, bytes)),
+                Ok(bytes)
+                    if decode_record(&bytes)
+                        .is_ok_and(|record| record.crc == descriptor.data_crcs[index]) =>
+                {
+                    available.push((index, bytes))
+                }
                 Ok(_) => erased.push(index),
                 Err(err) => {
                     if matches!(err, ScaleFsError::Io(_)) {
@@ -1618,9 +2002,13 @@ impl<D: BlockDevice> Pool<D> {
         for (row, piece) in descriptor.parity_pieces.iter().enumerate() {
             match self.read_extent(*piece) {
                 Ok(bytes) => {
+                    if run.is_some_and(|run| run.parity_expect(row).verify(&bytes).is_err()) {
+                        continue;
+                    }
                     if let Ok(parity) = decode_parity_record(&bytes)
                         && usize::from(parity.parity_index) == row
                         && parity.data_pieces == descriptor.data_pieces
+                        && parity.data_crcs == descriptor.data_crcs
                         && parity.parity_pieces == descriptor.parity_pieces
                         && parity.coverage_len == descriptor.coverage_len
                     {
@@ -1642,7 +2030,11 @@ impl<D: BlockDevice> Pool<D> {
             crate::rs::reconstruct_data(data_count, parity_count, coverage, &borrowed, &erased)?;
         let mut bytes = rebuilt.swap_remove(0);
         bytes.truncate(target.length as usize);
-        if decode_record(&bytes).is_err() {
+        let verified = match expect {
+            Some(expect) => expect.verify(&bytes).is_ok(),
+            None => decode_record(&bytes).is_ok(),
+        };
+        if !verified || Expect::of(&bytes).crc != descriptor.data_crcs[column] {
             return Err(ScaleFsError::Corrupt(
                 "stripe reconstruction failed checksum verification",
             ));
@@ -1688,12 +2080,63 @@ impl<D: BlockDevice> Pool<D> {
         Ok(())
     }
 
-    pub fn tree(&self) -> &MetadataTree {
-        &self.tree
+    pub fn tree(&self) -> TreeRef<'_> {
+        self.tree.view(self)
     }
 
-    pub fn tree_mut(&mut self) -> &mut MetadataTree {
-        &mut self.tree
+    pub fn tree_mut(&mut self) -> TreeMut<'_> {
+        let pool: &Self = self;
+        pool.tree.edit_shared(pool)
+    }
+
+    pub fn set_metadata_cache(&self, bytes: usize) {
+        self.tree.set_cache_budget(bytes);
+    }
+
+    pub fn metadata_cache(&self) -> CacheStats {
+        self.tree.cache_stats()
+    }
+
+    pub fn tree_census(&self) -> Result<TreeCensus> {
+        let mut census = TreeCensus::default();
+        let mut stack = vec![self.last_metadata_root.clone()];
+        while let Some(page) = stack.pop() {
+            let bytes = self.read_record(&page.copies, page.expect)?;
+            census.page_bytes += bytes.len() as u64;
+            let block = page
+                .copies
+                .first()
+                .and_then(|copy| self.member_slot(copy.device_index))
+                .map_or(4096, |slot| {
+                    u64::from(self.allocators[slot].geometry().logical_block_size)
+                });
+            census.page_disk_bytes += (bytes.len() as u64).div_ceil(block) * block;
+            match decode_record(&bytes)?.kind {
+                RecordKind::MetadataInternal => {
+                    census.internal_pages += 1;
+                    stack.extend(decode_internal_record(&bytes)?.into_iter().map(|(_, c)| c));
+                }
+                RecordKind::MetadataLeaf => {
+                    census.leaf_pages += 1;
+                    for (_, value) in decode_leaf_record(&bytes)? {
+                        census.items += 1;
+                        match value {
+                            MetadataValue::FileRun(run) => {
+                                census.runs += 1;
+                                census.run_records += run.count() as u64;
+                            }
+                            MetadataValue::StripedRun(run) => {
+                                census.runs += 1;
+                                census.run_records += run.count() as u64;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => return Err(ScaleFsError::Corrupt("expected a metadata page record")),
+            }
+        }
+        Ok(census)
     }
 
     pub fn allocator(&self) -> &ZoneAllocator {
@@ -1721,7 +2164,7 @@ impl<D: BlockDevice> Pool<D> {
                 let aux = commit
                     .aux_root
                     .ok_or(ScaleFsError::Corrupt("multi-device commit lacks a roster"))?;
-                let bytes = read_extent_from_set(std::slice::from_ref(device), aux)?;
+                let bytes = read_ref(device, aux)?;
                 let roster = decode_topology(&bytes)?;
                 if roster.tx_id != commit.tx_id {
                     return Err(ScaleFsError::Corrupt("roster does not match its commit"));
@@ -1750,20 +2193,21 @@ impl<D: BlockDevice> Pool<D> {
 
     fn collect_memberships_in_tree(
         &self,
-        root: &[Extent],
+        root: &PageRef,
         memberships: &mut StripeMembers,
         visited: &mut HashSet<(u16, u64)>,
-        pending_roots: &mut Vec<Vec<Extent>>,
+        pending_roots: &mut Vec<PageRef>,
     ) -> Result<()> {
         let first = root
+            .copies
             .first()
             .ok_or(ScaleFsError::Corrupt("tree root has no copies"))?;
         if !visited.insert((first.device_index, first.offset)) {
             return Ok(());
         }
-        let bytes = self.read_record(root)?;
+        let bytes = self.read_record(&root.copies, root.expect)?;
         match decode_record(&bytes)?.kind {
-            RecordKind::MetadataInternal | RecordKind::MetadataInternalMirrored => {
+            RecordKind::MetadataInternal => {
                 for (_, child) in decode_internal_record(&bytes)? {
                     self.collect_memberships_in_tree(&child, memberships, visited, pending_roots)?;
                 }
@@ -1771,20 +2215,23 @@ impl<D: BlockDevice> Pool<D> {
             RecordKind::MetadataLeaf => {
                 for (_, value) in decode_leaf_record(&bytes)? {
                     match value {
-                        MetadataValue::StripedExtent {
-                            extent,
-                            parity_extents,
-                            ..
-                        } => {
-                            if let Some(stripe_first) = parity_extents.first() {
-                                memberships
+                        MetadataValue::StripedRun(run) => {
+                            if let Some(stripe_first) = run.parity.first() {
+                                let members = memberships
                                     .entry((stripe_first.device_index, stripe_first.offset))
-                                    .or_default()
-                                    .insert((extent.device_index, extent.offset, extent.length));
+                                    .or_default();
+                                for (piece, crc) in run.pieces.iter().zip(&run.crcs) {
+                                    members.insert((
+                                        piece.device_index,
+                                        piece.offset,
+                                        piece.length,
+                                        *crc,
+                                    ));
+                                }
                             }
                         }
-                        MetadataValue::RetainedRoot { metadata_roots, .. } => {
-                            pending_roots.push(metadata_roots);
+                        MetadataValue::RetainedRoot { root, .. } => {
+                            pending_roots.push(root);
                         }
                         _ => {}
                     }
@@ -1815,27 +2262,28 @@ impl<D: BlockDevice> Pool<D> {
 
     fn collect_references_in_tree(
         &self,
-        root: &[Extent],
+        root: &PageRef,
         member: u16,
         out: &mut Vec<(ZoneClass, Extent)>,
         visited: &mut HashSet<(u16, u64)>,
         stripes_seen: &mut HashSet<(u16, u64)>,
-        pending_roots: &mut Vec<Vec<Extent>>,
+        pending_roots: &mut Vec<PageRef>,
     ) -> Result<()> {
         let first = root
+            .copies
             .first()
             .ok_or(ScaleFsError::Corrupt("tree root has no copies"))?;
         if !visited.insert((first.device_index, first.offset)) {
             return Ok(());
         }
-        for copy in root {
+        for copy in &root.copies {
             if copy.device_index == member {
                 out.push((ZoneClass::Metadata, *copy));
             }
         }
-        let bytes = self.read_record(root)?;
+        let bytes = self.read_record(&root.copies, root.expect)?;
         match decode_record(&bytes)?.kind {
-            RecordKind::MetadataInternal | RecordKind::MetadataInternalMirrored => {
+            RecordKind::MetadataInternal => {
                 for (_, child) in decode_internal_record(&bytes)? {
                     self.collect_references_in_tree(
                         &child,
@@ -1850,22 +2298,21 @@ impl<D: BlockDevice> Pool<D> {
             RecordKind::MetadataLeaf => {
                 for (_, value) in decode_leaf_record(&bytes)? {
                     match value {
-                        MetadataValue::FileExtent { extents, .. } => {
-                            for extent in extents {
-                                if extent.device_index == member {
-                                    out.push((ZoneClass::Data, extent));
+                        MetadataValue::FileRun(run) => {
+                            for span in run.spans() {
+                                if span.device_index == member {
+                                    out.push((ZoneClass::Data, span));
                                 }
                             }
                         }
-                        MetadataValue::StripedExtent {
-                            extent,
-                            parity_extents,
-                            ..
-                        } => {
-                            if extent.device_index == member {
-                                out.push((ZoneClass::Data, extent));
+                        MetadataValue::StripedRun(run) => {
+                            for piece in &run.pieces {
+                                if piece.device_index == member {
+                                    out.push((ZoneClass::Data, *piece));
+                                }
                             }
-                            for parity in &parity_extents {
+                            let parity_extents = &run.parity;
+                            for parity in parity_extents {
                                 if parity.device_index == member {
                                     out.push((ZoneClass::Parity, *parity));
                                 }
@@ -1880,7 +2327,7 @@ impl<D: BlockDevice> Pool<D> {
                             }
                             let mut described = false;
                             let mut present_rows = false;
-                            for parity in &parity_extents {
+                            for (row, parity) in parity_extents.iter().enumerate() {
                                 if parity.device_index == member
                                     || self.member_slot(parity.device_index).is_none()
                                 {
@@ -1890,6 +2337,9 @@ impl<D: BlockDevice> Pool<D> {
                                 let Ok(bytes) = self.read_extent(*parity) else {
                                     continue;
                                 };
+                                if run.parity_expect(row).verify(&bytes).is_err() {
+                                    continue;
+                                }
                                 let Ok(record) = decode_parity_record(&bytes) else {
                                     continue;
                                 };
@@ -1912,8 +2362,8 @@ impl<D: BlockDevice> Pool<D> {
                                 ));
                             }
                         }
-                        MetadataValue::RetainedRoot { metadata_roots, .. } => {
-                            pending_roots.push(metadata_roots);
+                        MetadataValue::RetainedRoot { root, .. } => {
+                            pending_roots.push(root);
                         }
                         _ => {}
                     }
@@ -1992,7 +2442,7 @@ impl<D: BlockDevice> Pool<D> {
             aux_record: None,
             label: template.label.clone(),
         };
-        let bytes = encode_superblock(&superblock)?;
+        let bytes = encode_superblock(&superblock, self.committed_tx + 1)?;
         let device = format_member_wrapper(spec.device, template.pool_id, spec.device_id)?;
         for offset in superblock_slots(device.len()) {
             write_padded(&device, offset, &bytes, SUPERBLOCK_PAD)?;
@@ -2082,105 +2532,84 @@ impl<D: BlockDevice> Pool<D> {
             StripeMembers::new()
         };
 
-        let keys: Vec<MetadataKey> = self
-            .tree
-            .range(MetadataKey::MIN, MetadataKey::MAX)
-            .iter()
-            .filter(|(key, value)| {
-                key.item_type == ITEM_FILE_EXTENT
-                    && matches!(
-                        value,
-                        MetadataValue::FileExtent { .. } | MetadataValue::StripedExtent { .. }
-                    )
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        for key in keys {
-            match self.tree.get(key).cloned() {
-                Some(MetadataValue::FileExtent {
-                    extents,
-                    data_offset,
-                    logical_len,
-                }) => {
-                    if let Some(healed) = self.rebuild_copy_set(&extents, &mut memo, &mut report)? {
-                        self.tree.insert(
-                            key,
-                            MetadataValue::FileExtent {
-                                extents: healed,
-                                data_offset,
-                                logical_len,
-                            },
-                        )?;
-                    }
+        let batch = self.rewrite_batch();
+        let mut marked = 0usize;
+        let mut cursor = Some(MetadataKey::MIN);
+        while let Some(from) = cursor {
+            let (items, _) = self.tree().leaf_from(from)?;
+            for (key, value) in items {
+                if key.item_type != ITEM_FILE_EXTENT {
+                    continue;
                 }
-                Some(MetadataValue::StripedExtent {
-                    extent,
-                    parity_extents,
-                    data_offset,
-                    logical_len,
-                }) => {
-                    if let Some(heal) = self.rebuild_stripe(
-                        &parity_extents,
-                        &memberships,
-                        &mut stripes,
-                        &mut report,
-                    )? {
-                        self.tree.insert(
-                            key,
-                            MetadataValue::StripedExtent {
-                                extent: heal.new_data_extent(extent),
-                                parity_extents: heal.parity_extents.clone(),
-                                data_offset,
-                                logical_len,
-                            },
-                        )?;
+                match value {
+                    MetadataValue::FileRun(run) => {
+                        if let Some(healed) = self.rebuild_file_run(&run, &mut memo, &mut report)? {
+                            let mut at = key.offset;
+                            for part in healed {
+                                let len = part.logical_len;
+                                self.tree_mut().insert(
+                                    MetadataKey { offset: at, ..key },
+                                    MetadataValue::FileRun(part),
+                                )?;
+                                at += len;
+                            }
+                        }
                     }
+                    MetadataValue::StripedRun(run) => {
+                        if let Some(heal) = self.rebuild_stripe(
+                            &run.parity,
+                            Some(&run),
+                            &memberships,
+                            &mut stripes,
+                            &mut report,
+                        )? {
+                            self.tree_mut()
+                                .insert(key, MetadataValue::StripedRun(heal.apply(&run)))?;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => continue,
             }
+            let (next, bytes) = self.tree_mut().mark_dirty_from(from, 0)?;
+            marked += bytes;
+            if marked >= batch && next.is_some() {
+                self.commit(AllocPurpose::Normal, now_ns)?;
+                marked = 0;
+            }
+            cursor = next;
         }
 
-        let retained: Vec<(MetadataKey, MetadataValue)> = self
-            .tree
-            .range(
-                MetadataKey {
-                    object_id: 0,
-                    item_type: ITEM_RETAINED_ROOT,
-                    offset: 0,
-                },
-                MetadataKey {
-                    object_id: 0,
-                    item_type: ITEM_RETAINED_ROOT,
-                    offset: u64::MAX,
-                },
-            )
-            .iter()
-            .map(|(key, value)| (*key, (*value).clone()))
-            .collect();
+        let retained = self.tree().range(
+            MetadataKey {
+                object_id: 0,
+                item_type: ITEM_RETAINED_ROOT,
+                offset: 0,
+            },
+            MetadataKey {
+                object_id: 0,
+                item_type: ITEM_RETAINED_ROOT,
+                offset: u64::MAX,
+            },
+        )?;
         for (key, value) in retained {
             let MetadataValue::RetainedRoot {
                 tx_id,
-                metadata_roots,
+                root,
                 created_at_ns,
                 name,
             } = value
             else {
                 continue;
             };
-            let (new_roots, changed) = self.rebuild_tree(
-                &metadata_roots,
-                &mut memo,
-                &memberships,
-                &mut stripes,
-                &mut report,
-            )?;
+            let (new_roots, changed) =
+                self.rebuild_tree(&root, &mut memo, &memberships, &mut stripes, &mut report)?;
             if changed {
                 report.snapshots_rewritten += 1;
-                self.tree.insert(
+                self.tree_mut().insert(
                     key,
                     MetadataValue::RetainedRoot {
                         tx_id,
-                        metadata_roots: new_roots,
+                        root: new_roots,
                         created_at_ns,
                         name,
                     },
@@ -2188,15 +2617,76 @@ impl<D: BlockDevice> Pool<D> {
             }
         }
 
-        self.tree.mark_all_dirty();
         report.tx_id = self.commit(AllocPurpose::Normal, now_ns)?;
 
         Ok(report)
     }
 
+    fn rewrite_batch(&self) -> usize {
+        (self.tree.cache_budget() / 2).max(256 << 10)
+    }
+
+    fn rebuild_file_run(
+        &mut self,
+        run: &FileRun,
+        memo: &mut std::collections::HashMap<(u16, u64), Vec<Extent>>,
+        report: &mut RebuildReport,
+    ) -> Result<Option<Vec<FileRun>>> {
+        let mut sets: Vec<Vec<Extent>> = Vec::with_capacity(run.count());
+        let mut changed = false;
+        for k in 0..run.count() {
+            let copies = run.record_copies(k);
+            match self.rebuild_copy_set(&copies, run.expect(k), memo, report)? {
+                Some(healed) => {
+                    changed = true;
+                    sets.push(healed);
+                }
+                None => sets.push(copies),
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let zone_of = |pool: &Self, extent: &Extent| {
+            pool.member_slot(extent.device_index)
+                .map(|slot| extent.offset / pool.allocators[slot].geometry().zone_size)
+        };
+        let continues = |previous: &[Extent], next: &[Extent]| {
+            previous.len() == next.len()
+                && previous.iter().zip(next).all(|(a, b)| {
+                    a.device_index == b.device_index
+                        && a.offset + run.stride == b.offset
+                        && zone_of(self, a).is_some()
+                        && zone_of(self, a) == zone_of(self, b)
+                })
+        };
+        let full = run.full_payload();
+        let mut parts = Vec::new();
+        let mut first = 0;
+        for k in 1..=run.count() {
+            if k < run.count() && continues(&sets[k - 1], &sets[k]) {
+                continue;
+            }
+            let from = (first as u64 * full).saturating_sub(run.data_offset);
+            let to = (k as u64 * full)
+                .saturating_sub(run.data_offset)
+                .min(run.logical_len);
+            let mut part = run.slice(from, to - from);
+            let length = part.copies[0].length;
+            part.copies = sets[first]
+                .iter()
+                .map(|copy| Extent { length, ..*copy })
+                .collect();
+            parts.push(part);
+            first = k;
+        }
+        Ok(Some(parts))
+    }
+
     fn rebuild_copy_set(
         &mut self,
         copies: &[Extent],
+        expect: Expect,
         memo: &mut std::collections::HashMap<(u16, u64), Vec<Extent>>,
         report: &mut RebuildReport,
     ) -> Result<Option<Vec<Extent>>> {
@@ -2220,7 +2710,7 @@ impl<D: BlockDevice> Pool<D> {
                 ..*extent
             };
             if let Ok(data) = read_extent_from_set(std::slice::from_ref(&self.devices[slot]), local)
-                && decode_record(&data).is_ok()
+                && expect.verify(&data).is_ok()
             {
                 if bytes.is_none() {
                     bytes = Some(data);
@@ -2233,7 +2723,7 @@ impl<D: BlockDevice> Pool<D> {
         }
         let bytes = match bytes {
             Some(bytes) => bytes,
-            None if self.evacuating.is_some() => match self.read_record(copies) {
+            None if self.evacuating.is_some() => match self.read_record(copies, expect) {
                 Ok(data) => data,
                 Err(_) => return Ok(None),
             },
@@ -2274,6 +2764,7 @@ impl<D: BlockDevice> Pool<D> {
     fn rebuild_stripe(
         &mut self,
         parity_extents: &[Extent],
+        run: Option<&StripedRun>,
         memberships: &StripeMembers,
         stripes: &mut std::collections::HashMap<(u16, u64), Option<StripeHeal>>,
         report: &mut RebuildReport,
@@ -2295,6 +2786,7 @@ impl<D: BlockDevice> Pool<D> {
             let record = self
                 .read_extent(*extent)
                 .ok()
+                .filter(|bytes| run.is_none_or(|run| run.parity_expect(row).verify(bytes).is_ok()))
                 .and_then(|bytes| decode_parity_record(&bytes).ok())
                 .filter(|record| usize::from(record.parity_index) == row);
             if let Some(record) = record {
@@ -2322,10 +2814,11 @@ impl<D: BlockDevice> Pool<D> {
         let mut data_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(data_count);
         let mut moving_data: Vec<usize> = Vec::new();
         for (column, piece) in descriptor.data_pieces.iter().enumerate() {
+            let crc = descriptor.data_crcs[column];
             let bytes = self
                 .read_extent(*piece)
                 .ok()
-                .filter(|bytes| decode_record(bytes).is_ok());
+                .filter(|bytes| decode_record(bytes).is_ok_and(|record| record.crc == crc));
             if bytes.is_none() || needs_move(self, piece) {
                 moving_data.push(column);
             }
@@ -2371,7 +2864,9 @@ impl<D: BlockDevice> Pool<D> {
             for (piece, &column) in rebuilt.into_iter().zip(&erased) {
                 let mut bytes = piece;
                 bytes.truncate(descriptor.data_pieces[column].length as usize);
-                if decode_record(&bytes).is_err() {
+                if decode_record(&bytes).is_err()
+                    || Expect::of(&bytes).crc != descriptor.data_crcs[column]
+                {
                     return Err(ScaleFsError::Corrupt(
                         "stripe reconstruction failed checksum verification",
                     ));
@@ -2471,6 +2966,8 @@ impl<D: BlockDevice> Pool<D> {
             .map(|bytes| bytes.as_deref().expect("every column read or rebuilt"))
             .collect();
         let regenerated = crate::rs::generate_parity(&all_data, parity_count, coverage)?;
+        let parity_tx = self.committed_tx + 1;
+        let mut parity_crcs = Vec::with_capacity(parity_count);
         for (row, (member, allocation)) in parity_slots.iter().enumerate() {
             let payload = match &parity_payloads[row] {
                 Some(payload) => payload.clone(),
@@ -2480,11 +2977,13 @@ impl<D: BlockDevice> Pool<D> {
                 parity_index: row as u8,
                 coverage_len: descriptor.coverage_len,
                 data_pieces: new_data_pieces.clone(),
+                data_crcs: descriptor.data_crcs.clone(),
                 parity_pieces: new_parity_pieces.clone(),
                 parity: payload,
             };
-            let bytes = crate::stripes::encode_parity_record(&record)?;
+            let bytes = crate::stripes::encode_parity_record(&record, parity_tx)?;
             debug_assert_eq!(bytes.len() as u64, parity_len);
+            parity_crcs.push(Expect::of(&bytes).crc);
             let slot = self
                 .member_slot(*member)
                 .expect("placed on a present member");
@@ -2495,6 +2994,8 @@ impl<D: BlockDevice> Pool<D> {
         let heal = StripeHeal {
             moved,
             parity_extents: new_parity_pieces,
+            parity_crcs,
+            parity_tx,
         };
         stripes.insert((first.device_index, first.offset), Some(heal.clone()));
         Ok(Some(heal))
@@ -2520,19 +3021,21 @@ impl<D: BlockDevice> Pool<D> {
         };
         let old_pieces: Vec<Extent> = members
             .iter()
-            .map(|&(device_index, offset, length)| Extent {
+            .map(|&(device_index, offset, length, _)| Extent {
                 device_index,
                 offset,
                 length,
             })
             .collect();
+        let data_crcs: Vec<u32> = members.iter().map(|&(.., crc)| crc).collect();
         let mut data_bytes: Vec<Vec<u8>> = Vec::with_capacity(old_pieces.len());
         let mut moving_data: Vec<usize> = Vec::new();
         for (column, piece) in old_pieces.iter().enumerate() {
+            let crc = data_crcs[column];
             let bytes = self
                 .read_extent(*piece)
                 .ok()
-                .filter(|bytes| decode_record(bytes).is_ok())
+                .filter(|bytes| decode_record(bytes).is_ok_and(|record| record.crc == crc))
                 .ok_or(ScaleFsError::Corrupt(
                     "stripe has too few surviving pieces to reconstruct",
                 ))?;
@@ -2633,16 +3136,20 @@ impl<D: BlockDevice> Pool<D> {
         }
         let refs: Vec<&[u8]> = data_bytes.iter().map(Vec::as_slice).collect();
         let rows = crate::rs::generate_parity(&refs, parity_count, coverage)?;
+        let parity_tx = self.committed_tx + 1;
+        let mut parity_crcs = Vec::with_capacity(parity_count);
         for (row, ((member, allocation), payload)) in parity_slots.iter().zip(rows).enumerate() {
             let record = ParityRecord {
                 parity_index: row as u8,
                 coverage_len,
                 data_pieces: new_data_pieces.clone(),
+                data_crcs: data_crcs.clone(),
                 parity_pieces: new_parity_pieces.clone(),
                 parity: payload,
             };
-            let bytes = crate::stripes::encode_parity_record(&record)?;
+            let bytes = crate::stripes::encode_parity_record(&record, parity_tx)?;
             debug_assert_eq!(bytes.len() as u64, parity_len);
+            parity_crcs.push(Expect::of(&bytes).crc);
             let slot = self
                 .member_slot(*member)
                 .expect("placed on a present member");
@@ -2653,6 +3160,8 @@ impl<D: BlockDevice> Pool<D> {
         let heal = StripeHeal {
             moved,
             parity_extents: new_parity_pieces,
+            parity_crcs,
+            parity_tx,
         };
         stripes.insert((first.device_index, first.offset), Some(heal.clone()));
         Ok(Some(heal))
@@ -2660,14 +3169,15 @@ impl<D: BlockDevice> Pool<D> {
 
     fn rebuild_tree(
         &mut self,
-        root: &[Extent],
+        root: &PageRef,
         memo: &mut std::collections::HashMap<(u16, u64), Vec<Extent>>,
         memberships: &StripeMembers,
         stripes: &mut std::collections::HashMap<(u16, u64), Option<StripeHeal>>,
         report: &mut RebuildReport,
-    ) -> Result<(Vec<Extent>, bool)> {
-        let bytes = self.read_record(root)?;
+    ) -> Result<(PageRef, bool)> {
+        let bytes = self.read_record(&root.copies, root.expect)?;
         let live_copies = root
+            .copies
             .iter()
             .filter(|extent| {
                 self.evacuating != Some(extent.device_index)
@@ -2677,14 +3187,15 @@ impl<D: BlockDevice> Pool<D> {
                             ..**extent
                         };
                         read_extent_from_set(std::slice::from_ref(&self.devices[slot]), local)
-                            .is_ok_and(|data| decode_record(&data).is_ok())
+                            .is_ok_and(|data| root.expect.verify(&data).is_ok())
                     })
             })
             .count();
-        let mut changed = live_copies != root.len();
+        let mut changed = live_copies != root.copies.len();
+        let tx = self.committed_tx + 1;
 
         let new_bytes = match decode_record(&bytes)?.kind {
-            RecordKind::MetadataInternal | RecordKind::MetadataInternalMirrored => {
+            RecordKind::MetadataInternal => {
                 let mut entries = decode_internal_record(&bytes)?;
                 for (_, child) in &mut entries {
                     let (new_child, child_changed) =
@@ -2694,50 +3205,60 @@ impl<D: BlockDevice> Pool<D> {
                         changed = true;
                     }
                 }
-                changed.then(|| encode_internal_record(&entries))
+                changed.then(|| encode_internal_record(&entries, tx))
             }
             RecordKind::MetadataLeaf => {
-                let mut items = decode_leaf_record(&bytes)?;
-                for (_, value) in &mut items {
-                    match value {
-                        MetadataValue::FileExtent { extents, .. } => {
-                            if let Some(healed) = self.rebuild_copy_set(extents, memo, report)? {
-                                *extents = healed;
+                let mut items = Vec::new();
+                for (key, mut value) in decode_leaf_record(&bytes)? {
+                    match &mut value {
+                        MetadataValue::FileRun(run) => {
+                            if let Some(parts) = self.rebuild_file_run(run, memo, report)? {
+                                changed = true;
+                                let mut at = key.offset;
+                                for part in parts {
+                                    let len = part.logical_len;
+                                    items.push((
+                                        MetadataKey { offset: at, ..key },
+                                        MetadataValue::FileRun(part),
+                                    ));
+                                    at += len;
+                                }
+                                continue;
+                            }
+                        }
+                        MetadataValue::StripedRun(run) => {
+                            let parity = run.parity.clone();
+                            if let Some(heal) = self.rebuild_stripe(
+                                &parity,
+                                Some(run),
+                                memberships,
+                                stripes,
+                                report,
+                            )? {
+                                *run = heal.apply(run);
                                 changed = true;
                             }
                         }
-                        MetadataValue::StripedExtent {
-                            extent,
-                            parity_extents,
-                            ..
-                        } => {
-                            if let Some(heal) =
-                                self.rebuild_stripe(parity_extents, memberships, stripes, report)?
-                            {
-                                *extent = heal.new_data_extent(*extent);
-                                *parity_extents = heal.parity_extents.clone();
-                                changed = true;
-                            }
-                        }
-                        MetadataValue::RetainedRoot { metadata_roots, .. } => {
-                            let nested = metadata_roots.clone();
-                            let (new_roots, nested_changed) =
+                        MetadataValue::RetainedRoot { root, .. } => {
+                            let nested = root.clone();
+                            let (new_root, nested_changed) =
                                 self.rebuild_tree(&nested, memo, memberships, stripes, report)?;
                             if nested_changed {
-                                *metadata_roots = new_roots;
+                                *root = new_root;
                                 changed = true;
                             }
                         }
                         _ => {}
                     }
+                    items.push((key, value));
                 }
-                changed.then(|| encode_leaf_record(&items))
+                changed.then(|| encode_leaf_record(&items, tx))
             }
             _ => return Err(ScaleFsError::Corrupt("expected a metadata page record")),
         };
 
         match new_bytes {
-            None => Ok((root.to_vec(), false)),
+            None => Ok((root.clone(), false)),
             Some(bytes) => {
                 let mirror_width = self.mirror_width();
                 let exclude: Vec<u16> = self.evacuating.into_iter().collect();
@@ -2763,7 +3284,13 @@ impl<D: BlockDevice> Pool<D> {
                         length: bytes.len() as u64,
                     });
                 }
-                Ok((extents, true))
+                Ok((
+                    PageRef {
+                        copies: extents,
+                        expect: Expect::of(&bytes),
+                    },
+                    true,
+                ))
             }
         }
     }
@@ -3058,7 +3585,7 @@ impl<D: BlockDevice> Pool<D> {
             aux_record: None,
             label: template.label.clone(),
         };
-        let bytes = encode_superblock(&superblock)?;
+        let bytes = encode_superblock(&superblock, self.committed_tx + 1)?;
         let device = format_member_wrapper(spec.device, template.pool_id, spec.device_id)?;
         for offset in superblock_slots(device.len()) {
             write_padded(&device, offset, &bytes, SUPERBLOCK_PAD)?;
@@ -3116,127 +3643,169 @@ impl<D: BlockDevice> Pool<D> {
     }
 
     pub fn scrub(&mut self, repair: bool) -> Result<ScrubReport> {
-        let mut report = ScrubReport::default();
-        let mut dirty: HashSet<usize> = HashSet::new();
+        let mut cursor = self.scrub_start();
+        while !self.scrub_step(&mut cursor, repair, None)? {}
+        self.scrub_finish(cursor)
+    }
 
-        for slot in 0..self.devices.len() {
-            report.records_checked += 1;
-            let offsets = superblock_slots(self.devices[slot].len());
-            for offset in offsets {
-                report.copies_checked += 1;
-                let healthy = read_prefix(&self.devices[slot], offset)
-                    .and_then(|bytes| decode_superblock(&bytes))
-                    .is_ok();
-                if !healthy {
-                    report.copies_bad += 1;
-                    if repair {
-                        let bytes = encode_superblock(&self.superblocks[slot])?;
-                        write_padded(&self.devices[slot], offset, &bytes, SUPERBLOCK_PAD)?;
-                        report.copies_repaired += 1;
-                        dirty.insert(slot);
-                    }
-                }
-            }
+    pub fn scrub_start(&self) -> ScrubCursor {
+        ScrubCursor {
+            report: ScrubReport::default(),
+            dirty: HashSet::new(),
+            visited: HashSet::new(),
+            stack: vec![self.last_metadata_root.clone()],
+            chains_checked: false,
+        }
+    }
 
-            let mut chain: Vec<Extent> = Vec::new();
-            if let Some(commit_extent) = self.superblocks[slot].newest_commit {
-                chain.push(commit_extent);
-                if let Ok(bytes) =
-                    read_extent_from_set(std::slice::from_ref(&self.devices[slot]), commit_extent)
-                    && let Ok(commit) = decode_commit(&bytes)
-                {
-                    chain.push(commit.allocator_summary);
-                    if let Some(aux) = commit.aux_root {
-                        chain.push(aux);
-                    }
-                }
-            }
-            for extent in chain {
-                report.records_checked += 1;
-                report.copies_checked += 1;
-                let healthy =
-                    read_extent_from_set(std::slice::from_ref(&self.devices[slot]), extent)
-                        .and_then(|bytes| decode_record(&bytes).map(|_| ()))
+    pub fn scrub_step(
+        &mut self,
+        cursor: &mut ScrubCursor,
+        repair: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<bool> {
+        let mut dirty_slots: HashSet<usize> = HashSet::new();
+        if !cursor.chains_checked {
+            cursor.chains_checked = true;
+            for slot in 0..self.devices.len() {
+                cursor.report.records_checked += 1;
+                let offsets = superblock_slots(self.devices[slot].len());
+                for offset in offsets {
+                    cursor.report.copies_checked += 1;
+                    let healthy = read_prefix(&self.devices[slot], offset)
+                        .and_then(|bytes| decode_superblock(&bytes))
                         .is_ok();
-                if !healthy {
-                    report.copies_bad += 1;
-                    report.copies_unrepairable += 1;
+                    if !healthy {
+                        cursor.report.copies_bad += 1;
+                        if repair {
+                            let bytes = encode_superblock(
+                                &self.superblocks[slot],
+                                superblock_tx(&self.superblocks[slot], self.committed_tx),
+                            )?;
+                            write_padded(&self.devices[slot], offset, &bytes, SUPERBLOCK_PAD)?;
+                            cursor.report.copies_repaired += 1;
+                            dirty_slots.insert(slot);
+                        }
+                    }
+                }
+
+                let mut chain: Vec<RecordRef> = Vec::new();
+                if let Some(commit_ref) = self.superblocks[slot].newest_commit {
+                    chain.push(commit_ref);
+                    if let Ok(bytes) = read_ref(&self.devices[slot], commit_ref)
+                        && let Ok(commit) = decode_commit(&bytes)
+                    {
+                        chain.push(commit.allocator_summary);
+                        if let Some(aux) = commit.aux_root {
+                            chain.push(aux);
+                        }
+                    }
+                }
+                for reference in chain {
+                    cursor.report.records_checked += 1;
+                    cursor.report.copies_checked += 1;
+                    if let Err(error) = read_ref(&self.devices[slot], reference) {
+                        if is_stale(&error) {
+                            cursor.report.copies_stale += 1;
+                        }
+                        cursor.report.copies_bad += 1;
+                        cursor.report.copies_unrepairable += 1;
+                    }
                 }
             }
         }
 
-        let mut visited: HashSet<(u16, u64)> = HashSet::new();
-        let mut stack = vec![self.last_metadata_root.clone()];
-        while let Some(copies) = stack.pop() {
-            let Some(first) = copies.first() else {
+        while !cursor.stack.is_empty() {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                break;
+            }
+            let page = cursor.stack.pop().expect("checked non-empty");
+            let Some(first) = page.copies.first() else {
                 continue;
             };
-            if !visited.insert((first.device_index, first.offset)) {
+            if !cursor.visited.insert((first.device_index, first.offset)) {
                 continue;
             }
-            let Some(bytes) = self.scrub_copy_set(&copies, repair, &mut report, &mut dirty)? else {
+            let Some(bytes) = self.scrub_copy_set(
+                &page.copies,
+                Some(page.expect),
+                repair,
+                &mut cursor.report,
+                &mut dirty_slots,
+            )?
+            else {
                 continue;
             };
             match decode_record(&bytes)?.kind {
-                RecordKind::MetadataInternal | RecordKind::MetadataInternalMirrored => {
+                RecordKind::MetadataInternal => {
                     for (_, child) in decode_internal_record(&bytes)? {
-                        stack.push(child);
+                        cursor.stack.push(child);
                     }
                 }
                 RecordKind::MetadataLeaf => {
                     for (_, value) in decode_leaf_record(&bytes)? {
                         match value {
-                            MetadataValue::FileExtent { extents, .. } => {
-                                let Some(first) = extents.first() else {
-                                    continue;
-                                };
-                                if visited.insert((first.device_index, first.offset)) {
-                                    self.scrub_copy_set(&extents, repair, &mut report, &mut dirty)?;
+                            MetadataValue::FileRun(run) => {
+                                for k in 0..run.count() {
+                                    let copies = run.record_copies(k);
+                                    let first = copies[0];
+                                    if cursor.visited.insert((first.device_index, first.offset)) {
+                                        self.scrub_copy_set(
+                                            &copies,
+                                            Some(run.expect(k)),
+                                            repair,
+                                            &mut cursor.report,
+                                            &mut dirty_slots,
+                                        )?;
+                                    }
                                 }
                             }
-                            MetadataValue::StripedExtent {
-                                extent,
-                                parity_extents,
-                                ..
-                            } => {
+                            MetadataValue::StripedRun(run) => {
+                                let parity_extents = &run.parity;
                                 let Some(first) = parity_extents.first() else {
                                     continue;
                                 };
-                                let fresh = visited.insert((first.device_index, first.offset));
+                                let fresh =
+                                    cursor.visited.insert((first.device_index, first.offset));
                                 if fresh
                                     && self.scrub_stripe(
-                                        &parity_extents,
+                                        &run,
                                         repair,
-                                        &mut report,
-                                        &mut dirty,
-                                        &mut visited,
+                                        &mut cursor.report,
+                                        &mut dirty_slots,
+                                        &mut cursor.visited,
                                     )?
                                 {
                                     continue;
                                 }
                                 if fresh {
-                                    visited.remove(&(first.device_index, first.offset));
-                                    for parity in &parity_extents {
-                                        if visited.insert((parity.device_index, parity.offset | 1))
+                                    cursor.visited.remove(&(first.device_index, first.offset));
+                                    for parity in parity_extents {
+                                        if cursor
+                                            .visited
+                                            .insert((parity.device_index, parity.offset | 1))
                                         {
-                                            report.records_checked += 1;
-                                            report.copies_checked += 1;
-                                            report.copies_bad += 1;
-                                            report.copies_unrepairable += 1;
+                                            cursor.report.records_checked += 1;
+                                            cursor.report.copies_checked += 1;
+                                            cursor.report.copies_bad += 1;
+                                            cursor.report.copies_unrepairable += 1;
                                         }
                                     }
                                 }
-                                if visited.insert((extent.device_index, extent.offset)) {
-                                    self.scrub_copy_set(
-                                        &[extent],
-                                        repair,
-                                        &mut report,
-                                        &mut dirty,
-                                    )?;
+                                for (k, piece) in run.pieces.iter().enumerate() {
+                                    if cursor.visited.insert((piece.device_index, piece.offset)) {
+                                        self.scrub_copy_set(
+                                            std::slice::from_ref(piece),
+                                            Some(run.expect(k)),
+                                            repair,
+                                            &mut cursor.report,
+                                            &mut dirty_slots,
+                                        )?;
+                                    }
                                 }
                             }
-                            MetadataValue::RetainedRoot { metadata_roots, .. } => {
-                                stack.push(metadata_roots);
+                            MetadataValue::RetainedRoot { root, .. } => {
+                                cursor.stack.push(root);
                             }
                             _ => {}
                         }
@@ -3246,22 +3815,34 @@ impl<D: BlockDevice> Pool<D> {
             }
         }
 
-        for slot in dirty {
-            self.devices[slot].flush()?;
+        for slot in dirty_slots {
+            if let Some(member) = self.member_of_slot(slot) {
+                cursor.dirty.insert(member);
+            }
         }
-        Ok(report)
+        Ok(cursor.stack.is_empty())
+    }
+
+    pub fn scrub_finish(&mut self, cursor: ScrubCursor) -> Result<ScrubReport> {
+        for member in cursor.dirty {
+            if let Some(slot) = self.member_slot(member) {
+                self.devices[slot].flush()?;
+            }
+        }
+        Ok(cursor.report)
     }
 
     fn scrub_copy_set(
         &mut self,
         copies: &[Extent],
+        expect: Option<Expect>,
         repair: bool,
         report: &mut ScrubReport,
         dirty: &mut HashSet<usize>,
     ) -> Result<Option<Vec<u8>>> {
         report.records_checked += 1;
-        let mut good: Option<Vec<u8>> = None;
         let mut bad: Vec<(usize, Extent)> = Vec::new();
+        let mut agreeing: CopyGroups = Vec::new();
         for extent in copies {
             let Some(slot) = self.member_slot(extent.device_index) else {
                 report.copies_missing += 1;
@@ -3272,18 +3853,44 @@ impl<D: BlockDevice> Pool<D> {
                 device_index: 0,
                 ..*extent
             };
-            match read_extent_from_set(std::slice::from_ref(&self.devices[slot]), local) {
-                Ok(bytes) if decode_record(&bytes).is_ok() => {
-                    if good.is_none() {
-                        good = Some(bytes);
+            let verdict = read_extent_from_set(std::slice::from_ref(&self.devices[slot]), local)
+                .and_then(|bytes| {
+                    match expect {
+                        Some(expect) => expect.verify(&bytes)?,
+                        None => decode_record(&bytes)?,
+                    };
+                    Ok(bytes)
+                });
+            match verdict {
+                Ok(bytes) => match agreeing.iter_mut().find(|(content, _)| *content == bytes) {
+                    Some((_, holders)) => holders.push((slot, *extent)),
+                    None => agreeing.push((bytes, vec![(slot, *extent)])),
+                },
+                Err(error) => {
+                    if is_stale(&error) {
+                        report.copies_stale += 1;
                     }
-                }
-                _ => {
                     report.copies_bad += 1;
                     bad.push((slot, *extent));
                 }
             }
         }
+        agreeing.sort_by_key(|(_, holders)| std::cmp::Reverse(holders.len()));
+        let valid: usize = agreeing.iter().map(|(_, holders)| holders.len()).sum();
+        let majority = agreeing
+            .first()
+            .is_some_and(|(_, holders)| holders.len() * 2 > valid);
+        for (_, holders) in agreeing.iter().skip(1) {
+            for &(slot, extent) in holders {
+                report.copies_bad += 1;
+                if majority {
+                    bad.push((slot, extent));
+                } else {
+                    report.copies_unrepairable += 1;
+                }
+            }
+        }
+        let good: Option<Vec<u8>> = agreeing.into_iter().next().map(|(content, _)| content);
         match (&good, bad.is_empty()) {
             (Some(bytes), false) => {
                 if repair {
@@ -3306,27 +3913,64 @@ impl<D: BlockDevice> Pool<D> {
 
     fn scrub_stripe(
         &mut self,
-        parity_extents: &[Extent],
+        run: &StripedRun,
         repair: bool,
         report: &mut ScrubReport,
         dirty: &mut HashSet<usize>,
         visited: &mut HashSet<(u16, u64)>,
     ) -> Result<bool> {
+        let parity_extents = run.parity.as_slice();
         let mut parity_records: Vec<Option<ParityRecord>> = Vec::new();
+        let mut stale_rows = 0u64;
+        let mut stale_descriptor: Option<ParityRecord> = None;
         for (row, extent) in parity_extents.iter().enumerate() {
             let record = if self.member_slot(extent.device_index).is_none() {
                 None
             } else {
-                self.read_extent(*extent)
-                    .ok()
-                    .and_then(|bytes| decode_parity_record(&bytes).ok())
-                    .filter(|record| usize::from(record.parity_index) == row)
+                self.read_extent(*extent).ok().and_then(|bytes| {
+                    let decoded = decode_parity_record(&bytes)
+                        .ok()
+                        .filter(|record| usize::from(record.parity_index) == row);
+                    match run.parity_expect(row).verify(&bytes) {
+                        Ok(_) => decoded,
+                        Err(error) => {
+                            if is_stale(&error) {
+                                stale_rows += 1;
+                                if stale_descriptor.is_none() {
+                                    stale_descriptor = decoded.filter(|record| {
+                                        record.parity_pieces == run.parity
+                                            && run.pieces.iter().zip(&run.crcs).all(
+                                                |(piece, crc)| {
+                                                    record
+                                                        .data_pieces
+                                                        .iter()
+                                                        .zip(&record.data_crcs)
+                                                        .any(|(named, named_crc)| {
+                                                            named == piece && named_crc == crc
+                                                        })
+                                                },
+                                            )
+                                    });
+                                }
+                            }
+                            None
+                        }
+                    }
+                })
             };
             parity_records.push(record);
         }
-        let Some(descriptor) = parity_records.iter().flatten().next().cloned() else {
+        let Some(descriptor) = parity_records
+            .iter()
+            .flatten()
+            .next()
+            .cloned()
+            .or(stale_descriptor)
+        else {
             return Ok(false);
         };
+        report.copies_stale += stale_rows;
+        let stripe_tx = run.parity_tx;
         if descriptor.parity_pieces != *parity_extents {
             return Ok(false);
         }
@@ -3347,9 +3991,19 @@ impl<D: BlockDevice> Pool<D> {
             }
             report.records_checked += 1;
             report.copies_checked += 1;
+            let crc = descriptor.data_crcs[index];
             match self.read_extent(*piece) {
-                Ok(bytes) if decode_record(&bytes).is_ok() => data_bytes.push(Some(bytes)),
-                _ => {
+                Ok(bytes) if decode_record(&bytes).is_ok_and(|record| record.crc == crc) => {
+                    data_bytes.push(Some(bytes))
+                }
+                Ok(bytes) => {
+                    if decode_record(&bytes).is_ok() {
+                        report.copies_stale += 1;
+                    }
+                    report.copies_bad += 1;
+                    data_bytes.push(None);
+                }
+                Err(_) => {
                     report.copies_bad += 1;
                     data_bytes.push(None);
                 }
@@ -3402,7 +4056,9 @@ impl<D: BlockDevice> Pool<D> {
                         let extent = descriptor.data_pieces[column];
                         let mut bytes = piece;
                         bytes.truncate(extent.length as usize);
-                        if decode_record(&bytes).is_err() {
+                        if decode_record(&bytes).is_err()
+                            || Expect::of(&bytes).crc != descriptor.data_crcs[column]
+                        {
                             if !data_missing[column] {
                                 report.copies_unrepairable += 1;
                             }
@@ -3460,10 +4116,15 @@ impl<D: BlockDevice> Pool<D> {
                             parity_index: row as u8,
                             coverage_len: descriptor.coverage_len,
                             data_pieces: descriptor.data_pieces.clone(),
+                            data_crcs: descriptor.data_crcs.clone(),
                             parity_pieces: descriptor.parity_pieces.clone(),
                             parity: rows[row].clone(),
                         };
-                        let bytes = crate::stripes::encode_parity_record(&record)?;
+                        let bytes = crate::stripes::encode_parity_record(&record, stripe_tx)?;
+                        if Expect::of(&bytes) != run.parity_expect(row) {
+                            report.copies_unrepairable += 1;
+                            continue;
+                        }
                         let slot = self
                             .member_slot(extent.device_index)
                             .expect("presence checked above");
@@ -3499,8 +4160,8 @@ impl<D: BlockDevice> Pool<D> {
 
         let mut snapshot_stripes: HashSet<(u16, u64)> = HashSet::new();
         {
-            let retained: Vec<Vec<Extent>> = self
-                .tree
+            let retained: Vec<PageRef> = self
+                .tree()
                 .range(
                     MetadataKey {
                         object_id: 0,
@@ -3512,12 +4173,10 @@ impl<D: BlockDevice> Pool<D> {
                         item_type: ITEM_RETAINED_ROOT,
                         offset: u64::MAX,
                     },
-                )
-                .iter()
+                )?
+                .into_iter()
                 .filter_map(|(_, value)| match value {
-                    MetadataValue::RetainedRoot { metadata_roots, .. } => {
-                        Some(metadata_roots.clone())
-                    }
+                    MetadataValue::RetainedRoot { root, .. } => Some(root),
                     _ => None,
                 })
                 .collect();
@@ -3532,37 +4191,35 @@ impl<D: BlockDevice> Pool<D> {
         {
             let mut by_stripe: std::collections::BTreeMap<(u16, u64), LiveStripe> =
                 std::collections::BTreeMap::new();
-            for (_, value) in self.tree.range(MetadataKey::MIN, MetadataKey::MAX) {
-                let MetadataValue::StripedExtent {
-                    extent,
-                    parity_extents,
-                    ..
-                } = value
-                else {
-                    continue;
+            self.tree().for_each(&mut |_, value| {
+                let MetadataValue::StripedRun(run) = value else {
+                    return;
                 };
-                let Some(first) = parity_extents.first() else {
-                    continue;
+                let Some(first) = run.parity.first() else {
+                    return;
                 };
-                by_stripe
+                let live = &mut by_stripe
                     .entry((first.device_index, first.offset))
-                    .or_insert_with(|| (parity_extents.clone(), HashSet::new()))
-                    .1
-                    .insert((extent.device_index, extent.offset));
-            }
+                    .or_insert_with(|| (run.clone(), HashSet::new()))
+                    .1;
+                for piece in &run.pieces {
+                    live.insert((piece.device_index, piece.offset));
+                }
+            })?;
             live_refs.extend(by_stripe);
         }
 
         let target = usize::from(self.data_width()).max(1);
         let mut pending: Vec<(Extent, Vec<u8>)> = Vec::new();
         let mut stripes_compacted = 0u64;
-        for (key, (parity_list, live_pieces)) in live_refs {
+        for (key, (sample, live_pieces)) in live_refs {
             if snapshot_stripes.contains(&key) {
                 continue;
             }
             let mut descriptor = None;
-            for extent in &parity_list {
+            for (row, extent) in sample.parity.iter().enumerate() {
                 if let Ok(bytes) = self.read_extent(*extent)
+                    && sample.parity_expect(row).verify(&bytes).is_ok()
                     && let Ok(record) = decode_parity_record(&bytes)
                 {
                     descriptor = Some(record);
@@ -3583,11 +4240,16 @@ impl<D: BlockDevice> Pool<D> {
             }
             let mut stripe_records: Vec<(Extent, Vec<u8>)> = Vec::new();
             let mut readable = true;
-            for piece in &descriptor.data_pieces {
+            for (column, piece) in descriptor.data_pieces.iter().enumerate() {
                 if !live_pieces.contains(&(piece.device_index, piece.offset)) {
                     continue;
                 }
-                match self.read_striped(*piece, &parity_list) {
+                match self.read_described_piece(
+                    *piece,
+                    descriptor.data_crcs[column],
+                    &sample.parity,
+                    Some(&sample),
+                ) {
                     Ok(bytes) => stripe_records.push((*piece, bytes)),
                     Err(_) => {
                         readable = false;
@@ -3602,7 +4264,8 @@ impl<D: BlockDevice> Pool<D> {
             pending.extend(stripe_records);
         }
 
-        let mut moved: std::collections::HashMap<(u16, u64), (Extent, Vec<Extent>)> =
+        let mut emitted: Vec<crate::fs::EmittedStripe> = Vec::new();
+        let mut moved: std::collections::HashMap<(u16, u64), (usize, Extent)> =
             std::collections::HashMap::new();
         let mut index = 0usize;
         while index < pending.len() {
@@ -3611,44 +4274,65 @@ impl<D: BlockDevice> Pool<D> {
                 .iter()
                 .map(|(_, bytes)| bytes.clone())
                 .collect();
-            let (placed, data_extents, parity_extents) = self.emit_stripe(&group)?;
-            for (position, (old, _)) in pending[index..index + placed].iter().enumerate() {
+            let stripe = self.emit_stripe(&group)?;
+            for (position, (old, _)) in pending[index..index + stripe.placed].iter().enumerate() {
                 moved.insert(
                     (old.device_index, old.offset),
-                    (data_extents[position], parity_extents.clone()),
+                    (emitted.len(), stripe.pieces[position]),
                 );
             }
-            index += placed;
+            index += stripe.placed;
+            emitted.push(stripe);
         }
         let records_rewritten = moved.len() as u64;
-        let repoint: Vec<(MetadataKey, MetadataValue)> = self
-            .tree
-            .range(MetadataKey::MIN, MetadataKey::MAX)
-            .iter()
-            .filter_map(|(key, value)| match value {
-                MetadataValue::StripedExtent {
-                    extent,
-                    data_offset,
-                    logical_len,
-                    ..
-                } => moved.get(&(extent.device_index, extent.offset)).map(
-                    |(new_extent, new_parity)| {
-                        (
-                            *key,
-                            MetadataValue::StripedExtent {
-                                extent: *new_extent,
-                                parity_extents: new_parity.clone(),
-                                data_offset: *data_offset,
-                                logical_len: *logical_len,
-                            },
-                        )
+        let mut repoint: Vec<(MetadataKey, MetadataValue)> = Vec::new();
+        self.tree().for_each(&mut |key, value| {
+            let MetadataValue::StripedRun(run) = value else {
+                return;
+            };
+            if !run
+                .pieces
+                .iter()
+                .all(|piece| moved.contains_key(&(piece.device_index, piece.offset)))
+            {
+                return;
+            }
+            let homes: Vec<(usize, Extent)> = run
+                .pieces
+                .iter()
+                .map(|piece| moved[&(piece.device_index, piece.offset)])
+                .collect();
+            let full = run.full_payload();
+            let mut first = 0;
+            for k in 1..=run.count() {
+                if k < run.count() && homes[k].0 == homes[first].0 {
+                    continue;
+                }
+                let from = (first as u64 * full).saturating_sub(run.data_offset);
+                let to = (k as u64 * full)
+                    .saturating_sub(run.data_offset)
+                    .min(run.logical_len);
+                let part = run.slice(from, to - from);
+                let stripe = &emitted[homes[first].0];
+                repoint.push((
+                    MetadataKey {
+                        offset: key.offset + from,
+                        ..*key
                     },
-                ),
-                _ => None,
-            })
-            .collect();
+                    MetadataValue::StripedRun(StripedRun {
+                        pieces: homes[first..k].iter().map(|(_, piece)| *piece).collect(),
+                        parity: stripe.parity.clone(),
+                        parity_crcs: stripe.parity_crcs.clone(),
+                        parity_tx: stripe.parity_tx,
+                        ..part
+                    }),
+                ));
+                first = k;
+            }
+        })?;
+        let tree = self.tree_mut();
         for (key, value) in repoint {
-            self.tree.insert(key, value)?;
+            tree.insert(key, value)?;
         }
 
         let reclaim = self.reclaim(now_ns)?;
@@ -3661,20 +4345,21 @@ impl<D: BlockDevice> Pool<D> {
 
     fn collect_stripe_keys(
         &self,
-        root: &[Extent],
+        root: &PageRef,
         keys: &mut HashSet<(u16, u64)>,
         visited: &mut HashSet<(u16, u64)>,
-        pending_roots: &mut Vec<Vec<Extent>>,
+        pending_roots: &mut Vec<PageRef>,
     ) -> Result<()> {
         let first = root
+            .copies
             .first()
             .ok_or(ScaleFsError::Corrupt("tree root has no copies"))?;
         if !visited.insert((first.device_index, first.offset)) {
             return Ok(());
         }
-        let bytes = self.read_record(root)?;
+        let bytes = self.read_record(&root.copies, root.expect)?;
         match decode_record(&bytes)?.kind {
-            RecordKind::MetadataInternal | RecordKind::MetadataInternalMirrored => {
+            RecordKind::MetadataInternal => {
                 for (_, child) in decode_internal_record(&bytes)? {
                     self.collect_stripe_keys(&child, keys, visited, pending_roots)?;
                 }
@@ -3682,13 +4367,13 @@ impl<D: BlockDevice> Pool<D> {
             RecordKind::MetadataLeaf => {
                 for (_, value) in decode_leaf_record(&bytes)? {
                     match value {
-                        MetadataValue::StripedExtent { parity_extents, .. } => {
-                            if let Some(first) = parity_extents.first() {
+                        MetadataValue::StripedRun(run) => {
+                            if let Some(first) = run.parity.first() {
                                 keys.insert((first.device_index, first.offset));
                             }
                         }
-                        MetadataValue::RetainedRoot { metadata_roots, .. } => {
-                            pending_roots.push(metadata_roots);
+                        MetadataValue::RetainedRoot { root, .. } => {
+                            pending_roots.push(root);
                         }
                         _ => {}
                     }
@@ -3732,16 +4417,21 @@ impl<D: BlockDevice> Pool<D> {
         }
 
         for slot in 0..self.devices.len() {
-            let commit_extent = self.superblocks[slot]
+            let commit_ref = self.superblocks[slot]
                 .newest_commit
                 .ok_or(ScaleFsError::Corrupt("superblock references no commit"))?;
-            mark_local_extent(&mut live, &zone_sizes, slot, commit_extent)?;
-            let device = std::slice::from_ref(&self.devices[slot]);
-            let commit = decode_commit(&read_extent_from_set(device, commit_extent)?)?;
-            mark_local_extent(&mut live, &zone_sizes, slot, commit.allocator_summary)?;
+            mark_local_extent(&mut live, &zone_sizes, slot, commit_ref.extent)?;
+            let device = &self.devices[slot];
+            let commit = decode_commit(&read_ref(device, commit_ref)?)?;
+            mark_local_extent(
+                &mut live,
+                &zone_sizes,
+                slot,
+                commit.allocator_summary.extent,
+            )?;
             if let Some(aux) = commit.aux_root {
-                mark_local_extent(&mut live, &zone_sizes, slot, aux)?;
-                let roster = decode_topology(&read_extent_from_set(device, aux)?)?;
+                mark_local_extent(&mut live, &zone_sizes, slot, aux.extent)?;
+                let roster = decode_topology(&read_ref(device, aux)?)?;
                 mark_roster_chain_heads(&mut live, &zone_sizes, &self.member_slots, &roster)?;
             }
         }
@@ -3836,9 +4526,9 @@ struct PlannedCommit {
     stage_pages_and_summaries: Vec<PlannedWrite>,
     stage_commit_records: Vec<PlannedWrite>,
     stage_superblocks: Vec<PlannedWrite>,
-    root_replicas: Vec<Extent>,
+    root_replicas: PageRef,
     roster_members: Option<Vec<TopologyMember>>,
-    commit_extents: Vec<Option<Extent>>,
+    commit_extents: Vec<Option<RecordRef>>,
     taken_dirty: HashSet<u16>,
     taken_force_full: bool,
     drained_suspects: Vec<u16>,
@@ -3903,6 +4593,22 @@ pub struct CommitTicket<D> {
 impl<D: BlockDevice> CommitTicket<D> {
     pub fn tx_id(&self) -> u64 {
         self.plan.tx_id
+    }
+
+    pub fn planned_io(&self) -> (u64, u64) {
+        let plan = &self.plan;
+        let mut count = 0u64;
+        let mut bytes = 0u64;
+        for write in plan
+            .stage_pages_and_summaries
+            .iter()
+            .chain(&plan.stage_commit_records)
+            .chain(&plan.stage_superblocks)
+        {
+            count += 1;
+            bytes += write.bytes.len() as u64;
+        }
+        (count, bytes)
     }
 
     pub fn execute(self) -> std::result::Result<ExecutedCommit, AbortedCommit> {
@@ -4023,17 +4729,52 @@ fn write_padded<D: BlockDevice>(device: &D, offset: u64, bytes: &[u8], unit: usi
     device.write_at(offset, &buf)
 }
 
-fn read_any_copy<D: BlockDevice>(devices: &[D], copies: &[Extent]) -> Result<Vec<u8>> {
+fn root_of(commit: &Commit) -> PageRef {
+    PageRef {
+        copies: vec![commit.metadata_root.extent],
+        expect: commit.metadata_root.expect,
+    }
+}
+
+fn superblock_tx(superblock: &Superblock, fallback: u64) -> u64 {
+    superblock
+        .newest_commit
+        .map_or(fallback.max(1), |commit| commit.expect.tx)
+}
+
+fn read_ref<D: BlockDevice>(device: &D, reference: RecordRef) -> Result<Vec<u8>> {
+    let bytes = read_extent_from_set(std::slice::from_ref(device), reference.extent)?;
+    reference.expect.verify(&bytes)?;
+    Ok(bytes)
+}
+
+fn read_any_copy<D: BlockDevice>(
+    devices: &[D],
+    copies: &[Extent],
+    expect: Option<Expect>,
+) -> Result<Vec<u8>> {
     let identity: Vec<Option<usize>> = (0..devices.len()).map(Some).collect();
-    read_any_copy_slotted(devices, &identity, copies)
+    read_any_copy_slotted(devices, &identity, copies, expect)
 }
 
 fn read_any_copy_slotted<D: BlockDevice>(
     devices: &[D],
     slots: &[Option<usize>],
     copies: &[Extent],
+    expect: Option<Expect>,
+) -> Result<Vec<u8>> {
+    read_any_copy_counted(devices, slots, copies, expect, None)
+}
+
+fn read_any_copy_counted<D: BlockDevice>(
+    devices: &[D],
+    slots: &[Option<usize>],
+    copies: &[Extent],
+    expect: Option<Expect>,
+    stale: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<u8>> {
     let mut last_error = ScaleFsError::Corrupt("record has no copies");
+    let mut stale_seen = false;
     for extent in copies {
         let Some(slot) = slots
             .get(usize::from(extent.device_index))
@@ -4048,12 +4789,29 @@ fn read_any_copy_slotted<D: BlockDevice>(
             ..*extent
         };
         match read_extent_from_set(std::slice::from_ref(&devices[slot]), local) {
-            Ok(bytes) => match decode_record(&bytes) {
-                Ok(_) => return Ok(bytes),
-                Err(err) => last_error = err,
-            },
+            Ok(bytes) => {
+                let verdict = match expect {
+                    Some(expect) => expect.verify_in_place(&bytes).map(|_| ()),
+                    None => crate::format::check_record(&bytes).map(|_| ()),
+                };
+                match verdict {
+                    Ok(()) => return Ok(bytes),
+                    Err(err) => {
+                        if is_stale(&err) {
+                            stale_seen = true;
+                            if let Some(stale) = stale {
+                                stale.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        last_error = err;
+                    }
+                }
+            }
             Err(err) => last_error = err,
         }
+    }
+    if stale_seen {
+        return Err(ScaleFsError::Corrupt(crate::format::STALE_COPY));
     }
     Err(last_error)
 }
@@ -4103,6 +4861,16 @@ fn place_distinct_excluding(
 }
 
 fn read_extent_from_set<D: BlockDevice>(devices: &[D], extent: Extent) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    read_extent_into_from_set(devices, extent, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_extent_into_from_set<D: BlockDevice>(
+    devices: &[D],
+    extent: Extent,
+    bytes: &mut Vec<u8>,
+) -> Result<()> {
     let device = devices
         .get(usize::from(extent.device_index))
         .ok_or(ScaleFsError::Corrupt(
@@ -4114,15 +4882,33 @@ fn read_extent_from_set<D: BlockDevice>(devices: &[D], extent: Extent) -> Result
     if end > device.len() {
         return Err(ScaleFsError::Corrupt("extent reaches past the device end"));
     }
-    let mut bytes = vec![
-        0;
-        usize::try_from(extent.length).map_err(|_| ScaleFsError::Corrupt(
-            "extent length exceeds address space"
-        ))?
-    ];
-    device.read_at(extent.offset, &mut bytes)?;
-    Ok(bytes)
+    if extent.length > MAX_RECORD_LEN {
+        return Err(ScaleFsError::Corrupt(
+            "extent is longer than any record a writer produces",
+        ));
+    }
+    let len = usize::try_from(extent.length)
+        .map_err(|_| ScaleFsError::Corrupt("extent length exceeds address space"))?;
+    bytes.clear();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| ScaleFsError::Corrupt("extent too long to read into memory"))?;
+    bytes.resize(len, 0);
+    device.read_at(extent.offset, bytes)
 }
+
+thread_local! {
+    static READ_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_read_buffer<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    READ_BUFFER.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffer) => f(&mut buffer),
+        Err(_) => f(&mut Vec::new()),
+    })
+}
+
+const MAX_RECORD_LEN: u64 = 1 << 30;
 
 fn check_member_fits<D: BlockDevice>(device: &D, geometry: Geometry) -> Result<()> {
     if crate::gpt::usable_len(device.len(), device.sector_size()) < geometry.capacity_bytes() {
@@ -4172,10 +4958,10 @@ fn load_candidate<D: BlockDevice>(
     device: &D,
     superblock: Superblock,
 ) -> Result<(Superblock, Commit)> {
-    let extent = superblock
+    let reference = superblock
         .newest_commit
         .ok_or(ScaleFsError::Corrupt("superblock references no commit"))?;
-    let commit = decode_commit(&read_extent_from_set(std::slice::from_ref(device), extent)?)?;
+    let commit = decode_commit(&read_ref(device, reference)?)?;
     Ok((superblock, commit))
 }
 
@@ -4250,23 +5036,24 @@ fn mark_tree_live<D: BlockDevice>(
     devices: &[D],
     zone_sizes: &[u64],
     slots: &[Option<usize>],
-    root: &[Extent],
+    root: &PageRef,
     live: &mut [Vec<bool>],
     visited: &mut HashSet<(u16, u64)>,
-    pending_roots: &mut Vec<Vec<Extent>>,
+    pending_roots: &mut Vec<PageRef>,
 ) -> Result<()> {
     let first = root
+        .copies
         .first()
         .ok_or(ScaleFsError::Corrupt("tree root has no copies"))?;
     if !visited.insert((first.device_index, first.offset)) {
         return Ok(());
     }
-    for copy in root {
+    for copy in &root.copies {
         mark_extent(live, zone_sizes, slots, *copy)?;
     }
-    let bytes = read_any_copy_slotted(devices, slots, root)?;
+    let bytes = read_any_copy_slotted(devices, slots, &root.copies, Some(root.expect))?;
     match decode_record(&bytes)?.kind {
-        RecordKind::MetadataInternal | RecordKind::MetadataInternalMirrored => {
+        RecordKind::MetadataInternal => {
             for (_, child) in decode_internal_record(&bytes)? {
                 mark_tree_live(
                     devices,
@@ -4282,31 +5069,33 @@ fn mark_tree_live<D: BlockDevice>(
         RecordKind::MetadataLeaf => {
             for (_, value) in decode_leaf_record(&bytes)? {
                 match value {
-                    MetadataValue::FileExtent { extents, .. } => {
-                        for extent in extents {
-                            mark_extent(live, zone_sizes, slots, extent)?;
+                    MetadataValue::FileRun(run) => {
+                        for span in run.spans() {
+                            mark_extent(live, zone_sizes, slots, span)?;
                         }
                     }
-                    MetadataValue::StripedExtent {
-                        extent,
-                        parity_extents,
-                        ..
-                    } => {
-                        mark_extent(live, zone_sizes, slots, extent)?;
-                        for parity in &parity_extents {
+                    MetadataValue::StripedRun(run) => {
+                        for piece in &run.pieces {
+                            mark_extent(live, zone_sizes, slots, *piece)?;
+                        }
+                        for parity in &run.parity {
                             mark_extent(live, zone_sizes, slots, *parity)?;
                         }
-                        let first = parity_extents.first().ok_or(ScaleFsError::Corrupt(
-                            "striped extent has no parity records",
-                        ))?;
+                        let first = run
+                            .parity
+                            .first()
+                            .ok_or(ScaleFsError::Corrupt("striped run has no parity records"))?;
                         if !visited.insert((first.device_index, first.offset)) {
                             continue;
                         }
                         let mut descriptor = None;
-                        for parity in &parity_extents {
-                            if let Ok(bytes) =
-                                read_any_copy_slotted(devices, slots, std::slice::from_ref(parity))
-                                && let Ok(record) = decode_parity_record(&bytes)
+                        for (row, parity) in run.parity.iter().enumerate() {
+                            if let Ok(bytes) = read_any_copy_slotted(
+                                devices,
+                                slots,
+                                std::slice::from_ref(parity),
+                                Some(run.parity_expect(row)),
+                            ) && let Ok(record) = decode_parity_record(&bytes)
                             {
                                 descriptor = Some(record);
                                 break;
@@ -4325,8 +5114,8 @@ fn mark_tree_live<D: BlockDevice>(
                             mark_extent(live, zone_sizes, slots, *piece)?;
                         }
                     }
-                    MetadataValue::RetainedRoot { metadata_roots, .. } => {
-                        pending_roots.push(metadata_roots);
+                    MetadataValue::RetainedRoot { root, .. } => {
+                        pending_roots.push(root);
                     }
                     _ => {}
                 }
@@ -4478,6 +5267,7 @@ mod tests {
             ROOT_INODE,
             "f.txt",
         )
+        .unwrap()
     }
 
     #[test]
@@ -4493,7 +5283,7 @@ mod tests {
         assert_eq!(pool.superblock().dirent_hash_seed, SEED);
         assert!(!pool.read_only());
         assert!(matches!(
-            pool.tree().get(inode_key(ROOT_INODE)),
+            pool.tree().get(inode_key(ROOT_INODE)).unwrap(),
             Some(MetadataValue::Inode(inode)) if inode.is_dir()
         ));
     }
@@ -4536,7 +5326,7 @@ mod tests {
         let pool = Pool::open(&mut device).unwrap();
         assert_eq!(pool.committed_tx(), 6);
         for round in 0..5u64 {
-            assert!(pool.tree().get(inode_key(100 + round)).is_some());
+            assert!(pool.tree().get(inode_key(100 + round)).unwrap().is_some());
         }
     }
 
@@ -4576,7 +5366,7 @@ mod tests {
 
         let mut skewed = pool.superblocks[1].clone();
         skewed.feature_ro_compat &= !FEATURE_RO_COMPAT_SPECIAL_FILES;
-        let bytes = encode_superblock(&skewed).unwrap();
+        let bytes = encode_superblock(&skewed, pool.committed_tx()).unwrap();
         for offset in superblock_slots(pool.devices[1].len()) {
             pool.devices[1].write_at(offset, &bytes).unwrap();
         }
@@ -4610,7 +5400,7 @@ mod tests {
         let bytes = read_prefix(&view, 0).unwrap();
         let mut superblock = decode_superblock(&bytes).unwrap();
         superblock.unicode_version = crate::unicode::UnicodeVersion::new(99, 0, 0);
-        let encoded = encode_superblock(&superblock).unwrap();
+        let encoded = encode_superblock(&superblock, 1).unwrap();
         for offset in superblock_slots(view.len()) {
             view.write_at(offset, &encoded).unwrap();
         }
@@ -4619,6 +5409,126 @@ mod tests {
             Pool::open(modified),
             Err(ScaleFsError::UnsupportedUnicodeVersion { .. })
         ));
+    }
+
+    fn make_earlier_format(device: &impl BlockDevice) {
+        let v1 = crate::format::tests::hex_bytes(crate::format::tests::VERSION_ONE_SUPERBLOCK);
+        let view = crate::gpt::member_view(device).unwrap();
+        for offset in superblock_slots(view.len()) {
+            view.write_at(offset, &v1).unwrap();
+        }
+    }
+
+    fn assert_earlier_format<T: std::fmt::Debug>(result: Result<T>) {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ScaleFsError::EarlierFormat { version: 1 }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("created by an earlier preview of ScaleFS")
+                && message.contains("create a new pool and move the files"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn earlier_format_pools_are_refused_with_the_recreate_message() {
+        let device = Pool::create(MemoryBlockDevice::new(device_len()), params())
+            .unwrap()
+            .into_device();
+        make_earlier_format(&device);
+        assert_earlier_format(Pool::open(device.clone()));
+        assert_earlier_format(Pool::open_multi(vec![device]));
+
+        let devices: Vec<std::sync::Arc<MemoryBlockDevice>> = (0..3)
+            .map(|_| std::sync::Arc::new(MemoryBlockDevice::new(device_len())))
+            .collect();
+        let members = devices
+            .iter()
+            .enumerate()
+            .map(|(i, device)| MemberSpec {
+                device: std::sync::Arc::clone(device),
+                device_id: DeviceId([0x60 + i as u8; 16]),
+                geometry: geometry(),
+            })
+            .collect();
+        drop(Pool::create_multi(members, mirrored_params()).unwrap());
+        for device in &devices {
+            make_earlier_format(&**device);
+        }
+        assert_earlier_format(Pool::open_multi(devices.clone()));
+        assert_earlier_format(Pool::open_multi_degraded(devices[..2].to_vec()));
+    }
+
+    #[test]
+    fn a_stale_page_copy_is_passed_over_counted_and_healed() {
+        let devices: Vec<std::sync::Arc<MemoryBlockDevice>> = (0..2)
+            .map(|_| std::sync::Arc::new(MemoryBlockDevice::new(device_len())))
+            .collect();
+        let members = devices
+            .iter()
+            .enumerate()
+            .map(|(i, device)| MemberSpec {
+                device: std::sync::Arc::clone(device),
+                device_id: DeviceId([0x68 + i as u8; 16]),
+                geometry: geometry(),
+            })
+            .collect();
+        let mut pool = Pool::create_multi(members, mirrored_params()).unwrap();
+        add_test_file(&mut pool);
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let older = pool.last_metadata_root.clone();
+        let older_bytes = pool.read_record(&older.copies, older.expect).unwrap();
+        let newer = pool
+            .create_file(ROOT_INODE, "newer.txt", 0o644, NOW)
+            .unwrap();
+        pool.write(newer, 0, b"written after the older tree", NOW)
+            .unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let root = pool.last_metadata_root.clone();
+        let current = pool.read_record(&root.copies, root.expect).unwrap();
+        drop(pool);
+
+        let stale = root.copies[0];
+        assert!(
+            older_bytes.len() as u64 <= stale.length,
+            "the older page fits"
+        );
+        let plant = |bytes: &[u8]| {
+            let device = &devices[usize::from(stale.device_index)];
+            let view = crate::gpt::member_view(&**device).unwrap();
+            view.write_at(stale.offset, bytes).unwrap();
+        };
+        plant(&older_bytes);
+
+        let mut pool = Pool::open_multi(devices.clone()).unwrap();
+        assert!(
+            pool.lookup(ROOT_INODE, "newer.txt").is_ok(),
+            "the current tree"
+        );
+        assert_eq!(
+            pool.stale_copies_seen(),
+            1,
+            "the stale copy was passed over"
+        );
+
+        let found = pool.scrub(false).unwrap();
+        assert_eq!(found.copies_stale, 1, "{found:?}");
+        assert!(!found.healthy());
+        let healed = pool.scrub(true).unwrap();
+        assert_eq!(healed.copies_repaired, 1, "{healed:?}");
+        assert!(pool.scrub(false).unwrap().healthy());
+        assert_eq!(pool.read_extent(stale).unwrap(), current);
+        drop(pool);
+
+        plant(&older_bytes);
+        let survivor = vec![std::sync::Arc::clone(
+            &devices[usize::from(stale.device_index)],
+        )];
+        let err = Pool::open_multi_degraded(survivor).unwrap_err();
+        assert!(crate::format::is_stale(&err), "{err:?}");
     }
 
     #[test]
@@ -4633,7 +5543,7 @@ mod tests {
             let mut superblock = decode_superblock(&bytes).unwrap();
             superblock.feature_ro_compat = ro;
             superblock.feature_incompat = incompat;
-            let encoded = encode_superblock(&superblock).unwrap();
+            let encoded = encode_superblock(&superblock, 1).unwrap();
             for offset in superblock_slots(view.len()) {
                 view.write_at(offset, &encoded).unwrap();
             }
@@ -4722,7 +5632,7 @@ mod tests {
         crash_sweep(&base, &ops, |image, _| {
             if let Ok(pool) = Pool::open(image) {
                 assert_eq!(pool.committed_tx(), 1);
-                assert!(pool.tree().get(inode_key(ROOT_INODE)).is_some());
+                assert!(pool.tree().get(inode_key(ROOT_INODE)).unwrap().is_some());
             }
         });
 
@@ -5039,8 +5949,8 @@ mod tests {
                 panic!("crash state at prefix {prefix} failed to open: {err}")
             });
             match pool.committed_tx() {
-                2 => assert!(pool.tree().get(inode_key(3)).is_none()),
-                3 => assert!(pool.tree().get(inode_key(3)).is_some()),
+                2 => assert!(pool.tree().get(inode_key(3)).unwrap().is_none()),
+                3 => assert!(pool.tree().get(inode_key(3)).unwrap().is_some()),
                 other => panic!("recovered impossible transaction {other} (prefix {prefix})"),
             }
         });
@@ -5063,16 +5973,16 @@ mod tests {
         let err = pool.commit(AllocPurpose::Normal, NOW).unwrap_err();
         assert!(matches!(err, ScaleFsError::OutOfSpace), "{err:?}");
         assert_eq!(pool.allocators, before, "allocators must roll back");
-        assert!(pool.tree().get(inode_key(100)).is_some());
+        assert!(pool.tree().get(inode_key(100)).unwrap().is_some());
 
         for id in 100..3000 {
-            pool.tree_mut().remove(inode_key(id));
+            pool.tree_mut().remove(inode_key(id)).unwrap();
         }
         pool.commit(AllocPurpose::Normal, NOW).unwrap();
         let reopened = Pool::open(pool.into_device()).unwrap();
         let entry = reopened.lookup(ROOT_INODE, "fill.bin").unwrap();
         assert_eq!(reopened.read(entry.inode, 0, filler.len()).unwrap(), filler);
-        assert!(reopened.tree().get(inode_key(100)).is_none());
+        assert!(reopened.tree().get(inode_key(100)).unwrap().is_none());
     }
 
     fn pool_params() -> PoolParams {
@@ -5128,11 +6038,14 @@ mod tests {
                     offset: u64::MAX,
                 },
             )
+            .unwrap()
             .iter()
             .flat_map(|(_, value)| match value {
-                MetadataValue::FileExtent { extents, .. } => {
-                    extents.iter().map(|extent| extent.device_index).collect()
-                }
+                MetadataValue::FileRun(run) => run
+                    .copies
+                    .iter()
+                    .map(|extent| extent.device_index)
+                    .collect(),
                 _ => Vec::new(),
             })
             .collect();
@@ -5147,20 +6060,25 @@ mod tests {
             let superblock = decode_superblock(&read_prefix(&pool.devices[i], 0).unwrap()).unwrap();
             let commit_extent = superblock.newest_commit.expect("committed member");
             let commit =
-                decode_commit(&read_extent_from_set(device, commit_extent).unwrap()).unwrap();
+                decode_commit(&read_extent_from_set(device, commit_extent.extent).unwrap())
+                    .unwrap();
             assert_eq!(commit.tx_id, pool.committed_tx());
             let aux = commit
                 .aux_root
                 .expect("multi-device commits carry a roster");
-            let roster = decode_topology(&read_extent_from_set(device, aux).unwrap()).unwrap();
+            let roster =
+                decode_topology(&read_extent_from_set(device, aux.extent).unwrap()).unwrap();
             assert_eq!(roster.tx_id, commit.tx_id);
             assert_eq!(roster.topology_generation, 1);
             assert_eq!(roster.members.len(), 3);
             assert_eq!(roster.member_index(superblock.device_id), Some(i as u16));
             let entry = &roster.members[i];
             assert_eq!(entry.newest_tx, commit.tx_id);
-            assert_eq!(entry.newest_summary.offset, commit.allocator_summary.offset);
-            assert_eq!(entry.newest_commit.offset, commit_extent.offset);
+            assert_eq!(
+                entry.newest_summary.offset,
+                commit.allocator_summary.extent.offset
+            );
+            assert_eq!(entry.newest_commit.offset, commit_extent.extent.offset);
         }
 
         let stray = pool.devices.remove(0).into_inner();
@@ -5221,7 +6139,7 @@ mod tests {
         devices.rotate_left(1);
         let pool = Pool::open_multi(devices).unwrap();
         assert_eq!(pool.committed_tx(), tx + 1);
-        assert!(pool.tree().get(inode_key(20)).is_some());
+        assert!(pool.tree().get(inode_key(20)).unwrap().is_some());
     }
 
     #[test]
@@ -5384,7 +6302,7 @@ mod tests {
                                 )
                                 .unwrap();
                                 assert_eq!(reopened.committed_tx(), 3);
-                                assert!(reopened.tree().get(inode_key(30)).is_some());
+                                assert!(reopened.tree().get(inode_key(30)).unwrap().is_some());
                                 let entry = reopened.lookup(ROOT_INODE, "tx.bin").unwrap();
                                 assert_eq!(
                                     reopened.read(entry.inode, 0, data.len()).unwrap(),
@@ -6077,7 +6995,8 @@ mod tests {
             let device = std::slice::from_ref(&pool.devices[i]);
             let commit_extent = superblock.newest_commit.expect("committed member");
             let commit =
-                decode_commit(&read_extent_from_set(device, commit_extent).unwrap()).unwrap();
+                decode_commit(&read_extent_from_set(device, commit_extent.extent).unwrap())
+                    .unwrap();
             assert_eq!(
                 commit.tx_id, feature_tx,
                 "member {i} lags the feature commit"
@@ -6107,7 +7026,8 @@ mod tests {
             let device = std::slice::from_ref(&pool.devices[i]);
             let commit_extent = superblock.newest_commit.expect("committed member");
             let commit =
-                decode_commit(&read_extent_from_set(device, commit_extent).unwrap()).unwrap();
+                decode_commit(&read_extent_from_set(device, commit_extent.extent).unwrap())
+                    .unwrap();
             assert_eq!(commit.tx_id, grow_tx, "member {i} lags the transition");
         }
     }
@@ -6222,9 +7142,10 @@ mod tests {
                     offset: u64::MAX,
                 },
             )
+            .unwrap()
             .iter()
             .flat_map(|(_, value)| match value {
-                MetadataValue::FileExtent { extents, .. } => extents.clone(),
+                MetadataValue::FileRun(run) => run.record_copies(0),
                 _ => Vec::new(),
             })
             .collect();
@@ -6400,11 +7321,10 @@ mod tests {
                     offset: u64::MAX,
                 },
             )
+            .unwrap()
             .iter()
             .find_map(|(_, value)| match value {
-                MetadataValue::FileExtent { extents, .. } => {
-                    Some(extents.first().expect("copies").device_index)
-                }
+                MetadataValue::FileRun(run) => Some(run.copies[0].device_index),
                 _ => None,
             })
             .expect("file has extents")
@@ -6496,8 +7416,11 @@ mod tests {
         let superblock = decode_superblock(&read_prefix(&pool.devices[slot], 0).unwrap()).unwrap();
         let commit_extent = superblock.newest_commit.expect("committed member");
         let commit = decode_commit(
-            &read_extent_from_set(std::slice::from_ref(&pool.devices[slot]), commit_extent)
-                .unwrap(),
+            &read_extent_from_set(
+                std::slice::from_ref(&pool.devices[slot]),
+                commit_extent.extent,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(commit.tx_id, tx, "the probing commit touched the suspect");
@@ -6862,6 +7785,7 @@ mod tests {
             mirror_width: 2,
             members: Vec::new(),
             metadata_root_replicas: Vec::new(),
+            metadata_root_expect: Expect { crc: 0, tx: 9 },
         };
         for supply in [[1u64, 2], [2, 1]] {
             let mut views: Vec<Topology> = supply.iter().map(|g| roster(*g)).collect();
@@ -7003,6 +7927,7 @@ mod tests {
             ROOT_INODE,
             "ack.bin",
         )
+        .unwrap()
         .expect("the write survived");
         assert_eq!(
             reopened.read(entry.inode, 0, payload.len()).unwrap(),
@@ -7031,6 +7956,7 @@ mod tests {
             ROOT_INODE,
             "ack.bin",
         )
+        .unwrap()
         .expect("the write is in the newest view");
         assert_eq!(whole.read(entry.inode, 0, payload.len()).unwrap(), payload);
         add_test_file(&mut whole);
@@ -7302,14 +8228,15 @@ mod tests {
                     offset: u64::MAX,
                 },
             )
+            .unwrap()
             .iter()
-            .filter_map(|(_, value)| match value {
-                MetadataValue::StripedExtent {
-                    extent,
-                    parity_extents,
-                    ..
-                } => Some((*extent, parity_extents.clone())),
-                _ => None,
+            .flat_map(|(_, value)| match value {
+                MetadataValue::StripedRun(run) => run
+                    .pieces
+                    .iter()
+                    .map(|piece| (*piece, run.parity.clone()))
+                    .collect(),
+                _ => Vec::new(),
             })
             .collect()
     }
@@ -7611,8 +8538,9 @@ mod tests {
         assert!(
             pool.tree()
                 .range(MetadataKey::MIN, MetadataKey::MAX)
+                .unwrap()
                 .iter()
-                .all(|(_, value)| !matches!(value, MetadataValue::StripedExtent { .. }))
+                .all(|(_, value)| !matches!(value, MetadataValue::StripedRun(_)))
         );
     }
 
@@ -7994,7 +8922,8 @@ mod tests {
 
         let mut record = crate::stripes::decode_parity_record(&original).unwrap();
         record.parity[7] ^= 0xFF;
-        let forged = crate::stripes::encode_parity_record(&record).unwrap();
+        let forged =
+            crate::stripes::encode_parity_record(&record, Expect::of(&original).tx).unwrap();
         let slot = usize::from(parity_extent.device_index);
         pool.devices[slot]
             .write_at(parity_extent.offset, &forged)
@@ -8006,6 +8935,41 @@ mod tests {
         assert_eq!(healed.copies_repaired, 1, "{healed:?}");
         assert!(healed.healthy());
         assert_eq!(pool.read_extent(parity_extent).unwrap(), original);
+    }
+
+    #[test]
+    fn a_stale_stripe_piece_is_reconstructed_never_served() {
+        let chunk = crate::fs::FILE_DATA_CHUNK;
+        let mut pool = Pool::create_multi(roomy_members(5), parity_params()).unwrap();
+        let victim: Vec<u8> = (0..chunk * 2).map(|i| (i * 7 % 251) as u8).collect();
+        let intruder: Vec<u8> = (0..chunk * 2).map(|i| (i * 13 % 241) as u8).collect();
+        let a = pool.create_file(ROOT_INODE, "victim", 0o644, NOW).unwrap();
+        pool.write(a, 0, &victim, NOW).unwrap();
+        let b = pool
+            .create_file(ROOT_INODE, "intruder", 0o644, NOW)
+            .unwrap();
+        pool.write(b, 0, &intruder, NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+
+        let target = striped_runs(&pool, a)[0].0;
+        let source = striped_runs(&pool, b)[0].0;
+        assert_eq!(target.length, source.length, "setup: equal lengths");
+        let original = pool.read_extent(target).unwrap();
+        let misdirected = pool.read_extent(source).unwrap();
+        let slot = pool.member_slot(target.device_index).unwrap();
+        pool.devices[slot]
+            .write_at(target.offset, &misdirected)
+            .unwrap();
+
+        assert_eq!(pool.read(a, 0, victim.len()).unwrap(), victim);
+        assert!(pool.stale_copies_seen() >= 1);
+        let found = pool.scrub(false).unwrap();
+        assert!(found.copies_stale >= 1, "{found:?}");
+        assert!(!found.healthy());
+        let healed = pool.scrub(true).unwrap();
+        assert!(healed.copies_repaired >= 1, "{healed:?}");
+        assert!(pool.scrub(false).unwrap().healthy());
+        assert_eq!(pool.read_extent(target).unwrap(), original);
     }
 
     #[test]
@@ -8241,9 +9205,10 @@ mod tests {
                     offset: u64::MAX,
                 },
             )
+            .unwrap()
             .iter()
             .find_map(|(_, value)| match value {
-                MetadataValue::FileExtent { extents, .. } => Some(extents.clone()),
+                MetadataValue::FileRun(run) => Some(run.record_copies(0)),
                 _ => None,
             })
             .expect("file has extents")
@@ -8261,6 +9226,133 @@ mod tests {
     }
 
     #[test]
+    fn scrub_heals_one_record_inside_a_run() {
+        let members = (0..3)
+            .map(|i| {
+                let geometry = Geometry {
+                    zone_size: 1 << 20,
+                    zone_count: 16,
+                    ..geometry()
+                };
+                MemberSpec {
+                    device: MemoryBlockDevice::new(crate::gpt::member_image_len(
+                        geometry.capacity_bytes(),
+                    ) as usize),
+                    device_id: DeviceId([0x70 + i as u8; 16]),
+                    geometry,
+                }
+            })
+            .collect();
+        let mut pool = Pool::create_multi(members, mirrored_params()).unwrap();
+        let data: Vec<u8> = (0..300_000).map(|i| (i % 253) as u8).collect();
+        let file = pool.create_file(ROOT_INODE, "run.bin", 0o644, NOW).unwrap();
+        pool.write(file, 0, &data, NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let run = pool
+            .tree()
+            .range(
+                MetadataKey {
+                    object_id: file,
+                    item_type: ITEM_FILE_EXTENT,
+                    offset: 0,
+                },
+                MetadataKey {
+                    object_id: file,
+                    item_type: ITEM_FILE_EXTENT,
+                    offset: u64::MAX,
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .find_map(|(_, value)| match value {
+                MetadataValue::FileRun(run) if run.count() > 3 => Some(run),
+                _ => None,
+            })
+            .expect("a run of several records");
+        let middle = run.record_copies(2)[0];
+        corrupt_copy(&mut pool, middle);
+        let found = pool.scrub(false).unwrap();
+        assert_eq!(found.copies_bad, 1, "{found:?}");
+        let healed = pool.scrub(true).unwrap();
+        assert_eq!(healed.copies_repaired, 1, "{healed:?}");
+        assert!(pool.scrub(false).unwrap().healthy());
+        assert_eq!(pool.read(file, 0, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn the_tree_census_counts_items_runs_and_records() {
+        let geometry = Geometry {
+            zone_size: 4 << 20,
+            zone_count: 16,
+            ..geometry()
+        };
+        let device = MemoryBlockDevice::new(
+            crate::gpt::member_image_len(geometry.capacity_bytes()) as usize,
+        );
+        let mut pool = Pool::create(
+            device,
+            CreateParams {
+                geometry,
+                ..params()
+            },
+        )
+        .unwrap();
+        let file = pool.create_file(ROOT_INODE, "mib", 0o644, NOW).unwrap();
+        pool.write(file, 0, &vec![7u8; 1 << 20], NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+        let census = pool.tree_census().unwrap();
+        assert_eq!(census.items, pool.tree().item_count().unwrap() as u64);
+        assert_eq!((census.runs, census.run_records), (1, 33));
+        assert_eq!(census.leaf_pages + census.internal_pages, 1);
+        assert!(census.page_bytes > 0 && census.page_disk_bytes >= census.page_bytes);
+    }
+
+    #[test]
+    fn reclaim_keeps_every_record_of_a_run_live() {
+        let geometry = Geometry {
+            zone_size: 4 << 20,
+            zone_count: 16,
+            ..geometry()
+        };
+        let device = MemoryBlockDevice::new(
+            crate::gpt::member_image_len(geometry.capacity_bytes()) as usize,
+        );
+        let mut pool = Pool::create(
+            device,
+            CreateParams {
+                geometry,
+                ..params()
+            },
+        )
+        .unwrap();
+        let chunk = crate::fs::FILE_DATA_CHUNK;
+        let data: Vec<u8> = (0..20 * chunk).map(|i| (i % 249) as u8).collect();
+        let file = pool.create_file(ROOT_INODE, "run.bin", 0o644, NOW).unwrap();
+        pool.write(file, 0, &data, NOW).unwrap();
+        pool.commit(AllocPurpose::Normal, NOW).unwrap();
+
+        let middle = vec![0xEEu8; chunk];
+        pool.write(file, 10 * chunk as u64, &middle, NOW).unwrap();
+        let mut expected = data.clone();
+        expected[10 * chunk..11 * chunk].copy_from_slice(&middle);
+        pool.reclaim(NOW).unwrap();
+        assert_eq!(pool.read(file, 0, expected.len()).unwrap(), expected);
+
+        for i in 0..6 {
+            let filler = pool
+                .create_file(ROOT_INODE, &format!("fill{i}"), 0o644, NOW)
+                .unwrap();
+            pool.write(filler, 0, &vec![i as u8; 30 * chunk], NOW)
+                .unwrap();
+            pool.commit(AllocPurpose::Normal, NOW).unwrap();
+            pool.reclaim(NOW).unwrap();
+        }
+        assert_eq!(pool.read(file, 0, expected.len()).unwrap(), expected);
+        let reopened = Pool::open(pool.into_device()).unwrap();
+        assert_eq!(reopened.read(file, 0, expected.len()).unwrap(), expected);
+    }
+
+    #[test]
     fn scrub_heals_corrupted_copies_from_siblings() {
         let mut pool = Pool::create_multi(roomy_members(3), mirrored_params()).unwrap();
         let data: Vec<u8> = (0..60_000usize).map(|i| (i * 11 % 251) as u8).collect();
@@ -8274,8 +9366,8 @@ mod tests {
         assert_eq!(copies.len(), 2);
         corrupt_copy(&mut pool, copies[1]);
         let root = pool.last_metadata_root.clone();
-        assert_eq!(root.len(), 2);
-        corrupt_copy(&mut pool, root[1]);
+        assert_eq!(root.copies.len(), 2);
+        corrupt_copy(&mut pool, root.copies[1]);
 
         assert_eq!(pool.read(file, 0, data.len()).unwrap(), data);
 
@@ -9459,8 +10551,8 @@ mod tests {
         let superblock = pool.superblock();
         assert_eq!(superblock.feature_incompat, 0);
         let commit_extent = superblock.newest_commit.expect("created pools commit");
-        assert_eq!(commit_extent.length, 97);
-        let commit = decode_commit(&pool.read_extent(commit_extent).unwrap()).unwrap();
+        assert_eq!(commit_extent.extent.length, commit_record_len(false));
+        let commit = decode_commit(&pool.read_extent(commit_extent.extent).unwrap()).unwrap();
         assert_eq!(commit.aux_root, None);
     }
 
@@ -9543,3 +10635,7 @@ mod tests {
         assert_member_wrapper(pool.devices.last().unwrap().inner(), pool_id, [0x78; 16]);
     }
 }
+
+#[cfg(test)]
+#[path = "pool_fault_tests.rs"]
+mod fault_tests;

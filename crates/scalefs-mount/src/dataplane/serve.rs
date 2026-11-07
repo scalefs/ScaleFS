@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use scalefs_core::SharedDevice;
 use scalefs_core::tree::EntryKind;
@@ -7,7 +8,7 @@ use scalefs_core::wire::Cursor;
 
 use super::wire::{
     self, ATTR_LEN, INTERFACE_VERSION, MAX_BODY, Request, eject, op, put_attr, put_bytes,
-    setattr_mask, status, status_of, take_bytes,
+    request_flags, setattr_mask, status, status_of, take_bytes,
 };
 use crate::mountcore::{MountCore, SetAttr, TimeChange};
 
@@ -67,6 +68,34 @@ pub struct SessionParams {
     pub pool_id: [u8; 16],
     pub token: Vec<u8>,
     pub read_only: bool,
+    pub close_durability: CloseDurability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseDurability {
+    CommitOnClose,
+    Bounded(Duration),
+}
+
+impl Default for CloseDurability {
+    fn default() -> Self {
+        CloseDurability::Bounded(CloseDurability::DEFAULT_BOUND)
+    }
+}
+
+impl CloseDurability {
+    pub const MIN_BOUND: Duration = Duration::from_secs(1);
+    pub const MAX_BOUND: Duration = Duration::from_secs(5);
+    pub const DEFAULT_BOUND: Duration = Duration::from_secs(1);
+
+    fn deferral(self, flags: u16) -> Option<Duration> {
+        match self {
+            CloseDurability::Bounded(bound) if flags & request_flags::FSYNC_ON_CLOSE != 0 => {
+                Some(bound)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,15 +112,28 @@ pub fn serve_connection<D: SharedDevice, T: Read + Write>(
     core: &Arc<MountCore<D>>,
     session: &SessionParams,
     barrier: Option<&dyn EjectBarrier>,
+    on_authenticated: Option<&dyn Fn()>,
 ) -> SessionEnd {
     let trace = std::env::var_os("SCALEFS_DATAPLANE_TRACE").is_some_and(|v| v == "1");
+    let perf = scalefs_core::perftrace::enabled();
     let mut hello_done = false;
     loop {
+        let waited_from = perf.then(|| {
+            (
+                scalefs_core::perftrace::unix_ns(),
+                std::time::Instant::now(),
+            )
+        });
         let request = match wire::read_request(transport) {
             Ok(Some(request)) => request,
             Ok(None) => return SessionEnd::Disconnected,
             Err(_) => return SessionEnd::Error,
         };
+        let got_at = perf.then(std::time::Instant::now);
+        let op_timer = scalefs_core::perftrace::op(
+            scalefs_core::perftrace::Surface::Dataplane,
+            u32::from(request.op),
+        );
         if trace {
             eprintln!(
                 "[dataplane] req {} op {} body {}B",
@@ -104,6 +146,9 @@ pub fn serve_connection<D: SharedDevice, T: Read + Write>(
             match handle_hello(&request, session) {
                 Ok(body) => {
                     hello_done = true;
+                    if let Some(on_authenticated) = on_authenticated {
+                        on_authenticated();
+                    }
                     (status::OK, body)
                 }
                 Err(code) => {
@@ -123,13 +168,35 @@ pub fn serve_connection<D: SharedDevice, T: Read + Write>(
                 Err(code) => (code, Vec::new()),
             }
         } else {
-            match dispatch(core, request.op, &request.body) {
+            let close = session.close_durability.deferral(request.flags);
+            match dispatch(core, request.op, &request.body, close) {
                 Ok(body) => (status::OK, body),
                 Err(code) => (code, Vec::new()),
             }
         };
+        drop(op_timer);
+        let dispatched_at = perf.then(std::time::Instant::now);
         if wire::write_response(transport, request.req_id, status, &body).is_err() {
             return SessionEnd::Error;
+        }
+        if let (Some((wall, from)), Some(got), Some(dispatched)) =
+            (waited_from, got_at, dispatched_at)
+        {
+            let responded = std::time::Instant::now();
+            scalefs_core::perftrace::line(|| {
+                format!(
+                    "R {} {} {} {} {} {} {} {} {}",
+                    request.op,
+                    wall,
+                    (got - from).as_nanos(),
+                    (dispatched - got).as_nanos(),
+                    (responded - dispatched).as_nanos(),
+                    request.body.len(),
+                    body.len(),
+                    status,
+                    request.flags
+                )
+            });
         }
     }
 }
@@ -192,6 +259,7 @@ fn dispatch<D: SharedDevice>(
     core: &Arc<MountCore<D>>,
     op_code: u16,
     body: &[u8],
+    close: Option<Duration>,
 ) -> Result<Vec<u8>, i16> {
     let mut c = Cursor::new(body);
     match op_code {
@@ -443,7 +511,11 @@ fn dispatch<D: SharedDevice>(
         op::FSYNC => {
             let _inode = take_u64(&mut c)?;
             let _datasync = take_bool(&mut c)?;
-            core.commit().map_err(status_of)?;
+            match close {
+                Some(bound) => core.commit_within(bound),
+                None => core.commit(),
+            }
+            .map_err(status_of)?;
             Ok(Vec::new())
         }
         op::HELLO => Err(status::PROTOCOL),

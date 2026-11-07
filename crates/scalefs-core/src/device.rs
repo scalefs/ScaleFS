@@ -379,15 +379,18 @@ impl BlockDevice for FileBlockDevice {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         check_bounds(offset, buf.len(), self.len)?;
+        let _t = crate::perftrace::start(crate::perftrace::C::DevRead, buf.len() as u64);
         read_exact_at(&self.file, offset, buf)
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
         check_bounds(offset, data.len(), self.len)?;
+        let _t = crate::perftrace::start(crate::perftrace::C::DevWrite, data.len() as u64);
         write_all_at(&self.file, offset, data)
     }
 
     fn flush(&self) -> Result<()> {
+        let _t = crate::perftrace::start(crate::perftrace::C::DevFlush, 0);
         self.file.sync_all()?;
         Ok(())
     }

@@ -73,6 +73,14 @@ impl Read for Stream {
     }
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    Waiting,
+    Ready(usize),
+    Closed,
+}
+
 impl Stream {
     #[cfg(windows)]
     pub(crate) fn raw_handle(&self) -> isize {
@@ -80,6 +88,27 @@ impl Stream {
             StreamImp::Pipe(file) => {
                 std::os::windows::io::AsRawHandle::as_raw_handle(file) as isize
             }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn readiness(&self) -> Readiness {
+        let mut available = 0u32;
+        #[allow(unsafe_code)]
+        let ok = unsafe {
+            windows::ffi::PeekNamedPipe(
+                self.raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        match (ok, available) {
+            (0, _) => Readiness::Closed,
+            (_, 0) => Readiness::Waiting,
+            (_, available) => Readiness::Ready(available as usize),
         }
     }
 
@@ -138,8 +167,10 @@ impl Listener {
 
     #[cfg(windows)]
     pub fn bind_for_interactive_users(endpoint: &Endpoint) -> std::io::Result<Listener> {
+        let owner = crate::trust::own_account()?;
+        let sddl = format!("O:{owner}{}", windows::INTERACTIVE_PIPE_DACL);
         Ok(Listener(ListenerImp::Pipe(
-            windows::PipeListener::bind_with(&endpoint.address(), windows::INTERACTIVE_PIPE_SDDL)?,
+            windows::PipeListener::bind_owned(&endpoint.address(), &sddl, owner)?,
         )))
     }
 
@@ -290,9 +321,17 @@ mod windows {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
     #[allow(unsafe_code)]
-    mod ffi {
+    pub(super) mod ffi {
         #[link(name = "kernel32", kind = "raw-dylib")]
         unsafe extern "system" {
+            pub fn PeekNamedPipe(
+                pipe: isize,
+                buffer: *mut core::ffi::c_void,
+                buffer_size: u32,
+                bytes_read: *mut u32,
+                total_available: *mut u32,
+                left_this_message: *mut u32,
+            ) -> i32;
             pub fn CreateNamedPipeW(
                 name: *const u16,
                 open_mode: u32,
@@ -318,7 +357,7 @@ mod windows {
     }
 
     const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
-    pub const INTERACTIVE_PIPE_SDDL: &str =
+    pub const INTERACTIVE_PIPE_DACL: &str =
         "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12008b;;;IU)";
     pub const INTERACTIVE_ACCESS: u32 = 0x0012_008b;
     const SDDL_REVISION_1: u32 = 1;
@@ -379,14 +418,27 @@ mod windows {
         name: Vec<u16>,
         next: Option<OwnedHandle>,
         security: SecurityDescriptor,
+        owner: Option<String>,
     }
 
     impl PipeListener {
         pub fn bind(address: &str) -> std::io::Result<PipeListener> {
-            PipeListener::bind_with(address, PIPE_SDDL)
+            PipeListener::bind_with(address, PIPE_SDDL, None)
         }
 
-        pub fn bind_with(address: &str, sddl: &str) -> std::io::Result<PipeListener> {
+        pub fn bind_owned(
+            address: &str,
+            sddl: &str,
+            owner: String,
+        ) -> std::io::Result<PipeListener> {
+            PipeListener::bind_with(address, sddl, Some(owner))
+        }
+
+        fn bind_with(
+            address: &str,
+            sddl: &str,
+            owner: Option<String>,
+        ) -> std::io::Result<PipeListener> {
             let name: Vec<u16> = address.encode_utf16().chain(std::iter::once(0)).collect();
             let security = SecurityDescriptor::from_sddl(sddl)?;
             let first = match create_instance(&name, true, security.as_ptr()) {
@@ -403,14 +455,29 @@ mod windows {
                 name,
                 next: Some(first),
                 security,
+                owner,
             })
+        }
+
+        fn create_next(&self) -> std::io::Result<OwnedHandle> {
+            let instance = create_instance(&self.name, false, self.security.as_ptr())?;
+            if let Some(owner) = &self.owner {
+                let raw = std::os::windows::io::AsRawHandle::as_raw_handle(&instance) as isize;
+                if !crate::trust::handle_owner_is(raw, owner)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "the pipe name is now held by another owner",
+                    ));
+                }
+            }
+            Ok(instance)
         }
 
         pub fn accept(&mut self) -> std::io::Result<std::fs::File> {
             loop {
                 let instance = match self.next.take() {
                     Some(instance) => instance,
-                    None => create_instance(&self.name, false, self.security.as_ptr())?,
+                    None => self.create_next()?,
                 };
                 let raw = std::os::windows::io::AsRawHandle::as_raw_handle(&instance);
                 #[allow(unsafe_code)]
@@ -424,7 +491,7 @@ mod windows {
                         _ => return Err(error),
                     }
                 }
-                self.next = create_instance(&self.name, false, self.security.as_ptr()).ok();
+                self.next = self.create_next().ok();
                 return Ok(std::fs::File::from(instance));
             }
         }

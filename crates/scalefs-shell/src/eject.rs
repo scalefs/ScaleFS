@@ -1,10 +1,11 @@
 use crate::ffi::{self, DevPropKey, Guid, from_wide, wide};
-use crate::outcome::{self, Outcome, Record, Serving};
+use crate::outcome::{self, Outcome, Record};
 use crate::{notice, text};
 use core::ffi::c_void;
 use scalefs_ipc::client::Client;
 use scalefs_ipc::endpoint::Endpoint;
 use scalefs_ipc::json::{Value, object};
+use scalefs_ipc::trust::ServerIdentity;
 use std::time::{Duration, Instant};
 
 const FILE_SYSTEM_NAME: &str = "ScaleFS";
@@ -136,15 +137,18 @@ fn file_system_is_scalefs(letter: char) -> bool {
     ok != 0 && from_wide(&fs_name) == FILE_SYSTEM_NAME
 }
 
-fn endpoint() -> Endpoint {
-    crate::register::recorded_endpoint()
+fn companion() -> (Endpoint, ServerIdentity) {
+    let endpoint = crate::register::recorded_endpoint()
         .map(|text| Endpoint::new(&text))
         .unwrap_or_else(Endpoint::default_endpoint)
-        .shell_companion()
+        .shell_companion();
+    let account = outcome::companion_account(crate::register::recorded_account());
+    (endpoint, ServerIdentity::Account(account))
 }
 
 fn volume(params: Value) -> Result<Value, String> {
-    let mut client = Client::connect_limited(&endpoint(), Duration::from_secs(2))?;
+    let (endpoint, server) = companion();
+    let mut client = Client::connect_limited(&endpoint, Duration::from_secs(2), &server)?;
     client
         .call("shell.volume", params)
         .map_err(|error| format!("shell.volume failed: {error}"))
@@ -156,6 +160,7 @@ fn by_letter(letter: char) -> Result<Value, String> {
 
 fn by_pool(pool_id: &str) -> Option<Record> {
     volume(object(vec![("pool_id", Value::Str(pool_id.to_string()))]))
+        .and_then(|reply| outcome::for_pool(reply, pool_id))
         .ok()
         .map(|reply| Record::from_reply(&reply))
 }
@@ -206,17 +211,23 @@ pub fn run(letter: char, display: &str) {
 }
 
 fn attempt(letter: char) -> Result<Attempt, String> {
+    let pool_id = volume_device_name(letter)
+        .and_then(|name| outcome::pool_id_from_device_name(&name))
+        .ok_or_else(|| format!("{letter}: is not a ScaleFS volume"))?;
     let reply = by_letter(letter)?;
-    let serving =
-        Serving::from_reply(&reply).ok_or_else(|| format!("no serving is mounted at {letter}:"))?;
-    let before = Some(Record::from_reply(&reply));
-    let instance = outcome::instance_id(&serving.pool_id);
+    let plan = outcome::plan(&pool_id, reply).inspect_err(|why| {
+        ffi::debug_line(&format!(
+            "scalefs-shell: eject {letter}: not attempted: {why}"
+        ));
+    })?;
+    let before = Some(plan.before);
+    let instance = plan.instance;
     let devinst = match locate(&instance) {
         Ok(devinst) => devinst,
         Err(located) => {
             ffi::debug_line(&format!(
-                "scalefs-shell: eject {letter}: pool '{}' has no device {instance} (CR 0x{located:x})",
-                serving.pool
+                "scalefs-shell: eject {letter}: pool {pool_id} has no device {instance} \
+                 (CR 0x{located:x})"
             ));
             return Ok(Attempt {
                 outcome: Outcome::Failed { cr: located },
@@ -241,7 +252,7 @@ fn attempt(letter: char) -> Result<Attempt, String> {
     if cr == outcome::CR_SUCCESS {
         let deadline = Instant::now() + RECORD_WAIT;
         loop {
-            after = by_pool(&serving.pool_id);
+            after = by_pool(&pool_id);
             if after.is_some_and(|record| record.is_new_removal(before))
                 || Instant::now() >= deadline
             {
@@ -250,13 +261,17 @@ fn attempt(letter: char) -> Result<Attempt, String> {
             std::thread::sleep(Duration::from_millis(150));
         }
     } else if cr == outcome::CR_REMOVE_VETOED {
-        holders = outcome::holders(by_letter(letter).ok().as_ref());
+        holders = outcome::holders(
+            by_letter(letter)
+                .and_then(|reply| outcome::for_pool(reply, &pool_id))
+                .ok()
+                .as_ref(),
+        );
     }
     let outcome = outcome::classify(cr, before, after, holders);
     ffi::debug_line(&format!(
-        "scalefs-shell: eject {letter}: pool '{}' {instance} -> CR 0x{cr:x} veto type {veto_type} \
-         [{}]; record before {before:?} after {after:?} -> {outcome:?}",
-        serving.pool,
+        "scalefs-shell: eject {letter}: pool {pool_id} {instance} -> CR 0x{cr:x} veto type \
+         {veto_type} [{}]; record before {before:?} after {after:?} -> {outcome:?}",
         from_wide(&veto_name),
     ));
     Ok(Attempt { outcome, device })

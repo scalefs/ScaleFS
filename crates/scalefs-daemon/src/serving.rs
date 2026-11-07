@@ -1,10 +1,13 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use scalefs_mount::dataplane::{self, SessionParams};
+use scalefs_mount::dataplane::{self, CloseDurability, SessionParams};
 
 use scalefs_ipc::json::{Value, object};
 use scalefs_ipc::proto::ErrorCode;
@@ -12,6 +15,37 @@ use scalefs_ipc::proto::ErrorCode;
 use crate::pools::{OpError, PoolCore, PoolHandle, PoolPresentation};
 
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+const MAX_PENDING_HANDSHAKES: usize = 64;
+
+#[derive(Clone, Default)]
+struct Handshakes(Arc<AtomicUsize>);
+
+struct Admission(Arc<AtomicUsize>);
+
+impl Handshakes {
+    fn admit(&self, cap: usize) -> Option<Admission> {
+        let taken = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < cap).then_some(count + 1)
+            });
+        taken.ok().map(|_| Admission(Arc::clone(&self.0)))
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct Handshake {
+    deadline: Instant,
+    done: Rc<Cell<bool>>,
+}
 
 #[cfg(windows)]
 const ERROR_BUSY: i32 = 170;
@@ -131,6 +165,7 @@ struct ActiveServe {
     pool_id: String,
     endpoint: String,
     read_only: bool,
+    close_durability: CloseDurability,
     generation: u64,
     stop: Arc<AtomicBool>,
     #[cfg(windows)]
@@ -346,6 +381,8 @@ impl ServingRegistry {
             ));
         }
 
+        let close_durability = close_durability_param(params)?;
+
         let token = hex(&crate::shares::random_bytes::<32>());
         let generation = self
             .next_generation
@@ -360,6 +397,7 @@ impl ServingRegistry {
             pool_id,
             token: token.as_bytes().to_vec(),
             read_only,
+            close_durability,
         };
 
         #[cfg(unix)]
@@ -548,6 +586,7 @@ impl ServingRegistry {
             pool_id: hex(&pool_id),
             endpoint: endpoint.clone(),
             read_only,
+            close_durability,
             generation,
             stop,
             #[cfg(windows)]
@@ -583,6 +622,7 @@ impl ServingRegistry {
             ("token", Value::Str(token)),
             ("read_only", Value::Bool(read_only)),
         ];
+        reply.extend(close_durability_fields(close_durability));
         if let Some(letter) = mount_letter {
             reply.push(("mount", Value::Str(letter)));
         }
@@ -676,6 +716,7 @@ impl ServingRegistry {
                     ("endpoint", Value::Str(serve.endpoint.clone())),
                     ("read_only", Value::Bool(serve.read_only)),
                 ];
+                row.extend(close_durability_fields(serve.close_durability));
                 if let Some(letter) = &serve.mount_letter {
                     row.push(("mount", Value::Str(letter.clone())));
                 }
@@ -946,13 +987,17 @@ fn accept_loop(
     core: PoolCore,
     session: SessionParams,
 ) {
+    let handshakes = Handshakes::default();
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                let Some(admission) = handshakes.admit(MAX_PENDING_HANDSHAKES) else {
+                    continue;
+                };
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(STOP_POLL));
                 let _ = stream.set_write_timeout(Some(STOP_POLL));
-                spawn_session(stream, &stop, &connections, &core, &session);
+                spawn_session(stream, &stop, &connections, &core, &session, admission);
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -973,13 +1018,17 @@ fn accept_loop_unix(
     core: PoolCore,
     session: SessionParams,
 ) {
+    let handshakes = Handshakes::default();
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                let Some(admission) = handshakes.admit(MAX_PENDING_HANDSHAKES) else {
+                    continue;
+                };
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(STOP_POLL));
                 let _ = stream.set_write_timeout(Some(STOP_POLL));
-                spawn_session(stream, &stop, &connections, &core, &session);
+                spawn_session(stream, &stop, &connections, &core, &session, admission);
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -1013,11 +1062,9 @@ fn pump_loop(
                 }
             },
         };
-        let mut transport = StopPollStream {
-            stream,
-            stop: Arc::clone(&stop),
-        };
-        let end = dataplane::serve_connection(&mut transport, &core, &session, Some(&*barrier));
+        let mut transport = StopPollStream::new(stream, Arc::clone(&stop));
+        let end =
+            dataplane::serve_connection(&mut transport, &core, &session, Some(&*barrier), None);
         let _ = core.commit_if_dirty();
         match end {
             dataplane::SessionEnd::Bye => live = Some(transport.stream),
@@ -1036,14 +1083,32 @@ fn spawn_session<S: Read + Write + Send + 'static>(
     connections: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     core: &PoolCore,
     session: &SessionParams,
+    admission: Admission,
 ) {
     let core = Arc::clone(core);
     let session = session.clone();
     let stop = Arc::clone(stop);
     let handle = std::thread::spawn(move || {
-        let mut transport = StopPollStream { stream, stop };
-        let _ = dataplane::serve_connection(&mut transport, &core, &session, None);
+        let mut transport = StopPollStream::new(stream, stop);
+        let done = Rc::new(Cell::new(false));
+        transport.handshake = Some(Handshake {
+            deadline: Instant::now() + HELLO_DEADLINE,
+            done: Rc::clone(&done),
+        });
+        let admission = std::cell::RefCell::new(Some(admission));
+        let authenticated = || {
+            done.set(true);
+            admission.borrow_mut().take();
+        };
+        let _ = dataplane::serve_connection(
+            &mut transport,
+            &core,
+            &session,
+            None,
+            Some(&authenticated),
+        );
         let _ = core.commit_if_dirty();
+        drop(admission);
     });
     connections.lock().expect("connections lock").push(handle);
 }
@@ -1051,12 +1116,29 @@ fn spawn_session<S: Read + Write + Send + 'static>(
 struct StopPollStream<S> {
     stream: S,
     stop: Arc<AtomicBool>,
+    handshake: Option<Handshake>,
+}
+
+impl<S> StopPollStream<S> {
+    fn new(stream: S, stop: Arc<AtomicBool>) -> StopPollStream<S> {
+        StopPollStream {
+            stream,
+            stop,
+            handshake: None,
+        }
+    }
 }
 
 impl<S: Read> Read for StopPollStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if self.stop.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            if let Some(handshake) = &self.handshake
+                && !handshake.done.get()
+                && Instant::now() >= handshake.deadline
+            {
                 return Ok(0);
             }
             match self.stream.read(buf) {
@@ -1108,6 +1190,63 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub(crate) fn close_durability_param(params: &Value) -> Result<CloseDurability, OpError> {
+    let commit_on_close = match params.get("close_durability") {
+        None => false,
+        Some(Value::Str(word)) if word == "bounded" => false,
+        Some(Value::Str(word)) if word == "commit-on-close" => true,
+        Some(_) => {
+            return Err((
+                ErrorCode::BadRequest,
+                "close_durability must be \"bounded\" or \"commit-on-close\"".to_string(),
+            ));
+        }
+    };
+    let (min, max) = (
+        CloseDurability::MIN_BOUND.as_millis() as u64,
+        CloseDurability::MAX_BOUND.as_millis() as u64,
+    );
+    match (commit_on_close, params.get("close_bound_ms")) {
+        (true, None) => Ok(CloseDurability::CommitOnClose),
+        (true, Some(_)) => Err((
+            ErrorCode::BadRequest,
+            "close_bound_ms applies only to a bounded serving".to_string(),
+        )),
+        (false, None) => Ok(CloseDurability::Bounded(CloseDurability::DEFAULT_BOUND)),
+        (false, Some(value)) => value
+            .as_u64()
+            .filter(|ms| (min..=max).contains(ms))
+            .map(|ms| CloseDurability::Bounded(std::time::Duration::from_millis(ms)))
+            .ok_or((
+                ErrorCode::BadRequest,
+                format!("close_bound_ms must be {min}-{max}"),
+            )),
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn requested_close_durability(params: &Value) -> Option<CloseDurability> {
+    if params.get("close_durability").is_none() && params.get("close_bound_ms").is_none() {
+        return None;
+    }
+    close_durability_param(params).ok()
+}
+
+pub(crate) fn close_durability_fields(policy: CloseDurability) -> Vec<(&'static str, Value)> {
+    match policy {
+        CloseDurability::CommitOnClose => {
+            vec![(
+                "close_durability",
+                Value::Str("commit-on-close".to_string()),
+            )]
+        }
+        CloseDurability::Bounded(bound) => vec![
+            ("close_durability", Value::Str("bounded".to_string())),
+            ("close_bound_ms", Value::Int(bound.as_millis() as i128)),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1272,93 @@ mod tests {
             PoolPresentation::External,
             Some(OsStr::new("0")),
         ));
+    }
+
+    #[test]
+    fn the_close_policy_parses_and_refuses_what_it_does_not_know() {
+        use std::time::Duration;
+        let with = |entries: Vec<(&str, Value)>| close_durability_param(&object(entries));
+        assert_eq!(
+            with(vec![]).unwrap(),
+            CloseDurability::Bounded(Duration::from_secs(1))
+        );
+        assert_eq!(with(vec![]).unwrap(), CloseDurability::default());
+        assert_eq!(
+            with(vec![(
+                "close_durability",
+                Value::Str("commit-on-close".into())
+            )])
+            .unwrap(),
+            CloseDurability::CommitOnClose
+        );
+        assert_eq!(
+            with(vec![("close_durability", Value::Str("bounded".into()))]).unwrap(),
+            CloseDurability::Bounded(Duration::from_secs(1))
+        );
+        for ms in [1000, 2500, 5000] {
+            assert_eq!(
+                with(vec![
+                    ("close_durability", Value::Str("bounded".into())),
+                    ("close_bound_ms", Value::Int(ms)),
+                ])
+                .unwrap(),
+                CloseDurability::Bounded(Duration::from_millis(ms as u64))
+            );
+            assert_eq!(
+                with(vec![("close_bound_ms", Value::Int(ms))]).unwrap(),
+                CloseDurability::Bounded(Duration::from_millis(ms as u64)),
+                "a window alone is a bounded serving"
+            );
+        }
+        let refused = [
+            vec![("close_durability", Value::Str("sometimes".into()))],
+            vec![("close_durability", Value::Bool(true))],
+            vec![
+                ("close_durability", Value::Str("bounded".into())),
+                ("close_bound_ms", Value::Int(999)),
+            ],
+            vec![
+                ("close_durability", Value::Str("bounded".into())),
+                ("close_bound_ms", Value::Int(5001)),
+            ],
+            vec![
+                ("close_durability", Value::Str("bounded".into())),
+                ("close_bound_ms", Value::Str("2000".into())),
+            ],
+            vec![("close_bound_ms", Value::Int(60_000))],
+            vec![
+                ("close_durability", Value::Str("commit-on-close".into())),
+                ("close_bound_ms", Value::Int(2000)),
+            ],
+        ];
+        for entries in refused {
+            match with(entries) {
+                Err((ErrorCode::BadRequest, _)) => {}
+                other => panic!("expected a BadRequest, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            object(close_durability_fields(CloseDurability::Bounded(
+                Duration::from_millis(2500)
+            ))),
+            object(vec![
+                ("close_durability", Value::Str("bounded".into())),
+                ("close_bound_ms", Value::Int(2500)),
+            ])
+        );
+        let named = |entries: Vec<(&str, Value)>| requested_close_durability(&object(entries));
+        assert_eq!(named(vec![("pool", Value::Str("tank".into()))]), None);
+        assert_eq!(
+            named(vec![(
+                "close_durability",
+                Value::Str("commit-on-close".into())
+            )]),
+            Some(CloseDurability::CommitOnClose)
+        );
+        assert_eq!(
+            named(vec![("close_bound_ms", Value::Int(5000))]),
+            Some(CloseDurability::Bounded(Duration::from_secs(5)))
+        );
     }
 
     #[test]
@@ -1209,10 +1435,8 @@ mod tests {
     #[test]
     fn a_stopping_stream_still_writes_the_reply_it_owes() {
         let stop = Arc::new(AtomicBool::new(true));
-        let mut delivered = StopPollStream {
-            stream: std::io::Cursor::new(Vec::new()),
-            stop: Arc::clone(&stop),
-        };
+        let mut delivered =
+            StopPollStream::new(std::io::Cursor::new(Vec::new()), Arc::clone(&stop));
         std::io::Write::write_all(&mut delivered, b"ack").expect("the owed reply goes out");
         assert_eq!(delivered.stream.get_ref().as_slice(), b"ack");
         assert_eq!(
@@ -1229,10 +1453,7 @@ mod tests {
                 Ok(())
             }
         }
-        let mut refused = StopPollStream {
-            stream: Refusing,
-            stop,
-        };
+        let mut refused = StopPollStream::new(Refusing, stop);
         assert_eq!(
             std::io::Write::write(&mut refused, b"ack")
                 .expect_err("one attempt, then the stream's answer")
@@ -1293,3 +1514,7 @@ mod tests {
         assert!(watcher_terminated(&stop));
     }
 }
+
+#[cfg(test)]
+#[path = "serving_fault_tests.rs"]
+mod fault_tests;

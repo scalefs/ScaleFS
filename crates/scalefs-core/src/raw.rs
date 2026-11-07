@@ -132,6 +132,7 @@ impl SectorIo for RawSectorFile {
     }
 
     fn read_sectors(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let _t = crate::perftrace::start(crate::perftrace::C::DevRead, buf.len() as u64);
         read_exact_at(&self.file, offset, buf)
     }
 
@@ -141,6 +142,7 @@ impl SectorIo for RawSectorFile {
                 "this handle was opened read-only, for probing",
             ));
         }
+        let _t = crate::perftrace::start(crate::perftrace::C::DevWrite, data.len() as u64);
         write_all_at(&self.file, offset, data)
     }
 
@@ -148,6 +150,7 @@ impl SectorIo for RawSectorFile {
         if self.read_only {
             return Ok(());
         }
+        let _t = crate::perftrace::start(crate::perftrace::C::DevFlush, 0);
         match self.barrier {
             Barrier::SyncAll => self.file.sync_all()?,
             #[cfg(target_os = "macos")]
@@ -278,6 +281,7 @@ impl BlockDevice for AnyBlockDevice {
     }
 
     fn flush_group(devices: &[&Self]) -> Result<()> {
+        let _t = crate::perftrace::start(crate::perftrace::C::FlushGroup, devices.len() as u64);
         if devices.len() <= 1 {
             return devices.iter().try_for_each(|device| device.flush());
         }

@@ -6,6 +6,8 @@ mod serving;
 #[cfg(windows)]
 mod session_notify;
 mod shares;
+#[cfg(windows)]
+mod shell_companion;
 mod state;
 
 use scalefs_ipc::endpoint::{Endpoint, Listener, Stream};
@@ -119,10 +121,11 @@ const READ_VERBS: &[&str] = &[
     "shell.volume",
 ];
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const SHELL_VERBS: &[&str] = &["ping", "version", "shell.volume"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Surface {
+pub(crate) enum Surface {
     Management,
     #[cfg_attr(not(windows), allow(dead_code))]
     Shell,
@@ -239,36 +242,42 @@ pub fn serve_with(options: ServeOptions) -> Result<(), String> {
         restore_serves(&daemon, store);
     }
     #[cfg(windows)]
-    spawn_shell_companion(&daemon);
+    shell_companion::spawn(&daemon);
     if let Some(ready) = options.on_ready {
         ready();
     }
-    let mut consecutive_failures = 0;
+    const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut backoff = std::time::Duration::from_millis(50);
+    let mut reported = false;
     loop {
         match listener.accept() {
             Ok(stream) => {
-                consecutive_failures = 0;
+                backoff = std::time::Duration::from_millis(50);
+                if reported {
+                    eprintln!("scalefsd: the management listener is accepting again");
+                    reported = false;
+                }
                 if daemon.shutdown.load(Ordering::SeqCst) {
                     return Ok(());
                 }
                 let daemon = Arc::clone(&daemon);
                 let _ = std::thread::Builder::new()
                     .name("scalefsd-session".to_string())
-                    .spawn(move || serve_connection(stream, &daemon, Surface::Management));
+                    .spawn(move || serve_connection(stream, &daemon));
             }
             Err(error) => {
                 if daemon.shutdown.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                consecutive_failures += 1;
-                if consecutive_failures >= 64 {
-                    daemon.closing.store(true, Ordering::SeqCst);
-                    daemon.pools.unmount_all();
-                    daemon.serving.stop_all();
-                    daemon.shares.stop_all();
-                    return Err(format!("listener failed: {error}"));
+                if !reported {
+                    eprintln!(
+                        "scalefsd: the management listener cannot accept ({error}); retrying \
+                         (mounts and shares stay up)"
+                    );
+                    reported = true;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
             }
         }
     }
@@ -293,6 +302,9 @@ fn restore_serves(daemon: &Daemon, store: &state::StateStore) {
             if mount.read_only {
                 params.push(("read_only", Value::Bool(true)));
             }
+            if let Some(policy) = mount.close_durability {
+                params.extend(crate::serving::close_durability_fields(policy));
+            }
             match daemon.serving.serve(
                 &object(params),
                 |name| daemon.pools.share_handle(name),
@@ -312,7 +324,7 @@ fn restore_serves(daemon: &Daemon, store: &state::StateStore) {
     }
 }
 
-fn serve_connection(stream: Stream, daemon: &Daemon, surface: Surface) {
+fn serve_connection(stream: Stream, daemon: &Daemon) {
     let mut reader = BufReader::new(stream);
 
     let hello = match read_frame(&mut reader) {
@@ -368,19 +380,13 @@ fn serve_connection(stream: Stream, daemon: &Daemon, surface: Surface) {
                 continue;
             }
         };
-        let (response, hang_up) =
-            if surface == Surface::Shell && !SHELL_VERBS.contains(&request.op.as_str()) {
-                (
-                    error_response(
-                        Some(request.id),
-                        ErrorCode::Forbidden,
-                        &format!("'{}' is not answered on the shell endpoint", request.op),
-                    ),
-                    false,
-                )
-            } else {
-                dispatch(&request, daemon, reader.get_ref(), &mut gate)
-            };
+        let (response, hang_up) = dispatch(
+            &request,
+            daemon,
+            reader.get_ref(),
+            &mut gate,
+            Surface::Management,
+        );
         if write_frame(reader.get_mut(), &response).is_err() {
             return;
         }
@@ -399,6 +405,7 @@ fn dispatch(
     daemon: &Daemon,
     stream: &Stream,
     gate: &mut PeerGate,
+    surface: Surface,
 ) -> (Value, bool) {
     if daemon.closing.load(Ordering::SeqCst) && !matches!(request.op.as_str(), "ping" | "version") {
         return (
@@ -543,6 +550,9 @@ fn dispatch(
                                 Some(scalefs_ipc::json::Value::Str(device)) => Some(device.clone()),
                                 _ => None,
                             },
+                            close_durability: crate::serving::requested_close_durability(
+                                &request.params,
+                            ),
                         })
                     }
                     _ => None,
@@ -563,7 +573,7 @@ fn dispatch(
         }
         "serve.list" => answer(request.id, daemon.serving.list()),
         "pool.eject_record" => answer(request.id, daemon.pools.eject_record(&request.params)),
-        "shell.volume" => answer(request.id, shell_volume(daemon, &request.params)),
+        "shell.volume" => answer(request.id, shell_volume(daemon, &request.params, surface)),
         "share.add" => answer(
             request.id,
             daemon
@@ -583,53 +593,41 @@ fn dispatch(
     }
 }
 
-#[cfg(windows)]
-fn spawn_shell_companion(daemon: &Arc<Daemon>) {
-    let daemon = Arc::clone(daemon);
-    let _ = std::thread::Builder::new()
-        .name("scalefsd-shell".to_string())
-        .spawn(move || {
-            let companion = daemon.endpoint.shell_companion();
-            let mut listener = match Listener::bind_for_interactive_users(&companion) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    eprintln!(
-                        "scalefsd: the shell endpoint {} is unavailable ({error}); Explorer's \
-                         Eject command cannot reach this daemon",
-                        companion.as_str()
-                    );
-                    return;
-                }
-            };
-            let mut failures = 0;
-            while !daemon.shutdown.load(Ordering::SeqCst) && failures < 64 {
-                match listener.accept() {
-                    Ok(stream) => {
-                        failures = 0;
-                        let daemon = Arc::clone(&daemon);
-                        let _ = std::thread::Builder::new()
-                            .name("scalefsd-shell-session".to_string())
-                            .spawn(move || serve_connection(stream, &daemon, Surface::Shell));
-                    }
-                    Err(_) => {
-                        failures += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
-            }
-        });
-}
-
-fn shell_volume(daemon: &Daemon, params: &Value) -> Result<Value, pools::OpError> {
+fn shell_volume(
+    daemon: &Daemon,
+    params: &Value,
+    surface: Surface,
+) -> Result<Value, pools::OpError> {
+    let letter = match params.get("letter") {
+        None => None,
+        Some(value) => Some(value.as_str().and_then(drive_letter).ok_or_else(
+            || -> pools::OpError {
+                (
+                    ErrorCode::BadRequest,
+                    "'letter' must be a drive letter (\"P:\")".to_string(),
+                )
+            },
+        )?),
+    };
+    let by_id = match params.get("pool_id") {
+        None => None,
+        Some(value) => Some(value.as_str().filter(|id| is_pool_id(id)).ok_or_else(
+            || -> pools::OpError {
+                (
+                    ErrorCode::BadRequest,
+                    "'pool_id' must be 32 lowercase hex digits".to_string(),
+                )
+            },
+        )?),
+    };
     let rows = daemon.serving.list()?;
     let serving = rows
         .get("serving")
         .and_then(Value::as_array)
         .unwrap_or_default();
-    let by_id = params.get("pool_id").and_then(Value::as_str);
-    let row = match (params.get("letter").and_then(Value::as_str), by_id) {
+    let row = match (letter, by_id) {
         (Some(letter), _) => {
-            let want = format!("{}:", letter.trim_end_matches(['\\', ':']));
+            let want = format!("{letter}:");
             Some(
                 serving
                     .iter()
@@ -666,6 +664,24 @@ fn shell_volume(daemon: &Daemon, params: &Value) -> Result<Value, pools::OpError
     let record = daemon
         .pools
         .eject_record(&object(vec![("pool_id", Value::Str(pool_id.clone()))]))?;
+    let serving = row.map(|row| {
+        let pool = row
+            .get("pool")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let holders = holders(daemon, &pool);
+        (pool, row.get("mount").cloned(), holders)
+    });
+    Ok(shell_volume_reply(surface, pool_id, &record, serving))
+}
+
+fn shell_volume_reply(
+    surface: Surface,
+    pool_id: String,
+    record: &Value,
+    serving: Option<(String, Option<Value>, Vec<Value>)>,
+) -> Value {
     let mut reply = vec![
         ("pool_id", Value::Str(pool_id)),
         ("phase", record.get("phase").cloned().unwrap_or(Value::Null)),
@@ -674,19 +690,29 @@ fn shell_volume(daemon: &Daemon, params: &Value) -> Result<Value, pools::OpError
             record.get("generation").cloned().unwrap_or(Value::Int(0)),
         ),
     ];
-    if let Some(row) = row {
-        let pool = row
-            .get("pool")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        reply.push(("holders", Value::Array(holders(daemon, &pool))));
-        if let Some(mount) = row.get("mount") {
-            reply.push(("mount", mount.clone()));
+    if let Some((pool, mount, holders)) = serving {
+        reply.push(("holders", Value::Array(holders)));
+        if surface == Surface::Management {
+            if let Some(mount) = mount {
+                reply.push(("mount", mount));
+            }
+            reply.push(("pool", Value::Str(pool)));
         }
-        reply.push(("pool", Value::Str(pool)));
     }
-    Ok(object(reply))
+    object(reply)
+}
+
+fn drive_letter(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let letter = chars.next().filter(char::is_ascii_alphabetic)?;
+    matches!(chars.as_str(), "" | ":" | ":\\").then(|| letter.to_ascii_uppercase())
+}
+
+fn is_pool_id(text: &str) -> bool {
+    text.len() == 32
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn holders(daemon: &Daemon, pool: &str) -> Vec<Value> {
@@ -731,10 +757,18 @@ mod tests {
 
     fn daemon(closing: bool, enforce: bool) -> Daemon {
         Daemon {
-            endpoint: Endpoint::new("dispatch-test"),
-            shutdown: AtomicBool::new(false),
             closing: AtomicBool::new(closing),
             trust: TrustPolicy { enforce },
+            ..daemon_at(Endpoint::new("dispatch-test"))
+        }
+    }
+
+    pub(crate) fn daemon_at(endpoint: Endpoint) -> Daemon {
+        Daemon {
+            endpoint,
+            shutdown: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            trust: TrustPolicy { enforce: false },
             pools: pools::Registry::default(),
             shares: shares::Shares::default(),
             serving: serving::ServingRegistry::default(),
@@ -782,7 +816,13 @@ mod tests {
         let (server, _client) = stream_pair("barrier");
         let mut gate = PeerGate::Fixed(true);
         for probe in ["ping", "version"] {
-            let (response, hang_up) = dispatch(&request(probe), &daemon, &server, &mut gate);
+            let (response, hang_up) = dispatch(
+                &request(probe),
+                &daemon,
+                &server,
+                &mut gate,
+                Surface::Management,
+            );
             assert_eq!(response.get("ok"), Some(&Value::Bool(true)), "{probe}");
             assert!(!hang_up, "{probe}");
         }
@@ -795,7 +835,13 @@ mod tests {
             "pool.detach",
             "shutdown",
         ] {
-            let (response, hang_up) = dispatch(&request(refused), &daemon, &server, &mut gate);
+            let (response, hang_up) = dispatch(
+                &request(refused),
+                &daemon,
+                &server,
+                &mut gate,
+                Surface::Management,
+            );
             assert_eq!(response.get("ok"), Some(&Value::Bool(false)), "{refused}");
             assert_eq!(error_code(&response).as_deref(), Some("busy"), "{refused}");
             assert!(!hang_up, "{refused}");
@@ -812,7 +858,13 @@ mod tests {
                 "'{verb}' must appear in exactly one class",
             );
             let fresh = daemon(false, false);
-            let (response, _) = dispatch(&request(verb), &fresh, &server, &mut gate);
+            let (response, _) = dispatch(
+                &request(verb),
+                &fresh,
+                &server,
+                &mut gate,
+                Surface::Management,
+            );
             let unknown = error_code(&response).as_deref() == Some("unsupported")
                 && response
                     .get("error")
@@ -825,7 +877,13 @@ mod tests {
             );
         }
         let fresh = daemon(false, false);
-        let (response, _) = dispatch(&request("pool.evaporate"), &fresh, &server, &mut gate);
+        let (response, _) = dispatch(
+            &request("pool.evaporate"),
+            &fresh,
+            &server,
+            &mut gate,
+            Surface::Management,
+        );
         assert_eq!(error_code(&response).as_deref(), Some("unsupported"));
     }
 
@@ -835,8 +893,13 @@ mod tests {
         let (server, _client) = stream_pair("enforce");
         let mut unprivileged = PeerGate::Fixed(false);
         for verb in MUTATE_VERBS {
-            let (response, hang_up) =
-                dispatch(&request(verb), &enforcing, &server, &mut unprivileged);
+            let (response, hang_up) = dispatch(
+                &request(verb),
+                &enforcing,
+                &server,
+                &mut unprivileged,
+                Surface::Management,
+            );
             assert_eq!(
                 error_code(&response).as_deref(),
                 Some("forbidden"),
@@ -845,7 +908,13 @@ mod tests {
             assert!(!hang_up, "{verb} must not act (or hang up) when refused");
         }
         for verb in READ_VERBS {
-            let (response, _) = dispatch(&request(verb), &enforcing, &server, &mut unprivileged);
+            let (response, _) = dispatch(
+                &request(verb),
+                &enforcing,
+                &server,
+                &mut unprivileged,
+                Surface::Management,
+            );
             assert_ne!(
                 error_code(&response).as_deref(),
                 Some("forbidden"),
@@ -858,8 +927,92 @@ mod tests {
             &enforcing,
             &server,
             &mut privileged,
+            Surface::Management,
         );
         assert_eq!(error_code(&response).as_deref(), Some("bad_request"));
+    }
+
+    #[test]
+    fn shell_volume_checks_its_parameters_first() {
+        let daemon = daemon(false, false);
+        let (server, _client) = stream_pair("shell-volume");
+        let mut gate = PeerGate::Fixed(false);
+        let mut ask = |params: Vec<(&str, Value)>| {
+            let request = Request {
+                id: 7,
+                op: "shell.volume".to_string(),
+                params: object(params),
+            };
+            error_code(&dispatch(&request, &daemon, &server, &mut gate, Surface::Management).0)
+        };
+        let hex32 = "0123456789abcdef0123456789abcdef";
+        for bad in [
+            Value::Str("x".into()),
+            Value::Str(hex32[1..].into()),
+            Value::Str(format!("{hex32}0")),
+            Value::Str(hex32.to_ascii_uppercase()),
+            Value::Str("../0123456789abcdef0123456789ab".into()),
+            Value::Int(5),
+        ] {
+            assert_eq!(
+                ask(vec![("pool_id", bad.clone())]).as_deref(),
+                Some("bad_request"),
+                "{bad:?}"
+            );
+        }
+        for bad in ["PP", "1:", "", "P:\\x", "P::"] {
+            assert_eq!(
+                ask(vec![("letter", Value::Str(bad.into()))]).as_deref(),
+                Some("bad_request"),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(ask(vec![]).as_deref(), Some("bad_request"));
+        assert_eq!(
+            ask(vec![("letter", Value::Str("p:".into()))]).as_deref(),
+            Some("not_found")
+        );
+        assert_eq!(ask(vec![("pool_id", Value::Str(hex32.into()))]), None);
+    }
+
+    #[test]
+    fn the_companion_reply_omits_the_pool_and_mount() {
+        let record = object(vec![
+            ("phase", Value::Str("none".into())),
+            ("generation", Value::Int(0)),
+        ]);
+        let pool_id = "0123456789abcdef0123456789abcdef".to_string();
+        let serving = Some((
+            "dl".to_string(),
+            Some(Value::Str("P:".into())),
+            vec![object(vec![
+                ("kind", Value::Str("share".into())),
+                ("name", Value::Str("dlshare".into())),
+            ])],
+        ));
+        let shell = shell_volume_reply(Surface::Shell, pool_id.clone(), &record, serving.clone());
+        let management = shell_volume_reply(Surface::Management, pool_id.clone(), &record, serving);
+        for reply in [&shell, &management] {
+            assert_eq!(
+                reply.get("pool_id").and_then(Value::as_str),
+                Some(pool_id.as_str())
+            );
+            assert_eq!(reply.get("phase").and_then(Value::as_str), Some("none"));
+            assert!(reply.get("generation").is_some());
+            assert!(
+                reply
+                    .get("holders")
+                    .and_then(Value::as_array)
+                    .is_some_and(|h| h.len() == 1),
+                "both surfaces name the share"
+            );
+        }
+        assert_eq!(shell.get("pool"), None, "the companion drops the pool name");
+        assert_eq!(shell.get("mount"), None, "the companion drops the mount");
+        assert_eq!(management.get("pool").and_then(Value::as_str), Some("dl"));
+        assert_eq!(management.get("mount").and_then(Value::as_str), Some("P:"));
+        let bare = shell_volume_reply(Surface::Shell, pool_id, &record, None);
+        assert_eq!(bare.get("holders"), None);
     }
 
     #[test]
@@ -867,7 +1020,13 @@ mod tests {
         let open = daemon(false, false);
         let (server, _client) = stream_pair("open");
         let mut unprivileged = PeerGate::Fixed(false);
-        let (response, _) = dispatch(&request("pool.attach"), &open, &server, &mut unprivileged);
+        let (response, _) = dispatch(
+            &request("pool.attach"),
+            &open,
+            &server,
+            &mut unprivileged,
+            Surface::Management,
+        );
         assert_eq!(error_code(&response).as_deref(), Some("bad_request"));
     }
 
@@ -904,7 +1063,7 @@ mod tests {
             )
         });
         let stream = listener.accept().unwrap();
-        serve_connection(stream, &daemon, Surface::Management);
+        serve_connection(stream, &daemon);
 
         let expected = if scalefs_ipc::trust::process_is_privileged() {
             "bad_request"

@@ -893,3 +893,43 @@ fn utf16le(text: &str) -> Vec<u8> {
     }
     out
 }
+
+#[test]
+fn a_read_longer_than_max_read_size_is_refused_or_clamped() {
+    let mut share = SmbShare::new(config(), nonces(), test_core());
+    let mut client = Client::new();
+    client.log_in("backup", "s3cret-pass", &mut share);
+    client.tree_connect("\\\\scalefs\\vault", &mut share);
+
+    let create = client.send(
+        command::CREATE,
+        &create_request("big.bin", disposition::CREATE, options::NON_DIRECTORY_FILE),
+        &mut share,
+    );
+    assert_eq!(create.status, status::SUCCESS, "CREATE");
+    let fid = created_file_id(&create.body);
+    let chunk = vec![0x5Au8; 1 << 20];
+    for (offset, len) in [(0u64, 1usize << 20), (1 << 20, 1 << 19)] {
+        let write = client.send(
+            command::WRITE,
+            &write_request(fid, offset, &chunk[..len]),
+            &mut share,
+        );
+        assert_eq!(write.status, status::SUCCESS, "WRITE");
+    }
+
+    let read = client.send(command::READ, &read_request(fid, 0, u32::MAX), &mut share);
+    let returned = if read.status == status::SUCCESS {
+        read_data(&read.body).len()
+    } else {
+        0
+    };
+    assert!(
+        read.status == status::INVALID_PARAMETER
+            || (read.status == status::SUCCESS && returned <= 1 << 20),
+        "a READ of {} bytes was answered {:#010x} with {returned} bytes",
+        u32::MAX,
+        read.status
+    );
+    let _ = client.send(command::CLOSE, &close_request(fid), &mut share);
+}

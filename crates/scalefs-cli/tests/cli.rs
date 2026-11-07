@@ -57,7 +57,7 @@ fn fails(args: &[&str]) -> (Option<i32>, String) {
 
 #[test]
 fn version_and_help_run() {
-    assert!(ok(&["version"]).contains("on-disk format v1"));
+    assert!(ok(&["version"]).contains("on-disk format v2"));
     assert!(ok(&["help"]).contains("pool create"));
     let (code, _) = fails(&["frobnicate"]);
     assert_eq!(code, Some(2));
@@ -219,6 +219,56 @@ fn fsck_detects_a_corrupted_data_record() {
     assert_eq!(output.status.code(), Some(1), "fsck must report problems");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("fails verification"), "{stderr}");
+}
+
+#[test]
+fn every_command_refuses_an_earlier_format_pool_with_one_message() {
+    let scratch = ScratchDir::new("earlier");
+    let image = scratch.path("pool.img");
+    ok(&[
+        "pool",
+        "create",
+        &image,
+        "--size",
+        "8M",
+        "--zone-size",
+        "64K",
+    ]);
+    let mut bytes = std::fs::read(&image).unwrap();
+    let mut patched = 0;
+    for at in (0..bytes.len() - 16).step_by(4096) {
+        let header = &bytes[at..at + 16];
+        if header[..8] == *b"ScaleFS\0"
+            && header[8..12] == 2u32.to_le_bytes()
+            && header[12..14] == 1u16.to_le_bytes()
+        {
+            bytes[at + 8..at + 12].copy_from_slice(&1u32.to_le_bytes());
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 2, "both superblock slots");
+    std::fs::write(&image, &bytes).unwrap();
+
+    let out = scratch.path("out");
+    let commands: [&[&str]; 6] = [
+        &["pool", "status", &image],
+        &["fsck", &image],
+        &["scrub", &image],
+        &["pool", "import", &image],
+        &["salvage", "scan", &image],
+        &["salvage", "copy-out", &image, &out],
+    ];
+    for args in commands {
+        let (code, stderr) = fails(args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(
+                "this pool was created by an earlier preview of ScaleFS (on-disk format 1; \
+                 this build reads format 2): create a new pool and move the files"
+            ),
+            "{args:?}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -639,7 +689,7 @@ fn daemon_commands_reach_a_running_scalefsd() {
     assert!(pinged.contains("answers"), "{pinged}");
     let version = ok(&["daemon", "version", "--endpoint", &endpoint_text]);
     assert!(version.contains("protocol 1"), "{version}");
-    assert!(version.contains("format v1"), "{version}");
+    assert!(version.contains("format v2"), "{version}");
 
     let stopped = ok(&["daemon", "shutdown", "--endpoint", &endpoint_text]);
     assert!(stopped.contains("shutting down"), "{stopped}");

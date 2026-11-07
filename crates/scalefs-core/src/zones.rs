@@ -343,7 +343,7 @@ impl ZoneAllocator {
         crate::layout::zone_summary_len(self.zones.len() as u64) as usize
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, tx: u64) -> Vec<u8> {
         let mut payload = Vec::with_capacity(
             8 + self.zones.len() * crate::layout::ZONE_SUMMARY_ENTRY_LEN as usize,
         );
@@ -360,7 +360,7 @@ impl ZoneAllocator {
             put_u32(&mut payload, zone.erase_count);
             put_u64(&mut payload, zone.write_pointer);
         }
-        encode_record(RecordKind::ZoneSummary, &payload)
+        encode_record(RecordKind::ZoneSummary, tx, &payload)
     }
 
     pub fn decode(geometry: Geometry, bytes: &[u8]) -> Result<Self> {
@@ -727,10 +727,10 @@ mod tests {
             .unwrap();
         assert_counts(&alloc);
 
-        let decoded = ZoneAllocator::decode(alloc.geometry(), &alloc.encode()).unwrap();
+        let decoded = ZoneAllocator::decode(alloc.geometry(), &alloc.encode(1)).unwrap();
         assert_counts(&decoded);
         assert_eq!(decoded, alloc);
-        assert_eq!(alloc.encoded_len(), alloc.encode().len());
+        assert_eq!(alloc.encoded_len(), alloc.encode(1).len());
     }
 
     #[test]
@@ -778,7 +778,7 @@ mod tests {
             .unwrap();
         assert!(alloc.reset_stripe(3).is_err());
 
-        let decoded = ZoneAllocator::decode(geometry(8, 1), &alloc.encode()).unwrap();
+        let decoded = ZoneAllocator::decode(geometry(8, 1), &alloc.encode(1)).unwrap();
         assert_eq!(decoded, alloc);
 
         let mut resumed = decoded;
@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn summary_decode_rejects_invalid_state() {
         let alloc = ZoneAllocator::new(geometry(8, 1)).unwrap();
-        let encoded = alloc.encode();
+        let encoded = alloc.encode(1);
 
         assert!(ZoneAllocator::decode(geometry(16, 1), &encoded).is_err());
 
@@ -800,7 +800,7 @@ mod tests {
             let record = decode_record(&encoded).unwrap();
             let mut payload = record.payload;
             mutate(&mut payload);
-            let bytes = encode_record(RecordKind::ZoneSummary, &payload);
+            let bytes = encode_record(RecordKind::ZoneSummary, 1, &payload);
             ZoneAllocator::decode(geometry(8, 1), &bytes)
         };
         let entry = |zone: usize| 8 + zone * 14;
@@ -854,10 +854,10 @@ mod tests {
         alloc
             .allocate(ZoneClass::Data, 5000, AllocPurpose::Normal)
             .unwrap();
-        let encoded = alloc.encode();
+        let encoded = alloc.encode(1);
         assert_eq!(
             hex(&encoded),
-            "5363616c6546530001000000050000007800000000000000224a6fcd00000000080000000000000000000000000000000000000000000500000000000010000000000000060000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+            "5363616c6546530002000000050000007800000058044c270100000000000000080000000000000000000000000000000000000000000500000000000010000000000000060000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
         );
         assert_eq!(
             ZoneAllocator::decode(geometry(8, 1), &encoded).unwrap(),
@@ -930,7 +930,7 @@ mod tests {
         alloc
             .allocate(ZoneClass::Data, 100, AllocPurpose::Normal)
             .unwrap();
-        let decoded = ZoneAllocator::decode(geometry(12, 1), &alloc.encode()).unwrap();
+        let decoded = ZoneAllocator::decode(geometry(12, 1), &alloc.encode(1)).unwrap();
         assert_eq!(decoded, alloc);
         assert_eq!(decoded.actuator_range_count(), 0);
     }

@@ -33,7 +33,9 @@ fn snapshot_list(args: &[String]) -> Result<(), String> {
         return Err("usage: scalefs snapshot list <image>".to_string());
     };
     let pool = open_pool(image)?;
-    let snapshots = pool.snapshot_list();
+    let snapshots = pool
+        .snapshot_list()
+        .map_err(|err| format!("{image}: cannot list snapshots: {err}"))?;
     if snapshots.is_empty() {
         println!("(no snapshots)");
         return Ok(());

@@ -100,7 +100,9 @@ char *scalefs_salvage_ls_json(ScalefsSalvage *session, const char *path);
 char *scalefs_salvage_stat_json(ScalefsSalvage *session, const char *path);
 
 /* Salvage one file to dest_path (created/truncated on the HOST
- * filesystem — never on the salvaged media). Unrecoverable ranges are
+ * filesystem — never on the salvaged media: a device path, or a path
+ * that resolves to one of the session's members, is refused with NULL
+ * and scalefs_last_error). Unrecoverable ranges are
  * written as zeros, never skipped, so the output size is exact; the
  * returned JSON is the evidence:
  * {"size","bytes_lost",

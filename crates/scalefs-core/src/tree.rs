@@ -1,6 +1,9 @@
 use crate::error::{Result, ScaleFsError};
-use crate::format::{RECORD_HEADER_LEN, RecordKind, decode_record, encode_record};
+use crate::format::{
+    Expect, RecordKind, decode_expect, decode_record, encode_expect, encode_record,
+};
 use crate::layout::{Extent, decode_extent, encode_extent};
+use crate::runs::{FileRun, StripedRun};
 use crate::wire::{Cursor, put_i64, put_u16, put_u32, put_u64};
 
 pub const ROOT_INODE: u64 = 1;
@@ -15,6 +18,8 @@ pub const ITEM_XATTR: u8 = 6;
 
 pub const MAX_NAME_LEN: usize = 255;
 pub const MAX_VALUE_LEN: usize = 4096;
+
+const MAX_LOAD_DEPTH: u32 = 64;
 
 pub const TOLERATED_RANGE_MIN: u8 = 128;
 
@@ -163,20 +168,11 @@ pub enum MetadataValue {
     },
     Inode(InodeAttrs),
     DirEntries(Vec<DirEntry>),
-    FileExtent {
-        extents: Vec<Extent>,
-        data_offset: u64,
-        logical_len: u64,
-    },
-    StripedExtent {
-        extent: Extent,
-        parity_extents: Vec<Extent>,
-        data_offset: u64,
-        logical_len: u64,
-    },
+    FileRun(FileRun),
+    StripedRun(StripedRun),
     RetainedRoot {
         tx_id: u64,
-        metadata_roots: Vec<Extent>,
+        root: PageRef,
         created_at_ns: i64,
         name: String,
     },
@@ -220,87 +216,15 @@ impl MetadataValue {
                     validate_stored_name(&entry.name)?;
                 }
             }
-            Self::FileExtent {
-                extents,
-                data_offset,
-                logical_len,
-            } => {
-                let Some(first) = extents.first() else {
-                    return Err(ScaleFsError::Corrupt("file extent has no copies"));
-                };
-                let mut members = std::collections::HashSet::new();
-                for extent in extents {
-                    if extent.length != first.length {
-                        return Err(ScaleFsError::Corrupt(
-                            "file extent copies must have equal lengths",
-                        ));
-                    }
-                    if !members.insert(extent.device_index) {
-                        return Err(ScaleFsError::Corrupt(
-                            "file extent copies must live on distinct members",
-                        ));
-                    }
-                }
-                let payload = first.length.saturating_sub(RECORD_HEADER_LEN as u64);
-                let end = data_offset.checked_add(*logical_len);
-                if *logical_len == 0 || end.is_none() || end.unwrap() > payload {
-                    return Err(ScaleFsError::Corrupt(
-                        "file extent references bytes outside its record",
-                    ));
-                }
-                if *logical_len > crate::fs::FILE_DATA_CHUNK as u64 {
-                    return Err(ScaleFsError::Corrupt(
-                        "file extent runs longer than one data chunk",
-                    ));
-                }
-            }
-            Self::StripedExtent {
-                extent,
-                parity_extents,
-                data_offset,
-                logical_len,
-            } => {
-                if parity_extents.is_empty() || parity_extents.len() > crate::rs::MAX_PARITY {
-                    return Err(ScaleFsError::Corrupt(
-                        "striped extent parity count is out of range",
-                    ));
-                }
-                let mut members = std::collections::HashSet::new();
-                members.insert(extent.device_index);
-                for parity in parity_extents {
-                    if parity.length == 0 || parity.length != parity_extents[0].length {
-                        return Err(ScaleFsError::Corrupt(
-                            "striped extent parity records must have equal lengths",
-                        ));
-                    }
-                    if !members.insert(parity.device_index) {
-                        return Err(ScaleFsError::Corrupt(
-                            "striped extent pieces must live on distinct members",
-                        ));
-                    }
-                }
-                let payload = extent.length.saturating_sub(RECORD_HEADER_LEN as u64);
-                let end = data_offset.checked_add(*logical_len);
-                if *logical_len == 0 || end.is_none() || end.unwrap() > payload {
-                    return Err(ScaleFsError::Corrupt(
-                        "striped extent references bytes outside its record",
-                    ));
-                }
-                if *logical_len > crate::fs::FILE_DATA_CHUNK as u64 {
-                    return Err(ScaleFsError::Corrupt(
-                        "striped extent runs longer than one data chunk",
-                    ));
-                }
-            }
+            Self::FileRun(run) => run.validate()?,
+            Self::StripedRun(run) => run.validate()?,
             Self::RetainedRoot {
-                tx_id,
-                metadata_roots,
-                name,
-                ..
+                tx_id, root, name, ..
             } => {
                 if *tx_id == 0 {
                     return Err(ScaleFsError::Corrupt("retained root transaction is zero"));
                 }
+                let metadata_roots = &root.copies;
                 if metadata_roots.is_empty() {
                     return Err(ScaleFsError::Corrupt("retained root has no copies"));
                 }
@@ -414,57 +338,23 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, value: &MetadataValue) {
                 out.extend_from_slice(entry.name.as_bytes());
             }
         }
-        MetadataValue::FileExtent {
-            extents,
-            data_offset,
-            logical_len,
-        } => {
-            if let [extent] = extents.as_slice() {
-                out.push(4);
-                encode_extent(out, *extent);
-            } else {
-                out.push(6);
-                out.push(extents.len() as u8);
-                for extent in extents {
-                    encode_extent(out, *extent);
-                }
-            }
-            put_u64(out, *data_offset);
-            put_u64(out, *logical_len);
+        MetadataValue::FileRun(run) => {
+            out.push(4);
+            run.encode(out);
         }
-        MetadataValue::StripedExtent {
-            extent,
-            parity_extents,
-            data_offset,
-            logical_len,
-        } => {
+        MetadataValue::StripedRun(run) => {
             out.push(8);
-            encode_extent(out, *extent);
-            out.push(parity_extents.len() as u8);
-            for parity in parity_extents {
-                encode_extent(out, *parity);
-            }
-            put_u64(out, *data_offset);
-            put_u64(out, *logical_len);
+            run.encode(out);
         }
         MetadataValue::RetainedRoot {
             tx_id,
-            metadata_roots,
+            root,
             created_at_ns,
             name,
         } => {
-            if let [root] = metadata_roots.as_slice() {
-                out.push(5);
-                put_u64(out, *tx_id);
-                encode_extent(out, *root);
-            } else {
-                out.push(7);
-                put_u64(out, *tx_id);
-                out.push(metadata_roots.len() as u8);
-                for root in metadata_roots {
-                    encode_extent(out, *root);
-                }
-            }
+            out.push(5);
+            put_u64(out, *tx_id);
+            encode_page_ref(out, root);
             put_i64(out, *created_at_ns);
             put_u16(out, name.len() as u16);
             out.extend_from_slice(name.as_bytes());
@@ -524,64 +414,11 @@ pub(crate) fn decode_value(cursor: &mut Cursor<'_>) -> Result<MetadataValue> {
             }
             MetadataValue::DirEntries(entries)
         }
-        4 => MetadataValue::FileExtent {
-            extents: vec![decode_extent(cursor)?],
-            data_offset: cursor.take_u64()?,
-            logical_len: cursor.take_u64()?,
-        },
-        6 => {
-            let copies = cursor.take_u8()?;
-            if copies < 2 {
-                return Err(ScaleFsError::Corrupt(
-                    "mirrored file extent needs at least two copies",
-                ));
-            }
-            let mut extents = Vec::with_capacity(usize::from(copies));
-            for _ in 0..copies {
-                extents.push(decode_extent(cursor)?);
-            }
-            MetadataValue::FileExtent {
-                extents,
-                data_offset: cursor.take_u64()?,
-                logical_len: cursor.take_u64()?,
-            }
-        }
-        8 => {
-            let extent = decode_extent(cursor)?;
-            let parity_count = cursor.take_u8()?;
-            if parity_count == 0 {
-                return Err(ScaleFsError::Corrupt(
-                    "striped extent has no parity records",
-                ));
-            }
-            let mut parity_extents = Vec::with_capacity(usize::from(parity_count));
-            for _ in 0..parity_count {
-                parity_extents.push(decode_extent(cursor)?);
-            }
-            MetadataValue::StripedExtent {
-                extent,
-                parity_extents,
-                data_offset: cursor.take_u64()?,
-                logical_len: cursor.take_u64()?,
-            }
-        }
-        tag @ (5 | 7) => {
+        4 => MetadataValue::FileRun(FileRun::decode(cursor)?),
+        8 => MetadataValue::StripedRun(StripedRun::decode(cursor)?),
+        5 => {
             let tx_id = cursor.take_u64()?;
-            let copies = if tag == 7 {
-                let copies = cursor.take_u8()?;
-                if copies < 2 {
-                    return Err(ScaleFsError::Corrupt(
-                        "mirrored retained root needs at least two copies",
-                    ));
-                }
-                usize::from(copies)
-            } else {
-                1
-            };
-            let mut metadata_roots = Vec::with_capacity(copies);
-            for _ in 0..copies {
-                metadata_roots.push(decode_extent(cursor)?);
-            }
+            let root = decode_page_ref(cursor)?;
             let created_at_ns = cursor.take_i64()?;
             let name_len = usize::from(cursor.take_u16()?);
             if name_len > MAX_NAME_LEN {
@@ -591,7 +428,7 @@ pub(crate) fn decode_value(cursor: &mut Cursor<'_>) -> Result<MetadataValue> {
                 .map_err(|_| ScaleFsError::Corrupt("retained root name is not UTF-8"))?;
             MetadataValue::RetainedRoot {
                 tx_id,
-                metadata_roots,
+                root,
                 created_at_ns,
                 name,
             }
@@ -629,7 +466,7 @@ fn value_encoded_len(value: &MetadataValue) -> usize {
     scratch.len()
 }
 
-pub(crate) fn encode_leaf_record(items: &[(MetadataKey, MetadataValue)]) -> Vec<u8> {
+pub(crate) fn encode_leaf_record(items: &[(MetadataKey, MetadataValue)], tx: u64) -> Vec<u8> {
     let mut payload = Vec::new();
     put_u16(&mut payload, items.len() as u16);
     for (key, value) in items {
@@ -639,7 +476,7 @@ pub(crate) fn encode_leaf_record(items: &[(MetadataKey, MetadataValue)]) -> Vec<
         put_u16(&mut payload, bytes.len() as u16);
         payload.extend_from_slice(&bytes);
     }
-    encode_record(RecordKind::MetadataLeaf, &payload)
+    encode_record(RecordKind::MetadataLeaf, tx, &payload)
 }
 
 pub(crate) fn decode_leaf_record(bytes: &[u8]) -> Result<Vec<(MetadataKey, MetadataValue)>> {
@@ -673,34 +510,57 @@ pub(crate) fn decode_leaf_record(bytes: &[u8]) -> Result<Vec<(MetadataKey, Metad
     Ok(items)
 }
 
-pub(crate) fn encode_internal_record(entries: &[(MetadataKey, Vec<Extent>)]) -> Vec<u8> {
-    let mirrored = entries.iter().any(|(_, copies)| copies.len() > 1);
-    let mut payload = Vec::new();
-    put_u16(&mut payload, entries.len() as u16);
-    for (separator, copies) in entries {
-        encode_key(&mut payload, *separator);
-        if mirrored {
-            payload.push(copies.len() as u8);
-        }
-        for extent in copies {
-            encode_extent(&mut payload, *extent);
-        }
+pub(crate) fn encode_page_ref(out: &mut Vec<u8>, page: &PageRef) {
+    out.push(page.copies.len() as u8);
+    for extent in &page.copies {
+        encode_extent(out, *extent);
     }
-    let kind = if mirrored {
-        RecordKind::MetadataInternalMirrored
-    } else {
-        RecordKind::MetadataInternal
-    };
-    encode_record(kind, &payload)
+    encode_expect(out, page.expect);
 }
 
-pub(crate) fn decode_internal_record(bytes: &[u8]) -> Result<Vec<(MetadataKey, Vec<Extent>)>> {
+pub(crate) fn decode_page_ref(cursor: &mut Cursor<'_>) -> Result<PageRef> {
+    let count = cursor.take_u8()?;
+    if count == 0 {
+        return Err(ScaleFsError::Corrupt("page reference has no copies"));
+    }
+    let mut copies: Vec<Extent> = Vec::with_capacity(usize::from(count));
+    let mut members = std::collections::HashSet::new();
+    for _ in 0..count {
+        let extent = decode_extent(cursor)?;
+        if extent.length == 0 {
+            return Err(ScaleFsError::Corrupt("page reference extent is empty"));
+        }
+        if copies.first().is_some_and(|f| f.length != extent.length) {
+            return Err(ScaleFsError::Corrupt(
+                "page reference copies must have equal lengths",
+            ));
+        }
+        if !members.insert(extent.device_index) {
+            return Err(ScaleFsError::Corrupt(
+                "page reference copies must live on distinct members",
+            ));
+        }
+        copies.push(extent);
+    }
+    let expect = decode_expect(cursor)?;
+    Ok(PageRef { copies, expect })
+}
+
+pub(crate) fn encode_internal_record(entries: &[(MetadataKey, PageRef)], tx: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_u16(&mut payload, entries.len() as u16);
+    for (separator, child) in entries {
+        encode_key(&mut payload, *separator);
+        encode_page_ref(&mut payload, child);
+    }
+    encode_record(RecordKind::MetadataInternal, tx, &payload)
+}
+
+pub(crate) fn decode_internal_record(bytes: &[u8]) -> Result<Vec<(MetadataKey, PageRef)>> {
     let record = decode_record(bytes)?;
-    let mirrored = match record.kind {
-        RecordKind::MetadataInternal => false,
-        RecordKind::MetadataInternalMirrored => true,
-        _ => return Err(ScaleFsError::Corrupt("expected a metadata internal record")),
-    };
+    if record.kind != RecordKind::MetadataInternal {
+        return Err(ScaleFsError::Corrupt("expected a metadata internal record"));
+    }
     let mut cursor = Cursor::new(&record.payload);
     let count = usize::from(cursor.take_u16()?);
     if count < 2 {
@@ -708,7 +568,7 @@ pub(crate) fn decode_internal_record(bytes: &[u8]) -> Result<Vec<(MetadataKey, V
             "internal page has fewer than two children",
         ));
     }
-    let mut entries: Vec<(MetadataKey, Vec<Extent>)> = Vec::with_capacity(count);
+    let mut entries: Vec<(MetadataKey, PageRef)> = Vec::with_capacity(count);
     for _ in 0..count {
         let separator = decode_key(&mut cursor)?;
         if let Some((previous, _)) = entries.last()
@@ -718,41 +578,24 @@ pub(crate) fn decode_internal_record(bytes: &[u8]) -> Result<Vec<(MetadataKey, V
                 "internal separators are not strictly sorted",
             ));
         }
-        let copy_count = if mirrored {
-            let copies = cursor.take_u8()?;
-            if copies == 0 {
-                return Err(ScaleFsError::Corrupt("child has no copies"));
-            }
-            usize::from(copies)
-        } else {
-            1
-        };
-        let mut copies = Vec::with_capacity(copy_count);
-        let mut members = std::collections::HashSet::new();
-        for _ in 0..copy_count {
-            let extent = decode_extent(&mut cursor)?;
-            if extent.length == 0 {
-                return Err(ScaleFsError::Corrupt("internal child extent is empty"));
-            }
-            if copies
-                .first()
-                .is_some_and(|f: &Extent| f.length != extent.length)
-            {
-                return Err(ScaleFsError::Corrupt(
-                    "child copies must have equal lengths",
-                ));
-            }
-            if !members.insert(extent.device_index) {
-                return Err(ScaleFsError::Corrupt(
-                    "child copies must live on distinct members",
-                ));
-            }
-            copies.push(extent);
-        }
-        entries.push((separator, copies));
+        entries.push((separator, decode_page_ref(&mut cursor)?));
     }
     cursor.expect_end("internal page has trailing bytes")?;
     Ok(entries)
+}
+
+pub type TreeItem = (MetadataKey, MetadataValue);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PageRef {
+    pub copies: Vec<Extent>,
+    pub expect: Expect,
+}
+
+impl PageRef {
+    pub fn location(&self) -> Option<(u16, u64)> {
+        location(&self.copies)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -761,23 +604,109 @@ pub struct PagePlan {
     pub bytes: Vec<u8>,
 }
 
+pub trait PageSource {
+    fn read_page(&self, page: &PageRef) -> Result<Vec<u8>>;
+}
+
+impl<F> PageSource for F
+where
+    F: Fn(&PageRef) -> Result<Vec<u8>>,
+{
+    fn read_page(&self, page: &PageRef) -> Result<Vec<u8>> {
+        self(page)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPages;
+
+impl PageSource for NoPages {
+    fn read_page(&self, _page: &PageRef) -> Result<Vec<u8>> {
+        Err(ScaleFsError::Unsupported(
+            "the tree page is not in memory and the tree has no page source",
+        ))
+    }
+}
+
+static NO_PAGES: NoPages = NoPages;
+
+pub const DEFAULT_METADATA_CACHE_BYTES: usize = 256 << 20;
+
+static DEFAULT_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_METADATA_CACHE_BYTES);
+
+pub fn set_default_metadata_cache(bytes: usize) {
+    DEFAULT_CACHE_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn default_metadata_cache() -> usize {
+    DEFAULT_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub budget_bytes: u64,
+    pub clean_bytes: u64,
+    pub loaded_pages: u64,
+    pub pinned_pages: u64,
+    pub page_reads: u64,
+    pub pages_evicted: u64,
+}
+
+#[derive(Debug)]
+struct PageMeta {
+    disk: Option<PageRef>,
+    used: u64,
+    cost: usize,
+    planned: u64,
+}
+
+impl PageMeta {
+    fn dirty(stamp: u64) -> Self {
+        Self {
+            disk: None,
+            used: stamp,
+            cost: 0,
+            planned: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Node {
     Leaf {
         items: Vec<(MetadataKey, MetadataValue)>,
-        disk: Option<Vec<Extent>>,
+        meta: PageMeta,
     },
     Internal {
-        children: Vec<(MetadataKey, Node)>,
-        disk: Option<Vec<Extent>>,
+        children: Vec<(MetadataKey, Child)>,
+        meta: PageMeta,
     },
 }
 
+#[derive(Debug)]
+enum Child {
+    OnDisk(PageRef),
+    Loaded(Box<Node>),
+}
+
 impl Node {
-    fn empty_leaf() -> Self {
+    fn empty_leaf(stamp: u64) -> Self {
         Node::Leaf {
             items: Vec::new(),
-            disk: None,
+            meta: PageMeta::dirty(stamp),
+        }
+    }
+
+    fn meta(&self) -> &PageMeta {
+        match self {
+            Node::Leaf { meta, .. } | Node::Internal { meta, .. } => meta,
+        }
+    }
+
+    fn meta_mut(&mut self) -> &mut PageMeta {
+        match self {
+            Node::Leaf { meta, .. } | Node::Internal { meta, .. } => meta,
         }
     }
 
@@ -788,31 +717,29 @@ impl Node {
         }
     }
 
-    fn max_key(&self) -> Option<MetadataKey> {
-        match self {
-            Node::Leaf { items, .. } => items.last().map(|(k, _)| *k),
-            Node::Internal { children, .. } => children.last().and_then(|(_, c)| c.max_key()),
-        }
-    }
-
     fn is_empty(&self) -> bool {
         match self {
             Node::Leaf { items, .. } => items.is_empty(),
             Node::Internal { children, .. } => children.is_empty(),
         }
     }
-
-    fn mark_dirty(&mut self) {
-        match self {
-            Node::Leaf { disk, .. } | Node::Internal { disk, .. } => *disk = None,
-        }
-    }
 }
 
-fn child_index(children: &[(MetadataKey, Node)], key: MetadataKey) -> usize {
+fn child_index(children: &[(MetadataKey, Child)], key: MetadataKey) -> usize {
     children
         .partition_point(|(separator, _)| *separator <= key)
         .saturating_sub(1)
+}
+
+fn child_hi(
+    children: &[(MetadataKey, Child)],
+    idx: usize,
+    hi: Option<MetadataKey>,
+) -> Option<MetadataKey> {
+    children
+        .get(idx + 1)
+        .map(|(separator, _)| *separator)
+        .or(hi)
 }
 
 fn leaf_encoded_payload_len(items: &[(MetadataKey, MetadataValue)]) -> usize {
@@ -822,9 +749,658 @@ fn leaf_encoded_payload_len(items: &[(MetadataKey, MetadataValue)]) -> usize {
         .sum::<usize>()
 }
 
+fn heap_bytes(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        len.div_ceil(16) * 16 + 16
+    }
+}
+
+fn value_heap_bytes(value: &MetadataValue) -> usize {
+    let extents = |list: &Vec<Extent>| heap_bytes(list.capacity() * size_of::<Extent>());
+    match value {
+        MetadataValue::PoolState { .. } | MetadataValue::Inode(_) => 0,
+        MetadataValue::DirEntries(entries) => {
+            heap_bytes(entries.capacity() * size_of::<DirEntry>())
+                + entries
+                    .iter()
+                    .map(|entry| heap_bytes(entry.name.capacity()))
+                    .sum::<usize>()
+        }
+        MetadataValue::FileRun(run) => {
+            extents(&run.copies) + heap_bytes(run.crcs.capacity() * size_of::<u32>())
+        }
+        MetadataValue::StripedRun(run) => {
+            extents(&run.pieces)
+                + extents(&run.parity)
+                + heap_bytes(run.crcs.capacity() * size_of::<u32>())
+                + heap_bytes(run.parity_crcs.capacity() * size_of::<u32>())
+        }
+        MetadataValue::RetainedRoot { root, name, .. } => {
+            extents(&root.copies) + heap_bytes(name.capacity())
+        }
+        MetadataValue::Special { data } | MetadataValue::Opaque { data, .. } => {
+            heap_bytes(data.capacity())
+        }
+        MetadataValue::XattrEntries(entries) => {
+            heap_bytes(entries.capacity() * size_of::<XattrEntry>())
+                + entries
+                    .iter()
+                    .map(|entry| {
+                        heap_bytes(entry.name.capacity()) + heap_bytes(entry.value.capacity())
+                    })
+                    .sum::<usize>()
+        }
+    }
+}
+
+fn node_cost(node: &Node) -> usize {
+    let own = heap_bytes(size_of::<Node>());
+    match node {
+        Node::Leaf { items, .. } => {
+            own + heap_bytes(items.capacity() * size_of::<(MetadataKey, MetadataValue)>())
+                + items
+                    .iter()
+                    .map(|(_, value)| value_heap_bytes(value))
+                    .sum::<usize>()
+        }
+        Node::Internal { children, .. } => {
+            own + heap_bytes(children.capacity() * size_of::<(MetadataKey, Child)>())
+                + children.len() * heap_bytes(2 * size_of::<Extent>())
+        }
+    }
+}
+
+fn location(copies: &[Extent]) -> Option<(u16, u64)> {
+    copies
+        .first()
+        .map(|extent| (extent.device_index, extent.offset))
+}
+
+#[derive(Clone, Copy)]
+struct Above<'p> {
+    here: Option<&'p [Extent]>,
+    up: Option<&'p Above<'p>>,
+}
+
+impl Above<'_> {
+    const TOP: Above<'static> = Above {
+        here: None,
+        up: None,
+    };
+
+    fn contains(&self, at: (u16, u64)) -> bool {
+        let mut cursor = Some(self);
+        while let Some(above) = cursor {
+            if above.here.and_then(location) == Some(at) {
+                return true;
+            }
+            cursor = above.up;
+        }
+        false
+    }
+}
+
+fn decode_page(
+    bytes: &[u8],
+    page: &PageRef,
+    lo: Option<MetadataKey>,
+    hi: Option<MetadataKey>,
+    depth: u32,
+    is_above: &dyn Fn((u16, u64)) -> bool,
+    stamp: u64,
+) -> Result<Node> {
+    if depth > MAX_LOAD_DEPTH {
+        return Err(ScaleFsError::Corrupt("tree deeper than any writer builds"));
+    }
+    let record = decode_record(bytes)?;
+    let meta = PageMeta {
+        disk: Some(page.clone()),
+        used: stamp,
+        cost: 0,
+        planned: 0,
+    };
+    let mut node = match record.kind {
+        RecordKind::MetadataLeaf => {
+            let items = decode_leaf_record(bytes)?;
+            if items.is_empty() && depth > 0 {
+                return Err(ScaleFsError::Corrupt("empty leaf below the root"));
+            }
+            if let (Some(lo), Some((first, _))) = (lo, items.first())
+                && *first != lo
+            {
+                return Err(ScaleFsError::Corrupt(
+                    "child page does not start at its separator",
+                ));
+            }
+            if let (Some(hi), Some((last, _))) = (hi, items.last())
+                && *last >= hi
+            {
+                return Err(ScaleFsError::Corrupt(
+                    "child page overlaps the next separator",
+                ));
+            }
+            Node::Leaf { items, meta }
+        }
+        RecordKind::MetadataInternal => {
+            let entries = decode_internal_record(bytes)?;
+            if let Some(lo) = lo
+                && entries[0].0 != lo
+            {
+                return Err(ScaleFsError::Corrupt(
+                    "child page does not start at its separator",
+                ));
+            }
+            if let Some(hi) = hi
+                && entries[entries.len() - 1].0 >= hi
+            {
+                return Err(ScaleFsError::Corrupt(
+                    "child page overlaps the next separator",
+                ));
+            }
+            let own = page.location();
+            let mut named = std::collections::HashSet::with_capacity(entries.len());
+            for (_, child) in &entries {
+                let at = child
+                    .location()
+                    .ok_or(ScaleFsError::Corrupt("tree page has no copies"))?;
+                if Some(at) == own || is_above(at) || !named.insert(at) {
+                    return Err(ScaleFsError::Corrupt("tree page reachable twice"));
+                }
+            }
+            Node::Internal {
+                children: entries
+                    .into_iter()
+                    .map(|(separator, child)| (separator, Child::OnDisk(child)))
+                    .collect(),
+                meta,
+            }
+        }
+        _ => return Err(ScaleFsError::Corrupt("expected a metadata page record")),
+    };
+    let cost = node_cost(&node);
+    node.meta_mut().cost = cost;
+    Ok(node)
+}
+
 #[derive(Debug)]
-pub struct MetadataTree {
+struct Cache {
+    budget: usize,
+    clean_bytes: usize,
+    clock: u64,
+    plan_epoch: u64,
+    in_flight: Option<u64>,
+    page_reads: u64,
+    pages_evicted: u64,
+}
+
+impl Cache {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn pending(&self, meta: &PageMeta) -> bool {
+        self.in_flight.is_some_and(|epoch| meta.planned == epoch)
+    }
+
+    fn pinned(&self, meta: &PageMeta) -> bool {
+        meta.disk.is_none() || self.pending(meta)
+    }
+
+    fn dirty(&mut self, meta: &mut PageMeta) {
+        let pending = self.pending(meta);
+        if meta.disk.take().is_some() && !pending {
+            self.clean_bytes -= meta.cost;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TreeState {
     root: Node,
+    cache: Cache,
+}
+
+struct PageRequest {
+    key: MetadataKey,
+    page: PageRef,
+    lo: MetadataKey,
+    hi: Option<MetadataKey>,
+    depth: u32,
+    above: Vec<(u16, u64)>,
+}
+
+impl TreeState {
+    fn visit_leaf<R>(
+        &mut self,
+        key: MetadataKey,
+        stamp: u64,
+        visit: &mut impl FnMut(&[(MetadataKey, MetadataValue)], Option<MetadataKey>) -> R,
+    ) -> std::result::Result<R, Box<PageRequest>> {
+        let mut node = &mut self.root;
+        let mut hi = None;
+        let mut depth = 0;
+        loop {
+            match node {
+                Node::Leaf { items, meta } => {
+                    meta.used = stamp;
+                    return Ok(visit(items, hi));
+                }
+                Node::Internal { children, meta } => {
+                    meta.used = stamp;
+                    let idx = child_index(children, key);
+                    let lo = children[idx].0;
+                    let below = child_hi(children, idx, hi);
+                    depth += 1;
+                    if let Child::OnDisk(page) = &children[idx].1 {
+                        return Err(Box::new(PageRequest {
+                            key,
+                            page: page.clone(),
+                            lo,
+                            hi: below,
+                            depth,
+                            above: Vec::new(),
+                        }));
+                    }
+                    let Child::Loaded(child) = &mut children[idx].1 else {
+                        unreachable!("checked above");
+                    };
+                    node = &mut **child;
+                    hi = below;
+                }
+            }
+        }
+    }
+
+    fn above_of(&self, key: MetadataKey, depth: u32) -> Vec<(u16, u64)> {
+        let mut out = Vec::new();
+        let mut node = &self.root;
+        for _ in 0..depth {
+            let Node::Internal { children, meta } = node else {
+                break;
+            };
+            if let Some(at) = meta.disk.as_ref().and_then(PageRef::location) {
+                out.push(at);
+            }
+            match &children[child_index(children, key)].1 {
+                Child::Loaded(child) => node = child,
+                Child::OnDisk(_) => break,
+            }
+        }
+        out
+    }
+
+    fn install(&mut self, request: &PageRequest, node: Node) -> bool {
+        let TreeState { root, cache } = self;
+        let mut slot = root;
+        loop {
+            let Node::Internal { children, .. } = slot else {
+                return false;
+            };
+            let idx = child_index(children, request.key);
+            if let Child::OnDisk(page) = &children[idx].1 {
+                let waiting = *page == request.page;
+                if waiting {
+                    cache.clean_bytes += node.meta().cost;
+                    children[idx].1 = Child::Loaded(Box::new(node));
+                }
+                return waiting;
+            }
+            let Child::Loaded(child) = &mut children[idx].1 else {
+                unreachable!("checked above");
+            };
+            slot = &mut **child;
+        }
+    }
+
+    fn evict_over_budget(&mut self) {
+        let cache = &mut self.cache;
+        if cache.clean_bytes <= cache.budget {
+            return;
+        }
+        let low = cache.budget - cache.budget / 8;
+        let need = cache.clean_bytes - low;
+        let mut candidates: Vec<(u64, usize)> = Vec::new();
+        collect_evictable(&self.root, cache, &mut candidates);
+        if candidates.is_empty() {
+            return;
+        }
+        candidates.sort_unstable_by_key(|&(used, _)| used);
+        let mut freed = 0usize;
+        let mut threshold = 0u64;
+        for (used, cost) in candidates {
+            threshold = used;
+            freed += cost;
+            if freed >= need {
+                break;
+            }
+        }
+        evict_up_to(&mut self.root, threshold, cache);
+    }
+}
+
+fn collect_evictable(node: &Node, cache: &Cache, out: &mut Vec<(u64, usize)>) {
+    if let Node::Internal { children, .. } = node {
+        for (_, child) in children {
+            if let Child::Loaded(child) = child {
+                if !cache.pinned(child.meta()) {
+                    out.push((child.meta().used, child.meta().cost));
+                }
+                collect_evictable(child, cache, out);
+            }
+        }
+    }
+}
+
+fn evict_up_to(node: &mut Node, threshold: u64, cache: &mut Cache) {
+    let Node::Internal { children, .. } = node else {
+        return;
+    };
+    for (_, child) in children.iter_mut() {
+        let Child::Loaded(loaded) = child else {
+            continue;
+        };
+        if !cache.pinned(loaded.meta()) && loaded.meta().used <= threshold {
+            let (bytes, pages) = clean_subtree(loaded, cache);
+            cache.clean_bytes -= bytes;
+            cache.pages_evicted += pages;
+            let page = loaded
+                .meta_mut()
+                .disk
+                .take()
+                .expect("a clean page has a location");
+            *child = Child::OnDisk(page);
+        } else {
+            evict_up_to(loaded, threshold, cache);
+        }
+    }
+}
+
+fn clean_subtree(node: &Node, cache: &Cache) -> (usize, u64) {
+    debug_assert!(!cache.pinned(node.meta()), "only clean pages are evicted");
+    let mut bytes = node.meta().cost;
+    let mut pages = 1;
+    if let Node::Internal { children, .. } = node {
+        for (_, child) in children {
+            if let Child::Loaded(child) = child {
+                let (b, p) = clean_subtree(child, cache);
+                bytes += b;
+                pages += p;
+            }
+        }
+    }
+    (bytes, pages)
+}
+
+struct Descent<'a> {
+    cache: &'a mut Cache,
+    pages: &'a dyn PageSource,
+    stamp: u64,
+}
+
+fn load_child<'n>(
+    children: &'n mut [(MetadataKey, Child)],
+    idx: usize,
+    hi: Option<MetadataKey>,
+    depth: u32,
+    descent: &mut Descent<'_>,
+    above: &Above<'_>,
+) -> Result<&'n mut Node> {
+    if let Child::OnDisk(page) = &children[idx].1 {
+        let bytes = descent.pages.read_page(page)?;
+        let node = decode_page(
+            &bytes,
+            page,
+            Some(children[idx].0),
+            child_hi(children, idx, hi),
+            depth,
+            &|at| above.contains(at),
+            descent.stamp,
+        )?;
+        descent.cache.page_reads += 1;
+        descent.cache.clean_bytes += node.meta().cost;
+        children[idx].1 = Child::Loaded(Box::new(node));
+    }
+    let Child::Loaded(node) = &mut children[idx].1 else {
+        unreachable!("the child was loaded above");
+    };
+    node.meta_mut().used = descent.stamp;
+    Ok(node)
+}
+
+fn insert_into(
+    node: &mut Node,
+    key: MetadataKey,
+    value: MetadataValue,
+    descent: &mut Descent<'_>,
+    above: &Above<'_>,
+    hi: Option<MetadataKey>,
+    depth: u32,
+) -> Result<Option<(MetadataKey, Node)>> {
+    match node {
+        Node::Leaf { items, meta } => {
+            meta.used = descent.stamp;
+            descent.cache.dirty(meta);
+            match items.binary_search_by(|(k, _)| k.cmp(&key)) {
+                Ok(i) => items[i].1 = value,
+                Err(i) => items.insert(i, (key, value)),
+            }
+            if leaf_encoded_payload_len(items) <= LEAF_SPLIT_BYTES || items.len() < 2 {
+                return Ok(None);
+            }
+            let total: usize = leaf_encoded_payload_len(items);
+            let mut running = 2;
+            let mut split_at = 1;
+            for (i, (_, v)) in items.iter().enumerate() {
+                running += 17 + 2 + value_encoded_len(v);
+                if running >= total / 2 {
+                    split_at = (i + 1).clamp(1, items.len() - 1);
+                    break;
+                }
+            }
+            let right_items = items.split_off(split_at);
+            let split_key = right_items[0].0;
+            Ok(Some((
+                split_key,
+                Node::Leaf {
+                    items: right_items,
+                    meta: PageMeta::dirty(descent.stamp),
+                },
+            )))
+        }
+        Node::Internal { children, meta } => {
+            meta.used = descent.stamp;
+            let idx = child_index(children, key);
+            let below = child_hi(children, idx, hi);
+            let here = Above {
+                here: meta.disk.as_ref().map(|page| page.copies.as_slice()),
+                up: Some(above),
+            };
+            let child = load_child(children, idx, hi, depth + 1, descent, &here)?;
+            let spawned = insert_into(child, key, value, descent, &here, below, depth + 1)?;
+            descent.cache.dirty(meta);
+            if let Child::Loaded(child) = &children[idx].1 {
+                children[idx].0 = child.min_key().expect("child is nonempty");
+            }
+            if let Some((split_key, right)) = spawned {
+                children.insert(idx + 1, (split_key, Child::Loaded(Box::new(right))));
+            }
+            if children.len() <= INTERNAL_MAX_CHILDREN {
+                return Ok(None);
+            }
+            let right_children = children.split_off(children.len() / 2);
+            let split_key = right_children[0].0;
+            Ok(Some((
+                split_key,
+                Node::Internal {
+                    children: right_children,
+                    meta: PageMeta::dirty(descent.stamp),
+                },
+            )))
+        }
+    }
+}
+
+fn remove_from(
+    node: &mut Node,
+    key: MetadataKey,
+    descent: &mut Descent<'_>,
+    above: &Above<'_>,
+    hi: Option<MetadataKey>,
+    depth: u32,
+) -> Result<Option<MetadataValue>> {
+    match node {
+        Node::Leaf { items, meta } => {
+            meta.used = descent.stamp;
+            match items.binary_search_by(|(k, _)| k.cmp(&key)) {
+                Ok(i) => {
+                    descent.cache.dirty(meta);
+                    Ok(Some(items.remove(i).1))
+                }
+                Err(_) => Ok(None),
+            }
+        }
+        Node::Internal { children, meta } => {
+            meta.used = descent.stamp;
+            let idx = child_index(children, key);
+            let below = child_hi(children, idx, hi);
+            let here = Above {
+                here: meta.disk.as_ref().map(|page| page.copies.as_slice()),
+                up: Some(above),
+            };
+            let child = load_child(children, idx, hi, depth + 1, descent, &here)?;
+            let Some(removed) = remove_from(child, key, descent, &here, below, depth + 1)? else {
+                return Ok(None);
+            };
+            descent.cache.dirty(meta);
+            let emptied = matches!(&children[idx].1, Child::Loaded(child) if child.is_empty());
+            if emptied {
+                children.remove(idx);
+            } else {
+                let lifted = match &mut children[idx].1 {
+                    Child::Loaded(child) => match &mut **child {
+                        Node::Internal {
+                            children: grand, ..
+                        } if grand.len() == 1 => grand.pop(),
+                        _ => None,
+                    },
+                    Child::OnDisk(_) => None,
+                };
+                if let Some(entry) = lifted {
+                    children[idx] = entry;
+                }
+                if let Child::Loaded(child) = &children[idx].1 {
+                    children[idx].0 = child.min_key().expect("child is nonempty");
+                }
+            }
+            Ok(Some(removed))
+        }
+    }
+}
+
+fn dirty_leaf(
+    node: &mut Node,
+    key: MetadataKey,
+    descent: &mut Descent<'_>,
+    above: &Above<'_>,
+    hi: Option<MetadataKey>,
+    depth: u32,
+) -> Result<(Option<MetadataKey>, usize)> {
+    match node {
+        Node::Leaf { meta, .. } => {
+            meta.used = descent.stamp;
+            descent.cache.dirty(meta);
+            let cost = node_cost(node);
+            Ok((hi, cost))
+        }
+        Node::Internal { children, meta } => {
+            meta.used = descent.stamp;
+            let idx = child_index(children, key);
+            let below = child_hi(children, idx, hi);
+            let here = Above {
+                here: meta.disk.as_ref().map(|page| page.copies.as_slice()),
+                up: Some(above),
+            };
+            let child = load_child(children, idx, hi, depth + 1, descent, &here)?;
+            let found = dirty_leaf(child, key, descent, &here, below, depth + 1)?;
+            descent.cache.dirty(meta);
+            Ok(found)
+        }
+    }
+}
+
+fn plan_node(
+    node: &mut Node,
+    tx: u64,
+    place: &mut dyn FnMut(u64) -> Result<Vec<(u16, u64)>>,
+    pages: &mut Vec<PagePlan>,
+    epoch: u64,
+) -> Result<PageRef> {
+    if let Some(page) = &node.meta().disk {
+        return Ok(page.clone());
+    }
+    node.meta_mut().planned = epoch;
+    let bytes = match node {
+        Node::Leaf { items, .. } => encode_leaf_record(items, tx),
+        Node::Internal { children, .. } => {
+            let mut entries = Vec::with_capacity(children.len());
+            for (separator, child) in children.iter_mut() {
+                let page = match child {
+                    Child::OnDisk(page) => page.clone(),
+                    Child::Loaded(child) => {
+                        let page = plan_node(child, tx, place, pages, epoch)?;
+                        *separator = child.min_key().expect("child is nonempty");
+                        page
+                    }
+                };
+                entries.push((*separator, page));
+            }
+            encode_internal_record(&entries, tx)
+        }
+    };
+    let extents = place_copies(place, bytes.len() as u64)?;
+    let page = PageRef {
+        copies: extents.clone(),
+        expect: Expect::of(&bytes),
+    };
+    let cost = node_cost(node);
+    let meta = node.meta_mut();
+    meta.disk = Some(page.clone());
+    meta.cost = cost;
+    pages.push(PagePlan { extents, bytes });
+    Ok(page)
+}
+
+fn for_each_planned(node: &mut Node, epoch: u64, visit: &mut dyn FnMut(&mut PageMeta)) {
+    if node.meta().planned != epoch {
+        return;
+    }
+    visit(node.meta_mut());
+    if let Node::Internal { children, .. } = node {
+        for (_, child) in children {
+            if let Child::Loaded(child) = child {
+                for_each_planned(child, epoch, visit);
+            }
+        }
+    }
+}
+
+pub struct MetadataTree {
+    state: std::sync::Mutex<TreeState>,
+}
+
+impl std::fmt::Debug for MetadataTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.state.try_lock() {
+            Ok(state) => f
+                .debug_struct("MetadataTree")
+                .field("cache", &stats_of(&state))
+                .finish(),
+            Err(_) => f.write_str("MetadataTree { .. }"),
+        }
+    }
 }
 
 impl Default for MetadataTree {
@@ -833,152 +1409,242 @@ impl Default for MetadataTree {
     }
 }
 
+fn stats_of(state: &TreeState) -> CacheStats {
+    fn walk(node: &Node, cache: &Cache, loaded: &mut u64, pinned: &mut u64) {
+        *loaded += 1;
+        if cache.pinned(node.meta()) {
+            *pinned += 1;
+        }
+        if let Node::Internal { children, .. } = node {
+            for (_, child) in children {
+                if let Child::Loaded(child) = child {
+                    walk(child, cache, loaded, pinned);
+                }
+            }
+        }
+    }
+    let (mut loaded, mut pinned) = (0, 0);
+    walk(&state.root, &state.cache, &mut loaded, &mut pinned);
+    CacheStats {
+        budget_bytes: state.cache.budget as u64,
+        clean_bytes: state.cache.clean_bytes as u64,
+        loaded_pages: loaded,
+        pinned_pages: pinned,
+        page_reads: state.cache.page_reads,
+        pages_evicted: state.cache.pages_evicted,
+    }
+}
+
 impl MetadataTree {
-    pub fn new() -> Self {
+    fn with_root(root: Node, clean_bytes: usize, page_reads: u64) -> Self {
         Self {
-            root: Node::empty_leaf(),
+            state: std::sync::Mutex::new(TreeState {
+                root,
+                cache: Cache {
+                    budget: default_metadata_cache(),
+                    clean_bytes,
+                    clock: 1,
+                    plan_epoch: 0,
+                    in_flight: None,
+                    page_reads,
+                    pages_evicted: 0,
+                },
+            }),
         }
     }
 
-    pub fn get(&self, key: MetadataKey) -> Option<&MetadataValue> {
-        let mut node = &self.root;
-        loop {
-            match node {
-                Node::Leaf { items, .. } => {
-                    return items
-                        .binary_search_by(|(k, _)| k.cmp(&key))
-                        .ok()
-                        .map(|i| &items[i].1);
-                }
-                Node::Internal { children, .. } => {
-                    node = &children[child_index(children, key)].1;
-                }
-            }
-        }
+    pub fn new() -> Self {
+        Self::with_root(Node::empty_leaf(1), 0, 0)
     }
 
-    pub fn insert(&mut self, key: MetadataKey, value: MetadataValue) -> Result<()> {
-        value.validate()?;
-        if value_encoded_len(&value) > MAX_VALUE_LEN {
-            return Err(ScaleFsError::InvalidArgument(
-                "metadata value exceeds the size limit",
-            ));
-        }
-        if let Some((split_key, right)) = Self::insert_into(&mut self.root, key, value) {
-            let old_root = std::mem::replace(&mut self.root, Node::empty_leaf());
-            let left_key = old_root.min_key().expect("split left half is nonempty");
-            self.root = Node::Internal {
-                children: vec![(left_key, old_root), (split_key, right)],
-                disk: None,
-            };
-        }
-        Ok(())
+    pub fn load(root: &PageRef, pages: &dyn PageSource) -> Result<MetadataTree> {
+        let bytes = pages.read_page(root)?;
+        let node = decode_page(&bytes, root, None, None, 0, &|_| false, 1)?;
+        let cost = node.meta().cost;
+        Ok(Self::with_root(node, cost, 1))
     }
 
-    fn insert_into(
-        node: &mut Node,
+    fn lock(&self) -> std::sync::MutexGuard<'_, TreeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn state_mut(&mut self) -> &mut TreeState {
+        self.state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn view<'a>(&'a self, pages: &'a dyn PageSource) -> TreeRef<'a> {
+        TreeRef { tree: self, pages }
+    }
+
+    pub fn edit<'a>(&'a mut self, pages: &'a dyn PageSource) -> TreeMut<'a> {
+        TreeMut(TreeRef { tree: self, pages })
+    }
+
+    pub fn in_memory(&mut self) -> TreeMut<'_> {
+        self.edit(&NO_PAGES)
+    }
+
+    pub(crate) fn edit_shared<'a>(&'a self, pages: &'a dyn PageSource) -> TreeMut<'a> {
+        TreeMut(TreeRef { tree: self, pages })
+    }
+
+    fn with_leaf<R>(
+        &self,
+        pages: &dyn PageSource,
         key: MetadataKey,
-        value: MetadataValue,
-    ) -> Option<(MetadataKey, Node)> {
-        node.mark_dirty();
-        match node {
-            Node::Leaf { items, .. } => {
-                match items.binary_search_by(|(k, _)| k.cmp(&key)) {
-                    Ok(i) => items[i].1 = value,
-                    Err(i) => items.insert(i, (key, value)),
-                }
-                if leaf_encoded_payload_len(items) <= LEAF_SPLIT_BYTES || items.len() < 2 {
-                    return None;
-                }
-                let total: usize = leaf_encoded_payload_len(items);
-                let mut running = 2;
-                let mut split_at = 1;
-                for (i, (_, v)) in items.iter().enumerate() {
-                    running += 17 + 2 + value_encoded_len(v);
-                    if running >= total / 2 {
-                        split_at = (i + 1).clamp(1, items.len() - 1);
-                        break;
-                    }
-                }
-                let right_items = items.split_off(split_at);
-                let split_key = right_items[0].0;
-                Some((
-                    split_key,
-                    Node::Leaf {
-                        items: right_items,
-                        disk: None,
-                    },
-                ))
-            }
-            Node::Internal { children, .. } => {
-                let idx = child_index(children, key);
-                let spawned = Self::insert_into(&mut children[idx].1, key, value);
-                children[idx].0 = children[idx].1.min_key().expect("child is nonempty");
-                if let Some((split_key, right)) = spawned {
-                    children.insert(idx + 1, (split_key, right));
-                }
-                if children.len() <= INTERNAL_MAX_CHILDREN {
-                    return None;
-                }
-                let right_children = children.split_off(children.len() / 2);
-                let split_key = right_children[0].0;
-                Some((
-                    split_key,
-                    Node::Internal {
-                        children: right_children,
-                        disk: None,
-                    },
-                ))
-            }
-        }
-    }
-
-    pub fn remove(&mut self, key: MetadataKey) -> Option<MetadataValue> {
-        let removed = Self::remove_from(&mut self.root, key);
+        visit: &mut impl FnMut(&[(MetadataKey, MetadataValue)], Option<MetadataKey>) -> R,
+    ) -> Result<R> {
+        let read = |request: &PageRequest| -> Result<Node> {
+            let bytes = pages.read_page(&request.page)?;
+            decode_page(
+                &bytes,
+                &request.page,
+                Some(request.lo),
+                request.hi,
+                request.depth,
+                &|at| request.above.contains(&at),
+                0,
+            )
+        };
+        let mut state = self.lock();
+        let mut lost = 0u32;
         loop {
-            match &mut self.root {
-                Node::Internal { children, .. } if children.len() == 1 => {
-                    let (_, child) = children.pop().expect("length checked");
-                    self.root = child;
+            let stamp = state.cache.tick();
+            let mut request = match state.visit_leaf(key, stamp, visit) {
+                Ok(out) => {
+                    state.evict_over_budget();
+                    return Ok(out);
                 }
-                Node::Internal { children, .. } if children.is_empty() => {
-                    self.root = Node::empty_leaf();
-                }
-                _ => break,
+                Err(request) => request,
+            };
+            request.above = state.above_of(request.key, request.depth);
+            let node = if lost < 4 {
+                drop(state);
+                let node = read(&request);
+                state = self.lock();
+                node?
+            } else {
+                read(&request)?
+            };
+            state.cache.page_reads += 1;
+            if !state.install(&request, node) {
+                lost += 1;
             }
         }
-        removed
     }
 
-    fn remove_from(node: &mut Node, key: MetadataKey) -> Option<MetadataValue> {
-        match node {
-            Node::Leaf { items, disk } => match items.binary_search_by(|(k, _)| k.cmp(&key)) {
-                Ok(i) => {
-                    *disk = None;
-                    Some(items.remove(i).1)
-                }
-                Err(_) => None,
-            },
-            Node::Internal { children, disk } => {
-                let idx = child_index(children, key);
-                let removed = Self::remove_from(&mut children[idx].1, key)?;
-                *disk = None;
-                if children[idx].1.is_empty() {
-                    children.remove(idx);
-                } else {
-                    let lifted = match &mut children[idx].1 {
-                        Node::Internal {
-                            children: grand, ..
-                        } if grand.len() == 1 => Some(grand.pop().expect("length checked")),
-                        _ => None,
-                    };
-                    if let Some((k, n)) = lifted {
-                        children[idx] = (k, n);
-                    }
-                    children[idx].0 = children[idx].1.min_key().expect("child is nonempty");
-                }
-                Some(removed)
+    pub fn plan_commit(
+        &mut self,
+        tx: u64,
+        place: &mut dyn FnMut(u64) -> Result<Vec<(u16, u64)>>,
+    ) -> Result<(PageRef, Vec<PagePlan>)> {
+        let state = self.state_mut();
+        debug_assert!(
+            state.cache.in_flight.is_none(),
+            "a plan is concluded before the next is made"
+        );
+        state.cache.plan_epoch += 1;
+        let epoch = state.cache.plan_epoch;
+        state.cache.in_flight = Some(epoch);
+        let mut pages = Vec::new();
+        let root = plan_node(&mut state.root, tx, place, &mut pages, epoch)?;
+        Ok((root, pages))
+    }
+
+    pub fn plan_published(&mut self) {
+        let state = self.state_mut();
+        let Some(epoch) = state.cache.in_flight else {
+            return;
+        };
+        let mut joined = 0usize;
+        for_each_planned(&mut state.root, epoch, &mut |meta| {
+            if meta.disk.is_some() {
+                joined += meta.cost;
             }
+        });
+        state.cache.in_flight = None;
+        state.cache.clean_bytes += joined;
+        state.evict_over_budget();
+    }
+
+    pub fn plan_abandoned(&mut self) {
+        let state = self.state_mut();
+        let Some(epoch) = state.cache.in_flight else {
+            return;
+        };
+        for_each_planned(&mut state.root, epoch, &mut |meta| {
+            meta.disk = None;
+        });
+        state.cache.in_flight = None;
+    }
+
+    pub fn cache_budget(&self) -> usize {
+        self.lock().cache.budget
+    }
+
+    pub fn set_cache_budget(&self, bytes: usize) {
+        let mut state = self.lock();
+        state.cache.budget = bytes;
+        state.evict_over_budget();
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        stats_of(&self.lock())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TreeRef<'a> {
+    tree: &'a MetadataTree,
+    pages: &'a dyn PageSource,
+}
+
+impl std::fmt::Debug for TreeRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TreeRef").field(self.tree).finish()
+    }
+}
+
+impl<'a> TreeRef<'a> {
+    pub fn new(tree: &'a MetadataTree, pages: &'a dyn PageSource) -> Self {
+        Self { tree, pages }
+    }
+
+    pub fn get(&self, key: MetadataKey) -> Result<Option<MetadataValue>> {
+        self.get_with(key, |value| value.cloned())
+    }
+
+    pub(crate) fn get_with<R>(
+        &self,
+        key: MetadataKey,
+        mut read: impl FnMut(Option<&MetadataValue>) -> R,
+    ) -> Result<R> {
+        self.tree.with_leaf(self.pages, key, &mut |items, _| {
+            read(
+                items
+                    .binary_search_by(|(k, _)| k.cmp(&key))
+                    .ok()
+                    .map(|i| &items[i].1),
+            )
+        })
+    }
+
+    pub fn last_in(&self, lo: MetadataKey, hi: MetadataKey) -> Result<Option<TreeItem>> {
+        let found = self.tree.with_leaf(self.pages, hi, &mut |items, _| {
+            let upto = items.partition_point(|(key, _)| *key <= hi);
+            match upto.checked_sub(1).map(|index| &items[index]) {
+                Some((key, value)) if *key >= lo => Some(Some((*key, value.clone()))),
+                Some(_) => Some(None),
+                None => None,
+            }
+        })?;
+        match found {
+            Some(answer) => Ok(answer),
+            None => Ok(self.range(lo, hi)?.pop()),
         }
     }
 
@@ -986,164 +1652,220 @@ impl MetadataTree {
         &self,
         start: MetadataKey,
         end: MetadataKey,
-    ) -> Vec<(MetadataKey, &MetadataValue)> {
+    ) -> Result<Vec<(MetadataKey, MetadataValue)>> {
         let mut out = Vec::new();
-        Self::collect_range(&self.root, start, end, &mut out);
-        out
+        self.scan(start, end, &mut |items| {
+            out.extend(items.iter().map(|(key, value)| (*key, value.clone())));
+        })?;
+        Ok(out)
     }
 
-    fn collect_range<'a>(
-        node: &'a Node,
+    pub fn keys(&self, start: MetadataKey, end: MetadataKey) -> Result<Vec<MetadataKey>> {
+        let mut out = Vec::new();
+        self.scan(start, end, &mut |items| {
+            out.extend(items.iter().map(|(key, _)| *key));
+        })?;
+        Ok(out)
+    }
+
+    pub(crate) fn scan(
+        &self,
         start: MetadataKey,
         end: MetadataKey,
-        out: &mut Vec<(MetadataKey, &'a MetadataValue)>,
-    ) {
-        match node {
-            Node::Leaf { items, .. } => {
-                let from = items.partition_point(|(k, _)| *k < start);
-                for (key, value) in &items[from..] {
-                    if *key > end {
-                        break;
-                    }
-                    out.push((*key, value));
+        visit: &mut dyn FnMut(&[TreeItem]),
+    ) -> Result<()> {
+        let mut from = start;
+        loop {
+            let next = self.tree.with_leaf(self.pages, from, &mut |items, hi| {
+                let first = items.partition_point(|(key, _)| *key < from);
+                let last = items.partition_point(|(key, _)| *key <= end);
+                if first < last {
+                    visit(&items[first..last]);
                 }
-            }
-            Node::Internal { children, .. } => {
-                let from = child_index(children, start);
-                for (separator, child) in &children[from..] {
-                    if *separator > end {
-                        break;
-                    }
-                    Self::collect_range(child, start, end, out);
-                }
+                hi
+            })?;
+            match next {
+                Some(next) if next <= end => from = next,
+                _ => return Ok(()),
             }
         }
     }
 
-    pub(crate) fn mark_all_dirty(&mut self) {
-        fn walk(node: &mut Node) {
-            node.mark_dirty();
-            if let Node::Internal { children, .. } = node {
-                for (_, child) in children {
-                    walk(child);
-                }
-            }
-        }
-        walk(&mut self.root);
+    pub fn leaf_from(&self, from: MetadataKey) -> Result<(Vec<TreeItem>, Option<MetadataKey>)> {
+        self.tree.with_leaf(self.pages, from, &mut |items, hi| {
+            let first = items.partition_point(|(key, _)| *key < from);
+            (items[first..].to_vec(), hi)
+        })
     }
 
-    pub fn item_count(&self) -> usize {
-        fn count(node: &Node) -> usize {
-            match node {
-                Node::Leaf { items, .. } => items.len(),
-                Node::Internal { children, .. } => children.iter().map(|(_, c)| count(c)).sum(),
-            }
-        }
-        count(&self.root)
-    }
-
-    pub fn plan_commit(
-        &mut self,
-        place: &mut dyn FnMut(u64) -> Result<Vec<(u16, u64)>>,
-    ) -> Result<(Vec<Extent>, Vec<PagePlan>)> {
-        let mut pages = Vec::new();
-        let root = Self::plan_node(&mut self.root, place, &mut pages)?;
-        Ok((root, pages))
-    }
-
-    fn plan_node(
-        node: &mut Node,
-        place: &mut dyn FnMut(u64) -> Result<Vec<(u16, u64)>>,
-        pages: &mut Vec<PagePlan>,
-    ) -> Result<Vec<Extent>> {
-        match node {
-            Node::Leaf { items, disk } => {
-                if let Some(extents) = disk {
-                    return Ok(extents.clone());
-                }
-                let bytes = encode_leaf_record(items);
-                let extents = place_copies(place, bytes.len() as u64)?;
-                *disk = Some(extents.clone());
-                pages.push(PagePlan {
-                    extents: extents.clone(),
-                    bytes,
-                });
-                Ok(extents)
-            }
-            Node::Internal { children, disk } => {
-                if let Some(extents) = disk {
-                    return Ok(extents.clone());
-                }
-                let mut entries = Vec::with_capacity(children.len());
-                for (separator, child) in children.iter_mut() {
-                    let child_extents = Self::plan_node(child, place, pages)?;
-                    *separator = child.min_key().expect("child is nonempty");
-                    entries.push((*separator, child_extents));
-                }
-                let bytes = encode_internal_record(&entries);
-                let extents = place_copies(place, bytes.len() as u64)?;
-                *disk = Some(extents.clone());
-                pages.push(PagePlan {
-                    extents: extents.clone(),
-                    bytes,
-                });
-                Ok(extents)
-            }
+    pub fn leaves(&self) -> Leaves<'a> {
+        Leaves {
+            tree: *self,
+            cursor: Some(MetadataKey::MIN),
         }
     }
 
-    pub fn load(
-        root: &[Extent],
-        read: &mut dyn FnMut(&[Extent]) -> Result<Vec<u8>>,
-    ) -> Result<MetadataTree> {
-        let root = Self::load_node(root, read, true)?;
-        Ok(MetadataTree { root })
+    pub fn for_each(&self, visit: &mut dyn FnMut(&MetadataKey, &MetadataValue)) -> Result<()> {
+        for leaf in self.leaves() {
+            for (key, value) in &leaf? {
+                visit(key, value);
+            }
+        }
+        Ok(())
     }
 
-    fn load_node(
-        extents: &[Extent],
-        read: &mut dyn FnMut(&[Extent]) -> Result<Vec<u8>>,
-        is_root: bool,
-    ) -> Result<Node> {
-        let bytes = read(extents)?;
-        let record = decode_record(&bytes)?;
-        match record.kind {
-            RecordKind::MetadataLeaf => {
-                let items = decode_leaf_record(&bytes)?;
-                if items.is_empty() && !is_root {
-                    return Err(ScaleFsError::Corrupt("empty leaf below the root"));
-                }
-                Ok(Node::Leaf {
-                    items,
-                    disk: Some(extents.to_vec()),
-                })
+    pub fn item_count(&self) -> Result<usize> {
+        let mut count = 0usize;
+        self.scan(MetadataKey::MIN, MetadataKey::MAX, &mut |items| {
+            count += items.len();
+        })?;
+        Ok(count)
+    }
+}
+
+#[derive(Debug)]
+pub struct Leaves<'a> {
+    tree: TreeRef<'a>,
+    cursor: Option<MetadataKey>,
+}
+
+impl Iterator for Leaves<'_> {
+    type Item = Result<Vec<(MetadataKey, MetadataValue)>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let from = self.cursor?;
+        match self.tree.leaf_from(from) {
+            Ok((items, next)) => {
+                self.cursor = next;
+                Some(Ok(items))
             }
-            RecordKind::MetadataInternal | RecordKind::MetadataInternalMirrored => {
-                let entries = decode_internal_record(&bytes)?;
-                let mut children = Vec::with_capacity(entries.len());
-                for (i, (separator, child_extents)) in entries.iter().enumerate() {
-                    let child = Self::load_node(child_extents, read, false)?;
-                    if child.min_key() != Some(*separator) {
-                        return Err(ScaleFsError::Corrupt(
-                            "child page does not start at its separator",
-                        ));
-                    }
-                    if let Some(next) = entries.get(i + 1)
-                        && child.max_key() >= Some(next.0)
-                    {
-                        return Err(ScaleFsError::Corrupt(
-                            "child page overlaps the next separator",
-                        ));
-                    }
-                    children.push((*separator, child));
-                }
-                Ok(Node::Internal {
-                    children,
-                    disk: Some(extents.to_vec()),
-                })
+            Err(error) => {
+                self.cursor = None;
+                Some(Err(error))
             }
-            _ => Err(ScaleFsError::Corrupt("expected a metadata page record")),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TreeMut<'a>(TreeRef<'a>);
+
+impl<'a> std::ops::Deref for TreeMut<'a> {
+    type Target = TreeRef<'a>;
+
+    fn deref(&self) -> &TreeRef<'a> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for TreeMut<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TreeMut").field(self.0.tree).finish()
+    }
+}
+
+impl TreeMut<'_> {
+    pub fn insert(&self, key: MetadataKey, value: MetadataValue) -> Result<()> {
+        value.validate()?;
+        if value_encoded_len(&value) > MAX_VALUE_LEN {
+            return Err(ScaleFsError::InvalidArgument(
+                "metadata value exceeds the size limit",
+            ));
+        }
+        let mut state = self.0.tree.lock();
+        let TreeState { root, cache } = &mut *state;
+        let stamp = cache.tick();
+        let mut descent = Descent {
+            cache,
+            pages: self.0.pages,
+            stamp,
+        };
+        let spawned = insert_into(root, key, value, &mut descent, &Above::TOP, None, 0);
+        if let Some((split_key, right)) = spawned? {
+            let old_root = std::mem::replace(root, Node::empty_leaf(stamp));
+            let left_key = old_root.min_key().expect("split left half is nonempty");
+            *root = Node::Internal {
+                children: vec![
+                    (left_key, Child::Loaded(Box::new(old_root))),
+                    (split_key, Child::Loaded(Box::new(right))),
+                ],
+                meta: PageMeta::dirty(stamp),
+            };
+        }
+        state.evict_over_budget();
+        Ok(())
+    }
+
+    pub fn remove(&self, key: MetadataKey) -> Result<Option<MetadataValue>> {
+        let mut state = self.0.tree.lock();
+        let TreeState { root, cache } = &mut *state;
+        let stamp = cache.tick();
+        let mut descent = Descent {
+            cache,
+            pages: self.0.pages,
+            stamp,
+        };
+        if let Node::Internal { children, meta } = root
+            && children.len() == 2
+        {
+            let here = Above {
+                here: meta.disk.as_ref().map(|page| page.copies.as_slice()),
+                up: None,
+            };
+            for idx in 0..2 {
+                load_child(children, idx, None, 1, &mut descent, &here)?;
+            }
+        }
+        let removed = remove_from(root, key, &mut descent, &Above::TOP, None, 0)?;
+        loop {
+            match root {
+                Node::Internal { children, .. } if children.len() == 1 => {
+                    let (_, child) = children.pop().expect("length checked");
+                    let Child::Loaded(child) = child else {
+                        unreachable!("a two-child root reads both children before a removal");
+                    };
+                    *root = *child;
+                }
+                Node::Internal { children, .. } if children.is_empty() => {
+                    *root = Node::empty_leaf(stamp);
+                }
+                _ => break,
+            }
+        }
+        state.evict_over_budget();
+        Ok(removed)
+    }
+
+    pub fn mark_dirty_from(
+        &self,
+        from: MetadataKey,
+        budget: usize,
+    ) -> Result<(Option<MetadataKey>, usize)> {
+        let mut state = self.0.tree.lock();
+        let TreeState { root, cache } = &mut *state;
+        let stamp = cache.tick();
+        let mut descent = Descent {
+            cache,
+            pages: self.0.pages,
+            stamp,
+        };
+        let mut cursor = from;
+        let mut marked = 0usize;
+        let next = loop {
+            let (next, cost) = dirty_leaf(root, cursor, &mut descent, &Above::TOP, None, 0)?;
+            marked += cost;
+            match next {
+                Some(next) if marked < budget => cursor = next,
+                other => break other,
+            }
+        };
+        state.evict_over_budget();
+        Ok((next, marked))
+    }
+
+    pub fn mark_all_dirty(&self) -> Result<()> {
+        self.mark_dirty_from(MetadataKey::MIN, usize::MAX)?;
+        Ok(())
     }
 }
 
@@ -1164,10 +1886,81 @@ fn place_copies(
 }
 
 #[cfg(test)]
+impl MetadataTree {
+    pub(crate) fn check_invariants(&self) {
+        fn walk(node: &Node, cache: &Cache, parent: Option<&PageMeta>, clean: &mut usize) {
+            let meta = node.meta();
+            if !cache.pinned(meta) {
+                *clean += meta.cost;
+            }
+            if let Some(parent) = parent {
+                assert!(
+                    !cache.pinned(meta) || cache.pinned(parent),
+                    "a pinned page's parent is pinned"
+                );
+                assert!(
+                    meta.used <= parent.used,
+                    "a page is never newer than its parent"
+                );
+            }
+            if let Node::Internal { children, .. } = node {
+                assert!(!children.is_empty(), "an internal page has children");
+                for (separator, child) in children {
+                    if let Child::Loaded(child) = child {
+                        assert_eq!(
+                            child.min_key(),
+                            Some(*separator),
+                            "a loaded child starts at its separator"
+                        );
+                        walk(child, cache, Some(meta), clean);
+                    }
+                }
+            }
+        }
+        let state = self.lock();
+        let mut clean = 0usize;
+        walk(&state.root, &state.cache, None, &mut clean);
+        assert_eq!(clean, state.cache.clean_bytes, "clean bytes add up");
+    }
+
+    pub(crate) fn dirty_pages(&self) -> usize {
+        fn walk(node: &Node) -> usize {
+            let own = usize::from(node.meta().disk.is_none());
+            own + match node {
+                Node::Internal { children, .. } => children
+                    .iter()
+                    .map(|(_, child)| match child {
+                        Child::Loaded(child) => walk(child),
+                        Child::OnDisk(_) => 0,
+                    })
+                    .sum(),
+                Node::Leaf { .. } => 0,
+            }
+        }
+        walk(&self.lock().root)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rng::XorShift64;
     use std::collections::HashMap;
+
+    fn leaf(items: &[(MetadataKey, MetadataValue)]) -> Vec<u8> {
+        encode_leaf_record(items, 1)
+    }
+
+    fn internal(entries: &[(MetadataKey, PageRef)]) -> Vec<u8> {
+        encode_internal_record(entries, 1)
+    }
+
+    fn page(copies: Vec<Extent>, crc: u32, tx: u64) -> PageRef {
+        PageRef {
+            copies,
+            expect: Expect { crc, tx },
+        }
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -1200,6 +1993,8 @@ mod tests {
     struct PageStore {
         pages: HashMap<(u16, u64), Vec<u8>>,
         next_offset: u64,
+        next_tx: u64,
+        reads: std::cell::RefCell<Vec<(u16, u64)>>,
     }
 
     impl PageStore {
@@ -1207,6 +2002,8 @@ mod tests {
             Self {
                 pages: HashMap::new(),
                 next_offset: 4096,
+                next_tx: 1,
+                reads: std::cell::RefCell::new(Vec::new()),
             }
         }
 
@@ -1219,19 +2016,30 @@ mod tests {
             }
         }
 
-        fn read(&self) -> impl FnMut(&[Extent]) -> Result<Vec<u8>> {
-            let pages = self.pages.clone();
-            move |copies| {
-                let extent = copies[0];
-                pages
-                    .get(&(extent.device_index, extent.offset))
-                    .cloned()
-                    .ok_or(ScaleFsError::Corrupt("missing page"))
-            }
+        fn take_reads(&self) -> Vec<(u16, u64)> {
+            std::mem::take(&mut self.reads.borrow_mut())
         }
     }
 
-    fn commit(tree: &mut MetadataTree, store: &mut PageStore) -> (Vec<Extent>, usize) {
+    impl PageSource for PageStore {
+        fn read_page(&self, page: &PageRef) -> Result<Vec<u8>> {
+            let extent = page.copies[0];
+            self.reads
+                .borrow_mut()
+                .push((extent.device_index, extent.offset));
+            let bytes = self
+                .pages
+                .get(&(extent.device_index, extent.offset))
+                .cloned()
+                .ok_or(ScaleFsError::Corrupt("missing page"))?;
+            page.expect.verify(&bytes)?;
+            Ok(bytes)
+        }
+    }
+
+    fn commit(tree: &mut MetadataTree, store: &mut PageStore) -> (PageRef, usize) {
+        let tx = store.next_tx;
+        store.next_tx += 1;
         let mut place = {
             let next = &mut store.next_offset;
             move |len: u64| {
@@ -1240,26 +2048,56 @@ mod tests {
                 Ok(vec![(0u16, offset)])
             }
         };
-        let (root, pages) = tree.plan_commit(&mut place).unwrap();
+        let (root, pages) = tree.plan_commit(tx, &mut place).unwrap();
         store.write_plan(&pages);
+        tree.plan_published();
         (root, pages.len())
+    }
+
+    fn committed_tree(count: u64, store: &mut PageStore) -> PageRef {
+        let mut tree = MetadataTree::new();
+        let edit = tree.in_memory();
+        for id in 1..=count {
+            edit.insert(inode_key(id), fixture_inode(id)).unwrap();
+        }
+        commit(&mut tree, store).0
+    }
+
+    fn path_to(store: &PageStore, root: &PageRef, key: MetadataKey) -> Vec<(u16, u64)> {
+        let mut path = Vec::new();
+        let mut copies = root.copies.clone();
+        loop {
+            let at = (copies[0].device_index, copies[0].offset);
+            path.push(at);
+            let bytes = &store.pages[&at];
+            if decode_record(bytes).unwrap().kind == RecordKind::MetadataLeaf {
+                return path;
+            }
+            let entries = decode_internal_record(bytes).unwrap();
+            let idx = entries
+                .partition_point(|(separator, _)| *separator <= key)
+                .saturating_sub(1);
+            copies = entries[idx].1.copies.clone();
+        }
     }
 
     #[test]
     fn insert_get_overwrite_remove() {
         let mut tree = MetadataTree::new();
-        tree.insert(inode_key(5), fixture_inode(100)).unwrap();
-        assert_eq!(tree.get(inode_key(5)), Some(&fixture_inode(100)));
-        tree.insert(inode_key(5), fixture_inode(200)).unwrap();
-        assert_eq!(tree.get(inode_key(5)), Some(&fixture_inode(200)));
-        assert_eq!(tree.remove(inode_key(5)), Some(fixture_inode(200)));
-        assert_eq!(tree.get(inode_key(5)), None);
-        assert_eq!(tree.remove(inode_key(5)), None);
+        let t = tree.in_memory();
+        t.insert(inode_key(5), fixture_inode(100)).unwrap();
+        assert_eq!(t.get(inode_key(5)).unwrap(), Some(fixture_inode(100)));
+        t.insert(inode_key(5), fixture_inode(200)).unwrap();
+        assert_eq!(t.get(inode_key(5)).unwrap(), Some(fixture_inode(200)));
+        assert_eq!(t.remove(inode_key(5)).unwrap(), Some(fixture_inode(200)));
+        assert_eq!(t.get(inode_key(5)).unwrap(), None);
+        assert_eq!(t.remove(inode_key(5)).unwrap(), None);
     }
 
     #[test]
     fn thousands_of_items_stay_sorted_through_splits() {
         let mut tree = MetadataTree::new();
+        let t = tree.in_memory();
         let mut rng = XorShift64::new(7);
         let mut ids: Vec<u64> = (1..=3000).collect();
         for i in (1..ids.len()).rev() {
@@ -1267,40 +2105,42 @@ mod tests {
             ids.swap(i, j);
         }
         for &id in &ids {
-            tree.insert(inode_key(id), fixture_inode(id)).unwrap();
+            t.insert(inode_key(id), fixture_inode(id)).unwrap();
         }
-        assert_eq!(tree.item_count(), 3000);
-        let all = tree.range(MetadataKey::MIN, MetadataKey::MAX);
+        assert_eq!(t.item_count().unwrap(), 3000);
+        let all = t.range(MetadataKey::MIN, MetadataKey::MAX).unwrap();
         assert_eq!(all.len(), 3000);
         for (i, (key, value)) in all.iter().enumerate() {
             assert_eq!(key.object_id, i as u64 + 1);
-            assert_eq!(**value, fixture_inode(i as u64 + 1));
+            assert_eq!(*value, fixture_inode(i as u64 + 1));
         }
-        assert_eq!(tree.get(inode_key(1)), Some(&fixture_inode(1)));
-        assert_eq!(tree.get(inode_key(2999)), Some(&fixture_inode(2999)));
+        assert_eq!(t.get(inode_key(1)).unwrap(), Some(fixture_inode(1)));
+        assert_eq!(t.get(inode_key(2999)).unwrap(), Some(fixture_inode(2999)));
     }
 
     #[test]
     fn removals_shrink_back_to_an_empty_root() {
         let mut tree = MetadataTree::new();
+        let t = tree.in_memory();
         for id in 1..=2000 {
-            tree.insert(inode_key(id), fixture_inode(id)).unwrap();
+            t.insert(inode_key(id), fixture_inode(id)).unwrap();
         }
         for id in 1..=2000 {
-            assert!(tree.remove(inode_key(id)).is_some(), "id {id}");
+            assert!(t.remove(inode_key(id)).unwrap().is_some(), "id {id}");
         }
-        assert_eq!(tree.item_count(), 0);
-        tree.insert(inode_key(1), fixture_inode(1)).unwrap();
-        assert_eq!(tree.get(inode_key(1)), Some(&fixture_inode(1)));
+        assert_eq!(t.item_count().unwrap(), 0);
+        t.insert(inode_key(1), fixture_inode(1)).unwrap();
+        assert_eq!(t.get(inode_key(1)).unwrap(), Some(fixture_inode(1)));
     }
 
     #[test]
     fn range_scans_are_bounded() {
         let mut tree = MetadataTree::new();
+        let t = tree.in_memory();
         for id in 1..=100 {
-            tree.insert(inode_key(id), fixture_inode(id)).unwrap();
+            t.insert(inode_key(id), fixture_inode(id)).unwrap();
         }
-        let some = tree.range(inode_key(10), inode_key(19));
+        let some = t.range(inode_key(10), inode_key(19)).unwrap();
         assert_eq!(some.len(), 10);
         assert_eq!(some[0].0.object_id, 10);
         assert_eq!(some[9].0.object_id, 19);
@@ -1310,7 +2150,9 @@ mod tests {
     fn commit_writes_only_dirty_pages() {
         let mut tree = MetadataTree::new();
         for id in 1..=3000 {
-            tree.insert(inode_key(id), fixture_inode(id)).unwrap();
+            tree.in_memory()
+                .insert(inode_key(id), fixture_inode(id))
+                .unwrap();
         }
         let mut store = PageStore::new();
         let (root1, first_pages) = commit(&mut tree, &mut store);
@@ -1320,7 +2162,9 @@ mod tests {
         assert_eq!(second_pages, 0);
         assert_eq!(root2, root1);
 
-        tree.insert(inode_key(1500), fixture_inode(9999)).unwrap();
+        tree.edit(&store)
+            .insert(inode_key(1500), fixture_inode(9999))
+            .unwrap();
         let (root3, third_pages) = commit(&mut tree, &mut store);
         assert_ne!(root3, root1);
         assert!(
@@ -1328,26 +2172,29 @@ mod tests {
             "path copy should touch the leaf and its ancestors, wrote {third_pages}"
         );
 
-        let loaded = MetadataTree::load(&root3, &mut store.read()).unwrap();
-        assert_eq!(loaded.item_count(), 3000);
-        assert_eq!(loaded.get(inode_key(1500)), Some(&fixture_inode(9999)));
-        assert_eq!(loaded.get(inode_key(42)), Some(&fixture_inode(42)));
+        let loaded = MetadataTree::load(&root3, &store).unwrap();
+        let view = loaded.view(&store);
+        assert_eq!(view.item_count().unwrap(), 3000);
+        assert_eq!(
+            view.get(inode_key(1500)).unwrap(),
+            Some(fixture_inode(9999))
+        );
+        assert_eq!(view.get(inode_key(42)).unwrap(), Some(fixture_inode(42)));
     }
 
     #[test]
     fn loaded_trees_continue_with_incremental_commits() {
-        let mut tree = MetadataTree::new();
-        for id in 1..=3000 {
-            tree.insert(inode_key(id), fixture_inode(id)).unwrap();
-        }
         let mut store = PageStore::new();
-        let (root, _) = commit(&mut tree, &mut store);
+        let root = committed_tree(3000, &mut store);
 
-        let mut reloaded = MetadataTree::load(&root, &mut store.read()).unwrap();
+        let mut reloaded = MetadataTree::load(&root, &store).unwrap();
         let (same_root, pages) = commit(&mut reloaded, &mut store);
         assert_eq!(pages, 0);
         assert_eq!(same_root, root);
-        reloaded.insert(inode_key(7), fixture_inode(7000)).unwrap();
+        reloaded
+            .edit(&store)
+            .insert(inode_key(7), fixture_inode(7000))
+            .unwrap();
         let (_, pages) = commit(&mut reloaded, &mut store);
         assert!((2..=4).contains(&pages), "wrote {pages}");
     }
@@ -1358,18 +2205,14 @@ mod tests {
         let mut store = PageStore::new();
         let (root, pages) = commit(&mut tree, &mut store);
         assert_eq!(pages, 1);
-        let loaded = MetadataTree::load(&root, &mut store.read()).unwrap();
-        assert_eq!(loaded.item_count(), 0);
+        let loaded = MetadataTree::load(&root, &store).unwrap();
+        assert_eq!(loaded.view(&store).item_count().unwrap(), 0);
     }
 
     #[test]
-    fn corrupted_pages_fail_to_load() {
-        let mut tree = MetadataTree::new();
-        for id in 1..=3000 {
-            tree.insert(inode_key(id), fixture_inode(id)).unwrap();
-        }
+    fn corrupted_pages_fail_to_load_or_to_walk() {
         let mut store = PageStore::new();
-        let (root, _) = commit(&mut tree, &mut store);
+        let root = committed_tree(3000, &mut store);
 
         let keys: Vec<(u16, u64)> = store.pages.keys().copied().collect();
         for key in keys {
@@ -1377,14 +2220,16 @@ mod tests {
             let page = corrupted.get_mut(&key).unwrap();
             let mid = page.len() / 2;
             page[mid] ^= 0xFF;
-            let mut read = move |copies: &[Extent]| {
-                let extent = copies[0];
+            let read = move |page: &PageRef| {
+                let extent = page.copies[0];
                 corrupted
                     .get(&(extent.device_index, extent.offset))
                     .cloned()
                     .ok_or(ScaleFsError::Corrupt("missing page"))
             };
-            assert!(MetadataTree::load(&root, &mut read).is_err());
+            let walked =
+                MetadataTree::load(&root, &read).and_then(|tree| tree.view(&read).item_count());
+            assert!(walked.is_err(), "page {key:?}");
         }
     }
 
@@ -1405,13 +2250,367 @@ mod tests {
             offset: 1,
         };
         assert!(matches!(
-            tree.insert(key, value),
+            tree.in_memory().insert(key, value),
             Err(ScaleFsError::InvalidArgument(_))
         ));
     }
 
     #[test]
+    fn opening_a_tree_reads_only_its_root() {
+        let mut store = PageStore::new();
+        let root = committed_tree(20_000, &mut store);
+        assert!(store.pages.len() > 100, "a tree of many pages");
+        let tree = MetadataTree::load(&root, &store).unwrap();
+        assert_eq!(
+            store.take_reads(),
+            vec![(root.copies[0].device_index, root.copies[0].offset)]
+        );
+        let stats = tree.cache_stats();
+        assert_eq!(stats.loaded_pages, 1);
+        assert_eq!(stats.page_reads, 1);
+    }
+
+    #[test]
+    fn a_cold_descent_reads_the_pages_on_its_path_and_nothing_else() {
+        let mut store = PageStore::new();
+        let root = committed_tree(20_000, &mut store);
+        let tree = MetadataTree::load(&root, &store).unwrap();
+        tree.set_cache_budget(64 << 20);
+        store.take_reads();
+        let view = tree.view(&store);
+        for (n, id) in [1u64, 7_777, 20_000].into_iter().enumerate() {
+            let expected = path_to(&store, &root, inode_key(id));
+            assert!(expected.len() >= 3, "a tree at least three levels deep");
+            assert_eq!(view.get(inode_key(id)).unwrap(), Some(fixture_inode(id)));
+            let reads = store.take_reads();
+            assert!(
+                reads.iter().all(|page| expected.contains(page)),
+                "{reads:?} vs {expected:?}"
+            );
+            let unique: std::collections::HashSet<_> = reads.iter().collect();
+            assert_eq!(unique.len(), reads.len(), "no page is read twice");
+            if n == 0 {
+                assert_eq!(reads, expected[1..].to_vec());
+            }
+            assert_eq!(view.get(inode_key(id)).unwrap(), Some(fixture_inode(id)));
+            assert!(store.take_reads().is_empty());
+        }
+        assert_eq!(view.get(MetadataKey::MIN).unwrap(), None);
+        assert!(store.take_reads().is_empty(), "the leftmost path is warm");
+        tree.check_invariants();
+    }
+
+    #[test]
+    fn a_tree_larger_than_its_cache_stays_correct() {
+        let mut store = PageStore::new();
+        let mut tree = MetadataTree::new();
+        tree.set_cache_budget(48 << 10);
+        let mut oracle = std::collections::BTreeMap::new();
+        let mut rng = XorShift64::new(0x5CA1E);
+        for step in 0..30_000u64 {
+            let id = rng.next_u64() % 4_000 + 1;
+            match rng.next_u64() % 10 {
+                0..=4 => {
+                    let value = fixture_inode(rng.next_u64() % 1_000_000);
+                    tree.edit(&store)
+                        .insert(inode_key(id), value.clone())
+                        .unwrap();
+                    oracle.insert(id, value);
+                }
+                5 | 6 => {
+                    let removed = tree.edit(&store).remove(inode_key(id)).unwrap();
+                    assert_eq!(removed, oracle.remove(&id), "remove {id}");
+                }
+                7 | 8 => {
+                    let found = tree.view(&store).get(inode_key(id)).unwrap();
+                    assert_eq!(found.as_ref(), oracle.get(&id), "get {id}");
+                }
+                _ => {
+                    let end = id + rng.next_u64() % 300;
+                    let scanned: Vec<(u64, MetadataValue)> = tree
+                        .view(&store)
+                        .range(inode_key(id), inode_key(end))
+                        .unwrap()
+                        .into_iter()
+                        .map(|(key, value)| (key.object_id, value))
+                        .collect();
+                    let expected: Vec<(u64, MetadataValue)> = oracle
+                        .range(id..=end)
+                        .map(|(id, value)| (*id, value.clone()))
+                        .collect();
+                    assert_eq!(scanned, expected, "range {id}..={end}");
+                }
+            }
+            if step % 400 == 399 {
+                commit(&mut tree, &mut store);
+                tree.check_invariants();
+            }
+        }
+        let stats = tree.cache_stats();
+        assert!(
+            stats.pages_evicted > 0,
+            "the cache was too small to hold the tree"
+        );
+        assert!(stats.page_reads > 0, "evicted pages were read back");
+        let (root, _) = commit(&mut tree, &mut store);
+        let all: Vec<(u64, MetadataValue)> = oracle.into_iter().collect();
+        let through = |tree: &MetadataTree| -> Vec<(u64, MetadataValue)> {
+            tree.view(&store)
+                .range(MetadataKey::MIN, MetadataKey::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|(key, value)| (key.object_id, value))
+                .collect()
+        };
+        assert_eq!(through(&tree), all);
+        let reopened = MetadataTree::load(&root, &store).unwrap();
+        reopened.set_cache_budget(48 << 10);
+        assert_eq!(through(&reopened), all);
+        assert!(reopened.cache_stats().clean_bytes <= 48 << 10);
+    }
+
+    #[test]
+    fn eviction_never_drops_a_dirty_page_or_an_ancestor_of_one() {
+        let mut store = PageStore::new();
+        let root = committed_tree(20_000, &mut store);
+        let mut tree = MetadataTree::load(&root, &store).unwrap();
+        assert_eq!(tree.view(&store).item_count().unwrap(), 20_000);
+        let changed = [3u64, 4_444, 9_999, 15_000, 19_998];
+        for id in changed {
+            tree.edit(&store)
+                .insert(inode_key(id), fixture_inode(id * 10))
+                .unwrap();
+        }
+        let dirty = tree.dirty_pages();
+        assert!(
+            dirty >= changed.len(),
+            "each change dirties a leaf and its path"
+        );
+        tree.set_cache_budget(0);
+        tree.check_invariants();
+        let stats = tree.cache_stats();
+        assert!(stats.pages_evicted > 0);
+        assert_eq!(tree.dirty_pages(), dirty, "no dirty page was evicted");
+        assert_eq!(stats.clean_bytes, 0, "only the pinned set is left");
+        assert_eq!(stats.loaded_pages, stats.pinned_pages);
+        store.take_reads();
+        for id in changed {
+            assert_eq!(
+                tree.view(&store).get(inode_key(id)).unwrap(),
+                Some(fixture_inode(id * 10))
+            );
+        }
+        assert!(
+            store.take_reads().is_empty(),
+            "the dirty paths stayed in memory"
+        );
+        let (root, written) = commit(&mut tree, &mut store);
+        assert_eq!(written, dirty);
+        let reopened = MetadataTree::load(&root, &store).unwrap();
+        let view = reopened.view(&store);
+        assert_eq!(view.item_count().unwrap(), 20_000);
+        for id in changed {
+            assert_eq!(
+                view.get(inode_key(id)).unwrap(),
+                Some(fixture_inode(id * 10))
+            );
+        }
+        assert_eq!(view.get(inode_key(5)).unwrap(), Some(fixture_inode(5)));
+    }
+
+    #[test]
+    fn a_plan_in_flight_is_pinned_and_an_abandoned_one_rewrites_exactly_its_pages() {
+        let mut store = PageStore::new();
+        let root = committed_tree(20_000, &mut store);
+        let mut tree = MetadataTree::load(&root, &store).unwrap();
+        for id in [10u64, 12_000] {
+            tree.edit(&store)
+                .insert(inode_key(id), fixture_inode(1))
+                .unwrap();
+        }
+        let dirty = tree.dirty_pages();
+        let mut next = 1 << 30;
+        let mut place = |len: u64| {
+            let offset = next;
+            next += len.div_ceil(4096) * 4096;
+            Ok(vec![(0u16, offset)])
+        };
+        let (_, pages) = tree.plan_commit(9, &mut place).unwrap();
+        assert_eq!(pages.len(), dirty);
+        assert_eq!(tree.dirty_pages(), 0, "planned pages count as clean");
+        tree.set_cache_budget(0);
+        assert_eq!(tree.cache_stats().pinned_pages, dirty as u64);
+        tree.check_invariants();
+        tree.plan_abandoned();
+        assert_eq!(tree.dirty_pages(), dirty);
+        tree.check_invariants();
+        let (root, written) = commit(&mut tree, &mut store);
+        assert_eq!(written, dirty);
+        tree.set_cache_budget(0);
+        assert_eq!(tree.cache_stats().pinned_pages, 0);
+        let reopened = MetadataTree::load(&root, &store).unwrap();
+        assert_eq!(
+            reopened.view(&store).get(inode_key(12_000)).unwrap(),
+            Some(fixture_inode(1))
+        );
+    }
+
+    #[test]
+    fn a_whole_tree_rewrite_in_batches_replaces_every_page() {
+        let mut store = PageStore::new();
+        let root = committed_tree(20_000, &mut store);
+        let before: std::collections::HashSet<(u16, u64)> = store.pages.keys().copied().collect();
+        let mut tree = MetadataTree::load(&root, &store).unwrap();
+        tree.set_cache_budget(64 << 10);
+        let mut cursor = Some(MetadataKey::MIN);
+        let mut batches = 0;
+        let mut root = root;
+        while let Some(from) = cursor {
+            let (next, marked) = tree.edit(&store).mark_dirty_from(from, 32 << 10).unwrap();
+            assert!(marked > 0);
+            assert!(
+                tree.cache_stats().pinned_pages < 40,
+                "{:?}",
+                tree.cache_stats()
+            );
+            root = commit(&mut tree, &mut store).0;
+            tree.check_invariants();
+            batches += 1;
+            cursor = next;
+        }
+        assert!(batches > 3, "the rewrite took several commits ({batches})");
+        let mut live = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(page) = stack.pop() {
+            let at = (page.copies[0].device_index, page.copies[0].offset);
+            live.push(at);
+            let bytes = &store.pages[&at];
+            if let Ok(entries) = decode_internal_record(bytes) {
+                stack.extend(entries.into_iter().map(|(_, child)| child));
+            }
+        }
+        assert!(
+            live.iter().all(|page| !before.contains(page)),
+            "no page survived the rewrite"
+        );
+        let reopened = MetadataTree::load(&root, &store).unwrap();
+        assert_eq!(reopened.view(&store).item_count().unwrap(), 20_000);
+    }
+
+    #[test]
+    fn crafted_child_pointers_are_refused_on_the_way_down() {
+        let mut store = PageStore::new();
+        let root = committed_tree(20_000, &mut store);
+        let root_at = (root.copies[0].device_index, root.copies[0].offset);
+        let entries = decode_internal_record(&store.pages[&root_at]).unwrap();
+        let reseal = |store: &mut PageStore, entries: &[(MetadataKey, PageRef)]| -> PageRef {
+            let bytes = internal(entries);
+            let resealed = PageRef {
+                copies: root.copies.clone(),
+                expect: Expect::of(&bytes),
+            };
+            store.pages.insert(root_at, bytes);
+            resealed
+        };
+
+        let mut looped = entries.clone();
+        looped[1].1 = root.clone();
+        let root = reseal(&mut store, &looped);
+        assert!(matches!(
+            MetadataTree::load(&root, &store),
+            Err(ScaleFsError::Corrupt(_))
+        ));
+
+        let mut shared = entries.clone();
+        shared[1].1 = shared[0].1.clone();
+        let root = reseal(&mut store, &shared);
+        assert!(matches!(
+            MetadataTree::load(&root, &store),
+            Err(ScaleFsError::Corrupt(_))
+        ));
+
+        let mut swapped = entries.clone();
+        let (first, second) = (swapped[0].1.clone(), swapped[1].1.clone());
+        swapped[0].1 = second;
+        swapped[1].1 = first;
+        let root = reseal(&mut store, &swapped);
+        let tree = MetadataTree::load(&root, &store).unwrap();
+        let view = tree.view(&store);
+        assert!(matches!(
+            view.get(inode_key(1)),
+            Err(ScaleFsError::Corrupt(_))
+        ));
+        let untouched = entries[entries.len() - 1].0;
+        if entries.len() > 2 {
+            assert!(view.get(untouched).unwrap().is_some());
+        }
+        assert!(view.item_count().is_err());
+    }
+
+    #[test]
+    fn concurrent_readers_share_one_cold_tree() {
+        struct Frozen(HashMap<(u16, u64), Vec<u8>>);
+        impl PageSource for Frozen {
+            fn read_page(&self, page: &PageRef) -> Result<Vec<u8>> {
+                let extent = page.copies[0];
+                self.0
+                    .get(&(extent.device_index, extent.offset))
+                    .cloned()
+                    .ok_or(ScaleFsError::Corrupt("missing page"))
+            }
+        }
+        let mut store = PageStore::new();
+        let root = committed_tree(20_000, &mut store);
+        let frozen = Frozen(store.pages.clone());
+        let tree = MetadataTree::load(&root, &frozen).unwrap();
+        tree.set_cache_budget(64 << 10);
+        std::thread::scope(|scope| {
+            for seed in 1..=4u64 {
+                let (tree, frozen) = (&tree, &frozen);
+                scope.spawn(move || {
+                    let view = tree.view(frozen);
+                    let mut rng = XorShift64::new(seed);
+                    for _ in 0..3_000 {
+                        let id = rng.next_u64() % 20_000 + 1;
+                        assert_eq!(view.get(inode_key(id)).unwrap(), Some(fixture_inode(id)));
+                    }
+                });
+            }
+        });
+        tree.check_invariants();
+        assert!(tree.cache_stats().clean_bytes <= 64 << 10);
+    }
+
+    fn small_run(data_offset: u64, logical_len: u64) -> FileRun {
+        FileRun {
+            copies: vec![Extent {
+                device_index: 0,
+                offset: 0,
+                length: 100,
+            }],
+            stride: 4096,
+            last_len: 100,
+            tx: 1,
+            crcs: vec![0xFEED],
+            data_offset,
+            logical_len,
+        }
+    }
+
+    #[test]
     fn value_validation_rejects_bad_contents() {
+        let mut same_member = small_run(0, 20);
+        same_member.copies.push(Extent {
+            device_index: 0,
+            offset: 4096,
+            length: 100,
+        });
+        let mut unequal = small_run(0, 20);
+        unequal.copies.push(Extent {
+            device_index: 1,
+            offset: 0,
+            length: 132,
+        });
         for value in [
             MetadataValue::PoolState { next_object_id: 1 },
             MetadataValue::DirEntries(vec![]),
@@ -1425,159 +2624,94 @@ mod tests {
                 kind: EntryKind::File,
                 name: "..".into(),
             }]),
-            MetadataValue::FileExtent {
-                extents: vec![Extent {
-                    device_index: 0,
-                    offset: 0,
-                    length: 100,
-                }],
-                data_offset: 0,
-                logical_len: 0,
-            },
-            MetadataValue::FileExtent {
-                extents: vec![Extent {
-                    device_index: 0,
-                    offset: 0,
-                    length: 100,
-                }],
-                data_offset: 0,
-                logical_len: 69,
-            },
-            MetadataValue::FileExtent {
-                extents: vec![Extent {
-                    device_index: 0,
-                    offset: 0,
-                    length: 100,
-                }],
-                data_offset: 60,
-                logical_len: 20,
-            },
-            MetadataValue::FileExtent {
-                extents: vec![
-                    Extent {
-                        device_index: 0,
-                        offset: 0,
-                        length: 100,
-                    },
-                    Extent {
-                        device_index: 0,
-                        offset: 4096,
-                        length: 100,
-                    },
-                ],
-                data_offset: 0,
-                logical_len: 20,
-            },
-            MetadataValue::FileExtent {
-                extents: vec![
-                    Extent {
-                        device_index: 0,
-                        offset: 0,
-                        length: 100,
-                    },
-                    Extent {
-                        device_index: 1,
-                        offset: 0,
-                        length: 132,
-                    },
-                ],
-                data_offset: 0,
-                logical_len: 20,
-            },
+            MetadataValue::FileRun(small_run(0, 0)),
+            MetadataValue::FileRun(small_run(0, 69)),
+            MetadataValue::FileRun(small_run(60, 20)),
+            MetadataValue::FileRun(same_member),
+            MetadataValue::FileRun(unequal),
         ] {
             assert!(value.validate().is_err(), "{value:?}");
         }
+        assert!(MetadataValue::FileRun(small_run(4, 64)).validate().is_ok());
     }
 
     fn fixture_striped(parity_members: &[u16]) -> MetadataValue {
-        MetadataValue::StripedExtent {
-            extent: Extent {
-                device_index: 2,
-                offset: 1 << 20,
-                length: 100,
-            },
-            parity_extents: parity_members
+        MetadataValue::StripedRun(StripedRun {
+            pieces: vec![
+                Extent {
+                    device_index: 2,
+                    offset: 1 << 20,
+                    length: 32 * 1024,
+                },
+                Extent {
+                    device_index: 3,
+                    offset: 1 << 20,
+                    length: 100,
+                },
+            ],
+            crcs: vec![0xAAAA_0001, 0xAAAA_0002],
+            tx: 6,
+            parity: parity_members
                 .iter()
                 .map(|&member| Extent {
                     device_index: member,
                     offset: 1 << 21,
-                    length: 4096,
+                    length: 32 * 1024 + 4096,
                 })
                 .collect(),
+            parity_crcs: parity_members
+                .iter()
+                .map(|&member| 0xBBBB_0000 | u32::from(member))
+                .collect(),
+            parity_tx: 6,
             data_offset: 4,
-            logical_len: 32,
-        }
+            logical_len: crate::fs::FILE_DATA_CHUNK as u64 + 60,
+        })
     }
 
     #[test]
-    fn striped_extents_round_trip_and_validate() {
+    fn striped_runs_round_trip_and_validate() {
         let key = MetadataKey {
             object_id: 5,
             item_type: ITEM_FILE_EXTENT,
             offset: 0,
         };
         let value = fixture_striped(&[0, 4]);
-        let record = encode_leaf_record(&[(key, value.clone())]);
+        let record = leaf(&[(key, value.clone())]);
         assert_eq!(decode_leaf_record(&record).unwrap(), vec![(key, value)]);
 
-        let mutate = |f: &dyn Fn(&mut MetadataValue)| {
-            let mut value = fixture_striped(&[0, 4]);
-            f(&mut value);
-            value.validate()
+        let mutate = |f: &dyn Fn(&mut StripedRun)| {
+            let MetadataValue::StripedRun(mut run) = fixture_striped(&[0, 4]) else {
+                unreachable!()
+            };
+            f(&mut run);
+            MetadataValue::StripedRun(run).validate()
         };
         for (name, mutation) in [
             (
                 "no parity records",
-                &(|v: &mut MetadataValue| {
-                    if let MetadataValue::StripedExtent { parity_extents, .. } = v {
-                        parity_extents.clear();
-                    }
-                }) as &dyn Fn(&mut MetadataValue),
+                &(|r: &mut StripedRun| {
+                    r.parity.clear();
+                    r.parity_crcs.clear();
+                }) as &dyn Fn(&mut StripedRun),
             ),
-            ("too many parity records", &|v: &mut MetadataValue| {
-                if let MetadataValue::StripedExtent { parity_extents, .. } = v {
-                    for member in 5..=6 {
-                        let mut extra = parity_extents[0];
-                        extra.device_index = member;
-                        parity_extents.push(extra);
-                    }
-                }
+            ("unequal parity lengths", &|r: &mut StripedRun| {
+                r.parity[1].length += 1;
             }),
-            ("unequal parity lengths", &|v: &mut MetadataValue| {
-                if let MetadataValue::StripedExtent { parity_extents, .. } = v {
-                    parity_extents[1].length += 1;
-                }
+            ("parity on a data member", &|r: &mut StripedRun| {
+                r.parity[0].device_index = r.pieces[0].device_index;
             }),
-            ("parity on the data member", &|v: &mut MetadataValue| {
-                if let MetadataValue::StripedExtent {
-                    extent,
-                    parity_extents,
-                    ..
-                } = v
-                {
-                    parity_extents[0].device_index = extent.device_index;
-                }
+            (
+                "a parity row without its checksum",
+                &|r: &mut StripedRun| {
+                    r.parity_crcs.pop();
+                },
+            ),
+            ("zero logical length", &|r: &mut StripedRun| {
+                r.logical_len = 0;
             }),
-            ("duplicate parity members", &|v: &mut MetadataValue| {
-                if let MetadataValue::StripedExtent { parity_extents, .. } = v {
-                    parity_extents[1].device_index = parity_extents[0].device_index;
-                }
-            }),
-            ("zero logical length", &|v: &mut MetadataValue| {
-                if let MetadataValue::StripedExtent { logical_len, .. } = v {
-                    *logical_len = 0;
-                }
-            }),
-            ("range outside the record", &|v: &mut MetadataValue| {
-                if let MetadataValue::StripedExtent {
-                    data_offset,
-                    logical_len,
-                    ..
-                } = v
-                {
-                    *data_offset = 60;
-                    *logical_len = 20;
-                }
+            ("range outside the records", &|r: &mut StripedRun| {
+                r.logical_len += 100;
             }),
         ] {
             assert!(
@@ -1594,10 +2728,10 @@ mod tests {
             item_type: ITEM_FILE_EXTENT,
             offset: 32768,
         };
-        let record = encode_leaf_record(&[(key, fixture_striped(&[0, 4]))]);
+        let record = leaf(&[(key, fixture_striped(&[0, 4]))]);
         assert_eq!(
             hex(&record),
-            "5363616c654653000100000003000000630000000000000074317a7600000000010005000000000000000300800000000000004e00080200000000001000000000006400000000000000020000000000002000000000000010000000000000040000000000200000000000001000000000000004000000000000002000000000000000"
+            "5363616c6546530002000000030000009800000013e6368f01000000000000000100050000000000000003008000000000000083000802020000000000100000000000008000000000000003000000000010000000000064000000000000000100aaaa0200aaaa060000000000000002000000000000200000000000009000000000000004000000000020000000000000900000000000000000bbbb0400bbbb060000000000000004000000000000001c80000000000000"
         );
     }
 
@@ -1614,7 +2748,7 @@ mod tests {
             put_u16(&mut payload, bytes.len() as u16);
             payload.extend_from_slice(&bytes);
         }
-        let record = encode_record(RecordKind::MetadataLeaf, &payload);
+        let record = encode_record(RecordKind::MetadataLeaf, 1, &payload);
         assert!(decode_leaf_record(&record).is_err());
 
         let mut payload = Vec::new();
@@ -1622,7 +2756,7 @@ mod tests {
         encode_key(&mut payload, inode_key(1));
         put_u16(&mut payload, 1);
         payload.push(100);
-        let record = encode_record(RecordKind::MetadataLeaf, &payload);
+        let record = encode_record(RecordKind::MetadataLeaf, 1, &payload);
         assert!(decode_leaf_record(&record).is_err());
     }
 
@@ -1637,10 +2771,10 @@ mod tests {
             item_type: 9,
             offset: 0,
         };
-        let record = encode_leaf_record(&[(key, opaque.clone())]);
+        let record = leaf(&[(key, opaque.clone())]);
         assert_eq!(decode_leaf_record(&record).unwrap(), vec![(key, opaque)]);
 
-        let record = encode_leaf_record(&[(
+        let record = leaf(&[(
             inode_key(1),
             MetadataValue::Opaque {
                 tag: 130,
@@ -1668,7 +2802,7 @@ mod tests {
                 value: Vec::new(),
             },
         ]);
-        let record = encode_leaf_record(&[(inode_key(2), bucket.clone())]);
+        let record = leaf(&[(inode_key(2), bucket.clone())]);
         assert_eq!(
             decode_leaf_record(&record).unwrap(),
             vec![(inode_key(2), bucket)]
@@ -1711,7 +2845,7 @@ mod tests {
             item_type: ITEM_DIRENT,
             offset: 42,
         };
-        let record = encode_leaf_record(&[(key, bucket.clone())]);
+        let record = leaf(&[(key, bucket.clone())]);
         assert_eq!(decode_leaf_record(&record).unwrap(), vec![(key, bucket)]);
 
         let mut payload = Vec::new();
@@ -1726,7 +2860,7 @@ mod tests {
         value.push(b'x');
         put_u16(&mut payload, value.len() as u16);
         payload.extend_from_slice(&value);
-        let record = encode_record(RecordKind::MetadataLeaf, &payload);
+        let record = encode_record(RecordKind::MetadataLeaf, 1, &payload);
         assert!(decode_leaf_record(&record).is_err());
 
         assert!(
@@ -1774,7 +2908,7 @@ mod tests {
         let target = MetadataValue::Special {
             data: b"../elsewhere".to_vec(),
         };
-        let record = encode_leaf_record(&[(key, target.clone())]);
+        let record = leaf(&[(key, target.clone())]);
         assert_eq!(decode_leaf_record(&record).unwrap(), vec![(key, target)]);
 
         let mut value = Vec::new();
@@ -1795,13 +2929,13 @@ mod tests {
             item_type: ITEM_SPECIAL,
             offset: 0,
         };
-        let record = encode_leaf_record(&[(dev_key, dev.clone())]);
+        let record = leaf(&[(dev_key, dev.clone())]);
         assert_eq!(decode_leaf_record(&record).unwrap(), vec![(dev_key, dev)]);
     }
 
     #[test]
     fn golden_special_fixture_is_stable() {
-        let record = encode_leaf_record(&[(
+        let record = leaf(&[(
             MetadataKey {
                 object_id: 9,
                 item_type: ITEM_SPECIAL,
@@ -1813,8 +2947,7 @@ mod tests {
         )]);
         assert_eq!(
             hex(&record),
-            "5363616c6546530001000000030000001a00000000000000\
-             c7ce0bf800000000010009000000000000000500000000000000000500802e2e2f62"
+            "5363616c6546530002000000030000001a0000003c2916a10100000000000000010009000000000000000500000000000000000500802e2e2f62"
         );
     }
 
@@ -1827,7 +2960,7 @@ mod tests {
         put_u16(&mut payload, oversized as u16);
         payload.push(200);
         payload.extend_from_slice(&vec![0u8; oversized - 1]);
-        let record = encode_record(RecordKind::MetadataLeaf, &payload);
+        let record = encode_record(RecordKind::MetadataLeaf, 1, &payload);
         assert!(matches!(
             decode_leaf_record(&record),
             Err(ScaleFsError::Corrupt(
@@ -1838,7 +2971,7 @@ mod tests {
 
     #[test]
     fn golden_opaque_fixture_is_stable() {
-        let record = encode_leaf_record(&[(
+        let record = leaf(&[(
             MetadataKey {
                 object_id: 7,
                 item_type: 9,
@@ -1851,7 +2984,7 @@ mod tests {
         )]);
         assert_eq!(
             hex(&record),
-            "5363616c6546530001000000030000001900000000000000df5cdf2b00000000010007000000000000000900000000000000000400c8657874"
+            "5363616c6546530002000000030000001900000007c3813c0100000000000000010007000000000000000900000000000000000400c8657874"
         );
         let decoded = decode_leaf_record(&record).unwrap();
         assert_eq!(
@@ -1870,10 +3003,12 @@ mod tests {
             offset: 4096,
             length: 100,
         };
-        let record = encode_internal_record(&[(inode_key(1), vec![extent])]);
+        let record = internal(&[(inode_key(1), page(vec![extent], 1, 1))]);
         assert!(decode_internal_record(&record).is_err());
-        let record =
-            encode_internal_record(&[(inode_key(2), vec![extent]), (inode_key(1), vec![extent])]);
+        let record = internal(&[
+            (inode_key(2), page(vec![extent], 1, 1)),
+            (inode_key(1), page(vec![extent], 2, 1)),
+        ]);
         assert!(decode_internal_record(&record).is_err());
     }
 
@@ -1896,11 +3031,15 @@ mod tests {
                 },
                 MetadataValue::RetainedRoot {
                     tx_id: 3,
-                    metadata_roots: vec![Extent {
-                        device_index: 0,
-                        offset: 67_117_056,
-                        length: 4128,
-                    }],
+                    root: page(
+                        vec![Extent {
+                            device_index: 0,
+                            offset: 67_117_056,
+                            length: 4128,
+                        }],
+                        0xA1A2_A3A4,
+                        2,
+                    ),
                     created_at_ns: 1_700_000_000_000_000_000,
                     name: "before-upgrade".into(),
                 },
@@ -1940,21 +3079,25 @@ mod tests {
                     item_type: ITEM_FILE_EXTENT,
                     offset: 0,
                 },
-                MetadataValue::FileExtent {
-                    extents: vec![Extent {
+                MetadataValue::FileRun(FileRun {
+                    copies: vec![Extent {
                         device_index: 0,
                         offset: 134_217_728,
                         length: 4128,
                     }],
+                    stride: 8192,
+                    last_len: 4128,
+                    tx: 2,
+                    crcs: vec![0xC1C1_0001],
                     data_offset: 0,
                     logical_len: 4000,
-                },
+                }),
             ),
         ];
-        let record = encode_leaf_record(&items);
+        let record = leaf(&items);
         assert_eq!(
             hex(&record),
-            "5363616c6546530001000000030000007001000000000000235a53fc000000000600000000000000000000000000000000000009000103000000000000000000000000000000042a000000000000003500050300000000000000000000000020000400000000201000000000000000002a36fe9c97170e006265666f72652d7570677261646501000000000000000100000000000000004100020000000000000000ed410000000000000000000001000000000000000000000000002a36fe9c971700002a36fe9c971700002a36fe9c971700002a36fe9c971701000000000000000208070605040302011700030100020000000000000001090068656c6c6f2e7478740200000000000000010000000000000000410002a00f000000000000a4810000e8030000e803000001000000200000000000000000002a36fe9c971700002a36fe9c971700002a36fe9c971700002a36fe9c9717020000000000000003000000000000000025000400000000000000080000000020100000000000000000000000000000a00f000000000000"
+            "5363616c65465300020000000300000094010000626de5e701000000000000000600000000000000000000000000000000000009000103000000000000000000000000000000042a000000000000004200050300000000000000010000000000200004000000002010000000000000a4a3a2a1020000000000000000002a36fe9c97170e006265666f72652d7570677261646501000000000000000100000000000000004100020000000000000000ed410000000000000000000001000000000000000000000000002a36fe9c971700002a36fe9c971700002a36fe9c971700002a36fe9c971701000000000000000208070605040302011700030100020000000000000001090068656c6c6f2e7478740200000000000000010000000000000000410002a00f000000000000a4810000e8030000e803000001000000200000000000000000002a36fe9c971700002a36fe9c971700002a36fe9c971700002a36fe9c971702000000000000000300000000000000003c00040100000000000000080000000020100000000000000020000001002010000002000000000000000100c1c10000000000000000a00f000000000000"
         );
         assert_eq!(decode_leaf_record(&record).unwrap(), items);
     }
@@ -1984,7 +3127,7 @@ mod tests {
                 },
                 MetadataValue::RetainedRoot {
                     tx_id: 3,
-                    metadata_roots: copies(67_117_056, 4128),
+                    root: page(copies(67_117_056, 4128), 0xB1B2_B3B4, 3),
                     created_at_ns: 1_700_000_000_000_000_000,
                     name: "pinned".into(),
                 },
@@ -1995,60 +3138,75 @@ mod tests {
                     item_type: ITEM_FILE_EXTENT,
                     offset: 0,
                 },
-                MetadataValue::FileExtent {
-                    extents: copies(134_217_728, 4128),
-                    data_offset: 0,
-                    logical_len: 4000,
-                },
+                MetadataValue::FileRun(FileRun {
+                    copies: copies(134_217_728, 32 * 1024),
+                    stride: 32 * 1024,
+                    last_len: 4128,
+                    tx: 3,
+                    crcs: vec![0xD1D1_0001, 0xD1D1_0002, 0xD1D1_0003],
+                    data_offset: 100,
+                    logical_len: 2 * crate::fs::FILE_DATA_CHUNK as u64 + 3000,
+                }),
             ),
         ];
-        let record = encode_leaf_record(&items);
+        let record = leaf(&items);
         assert_eq!(
             hex(&record),
-            "5363616c654653000100000003000000a40000000000000028e212170000000002000000000000000000042a000000000000004200070300000000000000020000000000200004000000002010000000000000010000000030000400000000201000000000000000002a36fe9c9717060070696e6e656402000000000000000300000000000000003a000602000000000000000800000000201000000000000001000000001000080000000020100000000000000000000000000000a00f000000000000"
+            "5363616c654653000200000003000000ce000000c2d5fb24010000000000000002000000000000000000042a000000000000004e000503000000000000000200000000002000040000000020100000000000000100000000300004000000002010000000000000b4b3b2b1030000000000000000002a36fe9c9717060070696e6e6564020000000000000003000000000000000058000402000000000000000800000000008000000000000001000000001000080000000000800000000000000080000003002010000003000000000000000100d1d10200d1d10300d1d16400000000000000780b010000000000"
         );
         assert_eq!(decode_leaf_record(&record).unwrap(), items);
 
         let entries = vec![
-            (MetadataKey::MIN, copies(67_108_864, 1000)),
-            (inode_key(2), copies(67_112_960, 2000)),
+            (
+                MetadataKey::MIN,
+                page(copies(67_108_864, 1000), 0xC1C2_C3C4, 4),
+            ),
+            (inode_key(2), page(copies(67_112_960, 2000), 0xD1D2_D3D4, 5)),
         ];
-        let record = encode_internal_record(&entries);
+        let record = internal(&entries);
         assert_eq!(
             hex(&record),
-            "5363616c65465300010000000900000076000000000000001d4c688d000000000200000000000000000000000000000000000002000000000000000400000000e803000000000000010000000010000400000000e803000000000000020000000000000001000000000000000002000000000010000400000000d007000000000000010000000020000400000000d007000000000000"
+            "5363616c6546530002000000040000008e000000c299d58701000000000000000200000000000000000000000000000000000002000000000000000400000000e803000000000000010000000010000400000000e803000000000000c4c3c2c10400000000000000020000000000000001000000000000000002000000000010000400000000d007000000000000010000000020000400000000d007000000000000d4d3d2d10500000000000000"
         );
         assert_eq!(decode_internal_record(&record).unwrap(), entries);
     }
 
     #[test]
-    fn mixed_copy_counts_round_trip_in_mirrored_pages() {
+    fn mixed_copy_counts_round_trip_in_internal_pages() {
         let entries = vec![
             (
                 MetadataKey::MIN,
-                vec![Extent {
-                    device_index: 0,
-                    offset: 67_108_864,
-                    length: 1000,
-                }],
+                page(
+                    vec![Extent {
+                        device_index: 0,
+                        offset: 67_108_864,
+                        length: 1000,
+                    }],
+                    11,
+                    1,
+                ),
             ),
             (
                 inode_key(2),
-                vec![
-                    Extent {
-                        device_index: 1,
-                        offset: 67_112_960,
-                        length: 2000,
-                    },
-                    Extent {
-                        device_index: 2,
-                        offset: 67_117_056,
-                        length: 2000,
-                    },
-                ],
+                page(
+                    vec![
+                        Extent {
+                            device_index: 1,
+                            offset: 67_112_960,
+                            length: 2000,
+                        },
+                        Extent {
+                            device_index: 2,
+                            offset: 67_117_056,
+                            length: 2000,
+                        },
+                    ],
+                    12,
+                    2,
+                ),
             ),
         ];
-        let record = encode_internal_record(&entries);
+        let record = internal(&entries);
         assert_eq!(decode_internal_record(&record).unwrap(), entries);
     }
 
@@ -2057,25 +3215,33 @@ mod tests {
         let entries = vec![
             (
                 MetadataKey::MIN,
-                vec![Extent {
-                    device_index: 0,
-                    offset: 67_108_864,
-                    length: 1000,
-                }],
+                page(
+                    vec![Extent {
+                        device_index: 0,
+                        offset: 67_108_864,
+                        length: 1000,
+                    }],
+                    0xE1E2_E3E4,
+                    6,
+                ),
             ),
             (
                 inode_key(2),
-                vec![Extent {
-                    device_index: 0,
-                    offset: 67_112_960,
-                    length: 2000,
-                }],
+                page(
+                    vec![Extent {
+                        device_index: 0,
+                        offset: 67_112_960,
+                        length: 2000,
+                    }],
+                    0xF1F2_F3F4,
+                    7,
+                ),
             ),
         ];
-        let record = encode_internal_record(&entries);
+        let record = internal(&entries);
         assert_eq!(
             hex(&record),
-            "5363616c6546530001000000040000004c00000000000000a6ca0ee80000000002000000000000000000000000000000000000000000000000000400000000e8030000000000000200000000000000010000000000000000000000000010000400000000d007000000000000"
+            "5363616c654653000200000004000000660000005fac987501000000000000000200000000000000000000000000000000000001000000000000000400000000e803000000000000e4e3e2e10600000000000000020000000000000001000000000000000001000000000010000400000000d007000000000000f4f3f2f10700000000000000"
         );
         assert_eq!(decode_internal_record(&record).unwrap(), entries);
     }

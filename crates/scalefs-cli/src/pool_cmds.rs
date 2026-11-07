@@ -6,8 +6,8 @@ use scalefs_core::{
     DiscoveredDevice, EntryKind, Extent, FEATURE_INCOMPAT_PARITY, FileBlockDevice, Geometry,
     ITEM_DIRENT, ITEM_FILE_EXTENT, ITEM_INODE, ITEM_POOL_STATE, ITEM_SPECIAL, ITEM_XATTR,
     InodeAttrs, MODE_BLOCK_DEVICE, MODE_CHAR_DEVICE, MODE_DIRECTORY, MODE_FIFO, MODE_FILE,
-    MODE_SOCKET, MODE_SYMLINK, MODE_TYPE_MASK, MemberSpec, MetadataKey, MetadataValue,
-    ParityRecord, Pool, PoolId, PoolParams, ROOT_INODE, ZoneClass, decode_file_data,
+    MODE_SOCKET, MODE_SYMLINK, MODE_TYPE_MASK, MemberSpec, MetadataValue, ParityRecord, Pool,
+    PoolId, PoolParams, ROOT_INODE, ScaleFsError, ZoneClass, decode_file_data,
     decode_parity_record, generate_parity,
 };
 
@@ -265,7 +265,12 @@ fn refuse_accidental_overwrite(path: &str, force: bool) -> Result<(), String> {
         scalefs_core::Contents::Foreign => probed
             .error
             .unwrap_or_else(|| "unrecognized data".to_string()),
-        scalefs_core::Contents::Unreadable => return Ok(()),
+        scalefs_core::Contents::Unreadable => format!(
+            "contents that could not be read ({})",
+            probed
+                .error
+                .unwrap_or_else(|| "no detail from the probe".to_string())
+        ),
     };
     Err(format!("{path} holds {holds}; use --force to overwrite it"))
 }
@@ -851,7 +856,11 @@ fn pool_inspect(args: &[String]) -> Result<(), String> {
         );
     }
     println!("  newest tx        {}", pool.committed_tx());
-    println!("  metadata items   {}", pool.tree().item_count());
+    let items = pool
+        .tree()
+        .item_count()
+        .map_err(|err| format!("{images}: the metadata tree cannot be read: {err}"))?;
+    println!("  metadata items   {items}");
 
     for (index, allocator) in pool.allocators().iter().enumerate() {
         if pool.member_count() == 1 {
@@ -901,10 +910,11 @@ pub fn cmd_scrub(args: &[String]) -> Result<bool, String> {
         .scrub(opts.flag("repair"))
         .map_err(|err| format!("{images}: {err}"))?;
     println!(
-        "checked {} record(s), {} cop(ies): {} bad, {} repaired, {} unrepairable{}",
+        "checked {} record(s), {} cop(ies): {} bad ({} stale), {} repaired, {} unrepairable{}",
         report.records_checked,
         report.copies_checked,
         report.copies_bad,
+        report.copies_stale,
         report.copies_repaired,
         report.copies_unrepairable,
         if report.copies_missing > 0 {
@@ -991,6 +1001,35 @@ fn check_zone_placement(
     }
 }
 
+fn owner_takes_extents(
+    inode: &dyn Fn(u64) -> Option<InodeAttrs>,
+    problems: &mut Vec<String>,
+    owner: u64,
+    offset: u64,
+    logical_len: u64,
+) -> bool {
+    match inode(owner) {
+        None => {
+            problems.push(format!(
+                "extent at {offset} belongs to missing inode {owner}"
+            ));
+            false
+        }
+        Some(attrs) if known_type(&attrs) && attrs.entry_kind() != EntryKind::File => {
+            problems.push(format!("{} {owner} has file extents", kind_name(&attrs)));
+            false
+        }
+        Some(attrs) => {
+            if offset + logical_len > attrs.size {
+                problems.push(format!(
+                    "inode {owner}: extent at {offset} runs past the file size"
+                ));
+            }
+            true
+        }
+    }
+}
+
 fn stripe_math_problem(pool: &Pool<AnyBlockDevice>, parity_extents: &[Extent]) -> Option<String> {
     let records: Vec<Option<ParityRecord>> = parity_extents
         .iter()
@@ -1019,7 +1058,10 @@ fn stripe_math_problem(pool: &Pool<AnyBlockDevice>, parity_extents: &[Extent]) -
                 piece.offset
             ));
         };
-        if decode_file_data(&bytes).is_err() {
+        let column = pieces.len();
+        if decode_file_data(&bytes).is_err()
+            || scalefs_core::Expect::of(&bytes).crc != descriptor.data_crcs[column]
+        {
             return Some(format!(
                 "stripe with parity at member {} offset {}: descriptor-named data piece at \
                  member {} offset {} fails verification",
@@ -1056,7 +1098,7 @@ pub fn cmd_fsck(args: &[String]) -> Result<bool, String> {
     if problems.is_empty() {
         println!(
             "{image}: clean ({inode_count} inode(s), {} snapshot(s), transaction {})",
-            pool.snapshot_list().len(),
+            pool.snapshot_list().map_or(0, |list| list.len()),
             pool.committed_tx()
         );
         Ok(true)
@@ -1069,26 +1111,46 @@ pub fn cmd_fsck(args: &[String]) -> Result<bool, String> {
     }
 }
 
+fn note_unreadable(problems: &mut Vec<String>, err: &ScaleFsError) {
+    let problem = format!("the metadata tree cannot be read: {err}");
+    if !problems.contains(&problem) {
+        problems.push(problem);
+    }
+}
+
 fn fsck_problems(pool: &Pool<AnyBlockDevice>) -> (usize, Vec<String>) {
     let mut problems: Vec<String> = Vec::new();
 
-    let all = pool.tree().range(MetadataKey::MIN, MetadataKey::MAX);
     let mut inodes: Vec<(u64, InodeAttrs)> = Vec::new();
     let mut specials: Vec<(u64, usize)> = Vec::new();
     let mut next_object_id = None;
-    for (key, value) in &all {
-        match (key.item_type, value) {
-            (ITEM_POOL_STATE, MetadataValue::PoolState { next_object_id: n }) => {
-                next_object_id = Some(*n);
+    for leaf in pool.tree().leaves() {
+        let items = match leaf {
+            Ok(items) => items,
+            Err(err) => {
+                note_unreadable(&mut problems, &err);
+                break;
             }
-            (ITEM_INODE, MetadataValue::Inode(attrs)) => inodes.push((key.object_id, *attrs)),
-            (ITEM_SPECIAL, MetadataValue::Special { data }) => {
-                specials.push((key.object_id, data.len()));
+        };
+        for (key, value) in &items {
+            match (key.item_type, value) {
+                (ITEM_POOL_STATE, MetadataValue::PoolState { next_object_id: n }) => {
+                    next_object_id = Some(*n);
+                }
+                (ITEM_INODE, MetadataValue::Inode(attrs)) => inodes.push((key.object_id, *attrs)),
+                (ITEM_SPECIAL, MetadataValue::Special { data }) => {
+                    specials.push((key.object_id, data.len()));
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-    let inode = |id: u64| inodes.iter().find(|(i, _)| *i == id).map(|(_, a)| *a);
+    let inode = |id: u64| {
+        inodes
+            .binary_search_by_key(&id, |(i, _)| *i)
+            .ok()
+            .map(|at| inodes[at].1)
+    };
 
     match inode(ROOT_INODE) {
         None => problems.push("root directory inode is missing".to_string()),
@@ -1109,31 +1171,40 @@ fn fsck_problems(pool: &Pool<AnyBlockDevice>) -> (usize, Vec<String>) {
     }
 
     let mut references: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    for (key, value) in &all {
-        if key.item_type != ITEM_DIRENT {
-            continue;
-        }
-        let MetadataValue::DirEntries(entries) = value else {
-            continue;
+    for leaf in pool.tree().leaves() {
+        let items = match leaf {
+            Ok(items) => items,
+            Err(err) => {
+                note_unreadable(&mut problems, &err);
+                break;
+            }
         };
-        for entry in entries {
-            match inode(entry.inode) {
-                None => problems.push(format!(
-                    "entry '{}' in directory {} references missing inode {}",
-                    entry.name, key.object_id, entry.inode
-                )),
-                Some(attrs) => {
-                    let known_mode = known_type(&attrs);
-                    let known_entry = !matches!(entry.kind, EntryKind::Unknown(_));
-                    if known_mode && known_entry && attrs.entry_kind() != entry.kind {
-                        problems.push(format!(
-                            "entry '{}' in directory {} disagrees with inode {} about its kind",
-                            entry.name, key.object_id, entry.inode
-                        ));
+        for (key, value) in &items {
+            if key.item_type != ITEM_DIRENT {
+                continue;
+            }
+            let MetadataValue::DirEntries(entries) = value else {
+                continue;
+            };
+            for entry in entries {
+                match inode(entry.inode) {
+                    None => problems.push(format!(
+                        "entry '{}' in directory {} references missing inode {}",
+                        entry.name, key.object_id, entry.inode
+                    )),
+                    Some(attrs) => {
+                        let known_mode = known_type(&attrs);
+                        let known_entry = !matches!(entry.kind, EntryKind::Unknown(_));
+                        if known_mode && known_entry && attrs.entry_kind() != entry.kind {
+                            problems.push(format!(
+                                "entry '{}' in directory {} disagrees with inode {} about its kind",
+                                entry.name, key.object_id, entry.inode
+                            ));
+                        }
                     }
                 }
+                *references.entry(entry.inode).or_insert(0) += 1;
             }
-            *references.entry(entry.inode).or_insert(0) += 1;
         }
     }
     for (id, attrs) in &inodes {
@@ -1192,29 +1263,38 @@ fn fsck_problems(pool: &Pool<AnyBlockDevice>) -> (usize, Vec<String>) {
     }
 
     let xattr_seed = pool.superblock().dirent_hash_seed;
-    for (key, value) in &all {
-        if key.item_type != ITEM_XATTR {
-            continue;
-        }
-        let MetadataValue::XattrEntries(entries) = value else {
-            problems.push(format!(
-                "non-bucket value at an xattr key of inode {}",
-                key.object_id
-            ));
-            continue;
+    for leaf in pool.tree().leaves() {
+        let items = match leaf {
+            Ok(items) => items,
+            Err(err) => {
+                note_unreadable(&mut problems, &err);
+                break;
+            }
         };
-        if inode(key.object_id).is_none() {
-            problems.push(format!(
-                "xattr bucket belongs to missing inode {}",
-                key.object_id
-            ));
-        }
-        for entry in entries {
-            if scalefs_core::dirent::dirent_hash(xattr_seed, &entry.name) != key.offset {
+        for (key, value) in &items {
+            if key.item_type != ITEM_XATTR {
+                continue;
+            }
+            let MetadataValue::XattrEntries(entries) = value else {
                 problems.push(format!(
-                    "xattr '{}' of inode {} sits in the wrong hash slot",
-                    entry.name, key.object_id
+                    "non-bucket value at an xattr key of inode {}",
+                    key.object_id
                 ));
+                continue;
+            };
+            if inode(key.object_id).is_none() {
+                problems.push(format!(
+                    "xattr bucket belongs to missing inode {}",
+                    key.object_id
+                ));
+            }
+            for entry in entries {
+                if scalefs_core::dirent::dirent_hash(xattr_seed, &entry.name) != key.offset {
+                    problems.push(format!(
+                        "xattr '{}' of inode {} sits in the wrong hash slot",
+                        entry.name, key.object_id
+                    ));
+                }
             }
         }
     }
@@ -1242,229 +1322,202 @@ fn fsck_problems(pool: &Pool<AnyBlockDevice>) -> (usize, Vec<String>) {
 
     let mut verified_stripes: std::collections::HashSet<(u16, u64)> =
         std::collections::HashSet::new();
-    for (key, value) in &all {
-        if key.item_type != ITEM_FILE_EXTENT {
-            continue;
-        }
-        let MetadataValue::StripedExtent {
-            extent,
-            parity_extents,
-            data_offset,
-            logical_len,
-        } = value
-        else {
-            continue;
+    for leaf in pool.tree().leaves() {
+        let items = match leaf {
+            Ok(items) => items,
+            Err(err) => {
+                note_unreadable(&mut problems, &err);
+                break;
+            }
         };
-        let owner = key.object_id;
-        if !parity_pool {
-            problems.push(format!(
-                "inode {owner}: striped extent at {} on a pool without the parity feature",
-                key.offset
-            ));
-        }
-        match inode(owner) {
-            None => {
-                problems.push(format!(
-                    "striped extent at {} belongs to missing inode {owner}",
-                    key.offset
-                ));
+        for (key, value) in &items {
+            if key.item_type != ITEM_FILE_EXTENT {
                 continue;
             }
-            Some(attrs) if known_type(&attrs) && attrs.entry_kind() != EntryKind::File => {
-                problems.push(format!("{} {owner} has file extents", kind_name(&attrs)));
-                continue;
-            }
-            Some(attrs) => {
-                if key.offset + logical_len > attrs.size {
-                    problems.push(format!(
-                        "inode {owner}: extent at {} runs past the file size",
-                        key.offset
-                    ));
-                }
-                if *logical_len > scalefs_core::fs::FILE_DATA_CHUNK as u64 {
-                    problems.push(format!(
-                        "inode {owner}: extent at {} runs longer than one data chunk — \
-                         the bounded extent lookup would miss it silently",
-                        key.offset
-                    ));
-                }
-            }
-        }
-        check_zone_placement(
-            pool,
-            &mut problems,
-            owner,
-            key.offset,
-            extent,
-            ZoneClass::Data,
-        );
-        if pool.allocator_for_member(extent.device_index).is_some() {
-            match pool
-                .read_extent(*extent)
-                .and_then(|bytes| decode_file_data(&bytes))
-            {
-                Ok(payload) => {
-                    if data_offset + logical_len > payload.len() as u64 {
-                        problems.push(format!(
-                            "inode {owner}: extent at {} references bytes outside its record",
-                            key.offset
-                        ));
-                    }
-                }
-                Err(err) => problems.push(format!(
-                    "inode {owner}: stripe piece on member {} at {} fails verification: {err}",
-                    extent.device_index, key.offset
-                )),
-            }
-        }
-        for (row, parity) in parity_extents.iter().enumerate() {
-            check_zone_placement(
-                pool,
-                &mut problems,
-                owner,
-                key.offset,
-                parity,
-                ZoneClass::Parity,
-            );
-            if pool.allocator_for_member(parity.device_index).is_none() {
-                continue;
-            }
-            match pool
-                .read_extent(*parity)
-                .and_then(|bytes| decode_parity_record(&bytes))
-            {
-                Ok(record) => {
-                    if usize::from(record.parity_index) != row {
-                        problems.push(format!(
-                            "inode {owner}: parity record at {} holds row {} where row {row} belongs",
-                            key.offset, record.parity_index
-                        ));
-                    }
-                    if !record.data_pieces.contains(extent) {
-                        problems.push(format!(
-                            "inode {owner}: stripe descriptor at {} does not name the piece",
-                            key.offset
-                        ));
-                    }
-                    if record.parity_pieces != *parity_extents {
-                        problems.push(format!(
-                            "inode {owner}: stripe descriptor at {} disagrees with the \
-                             reference's parity list",
-                            key.offset
-                        ));
-                    }
-                }
-                Err(err) => problems.push(format!(
-                    "inode {owner}: parity record on member {} at {} fails verification: {err}",
-                    parity.device_index, key.offset
-                )),
-            }
-        }
-        if let Some(first) = parity_extents.first()
-            && verified_stripes.insert((first.device_index, first.offset))
-            && let Some(problem) = stripe_math_problem(pool, parity_extents)
-        {
-            problems.push(problem);
-        }
-    }
-
-    for (key, value) in &all {
-        if key.item_type != ITEM_FILE_EXTENT {
-            continue;
-        }
-        let MetadataValue::FileExtent {
-            extents,
-            data_offset,
-            logical_len,
-        } = value
-        else {
-            continue;
-        };
-        let owner = key.object_id;
-        match inode(owner) {
-            None => {
-                problems.push(format!(
-                    "extent at {} belongs to missing inode {owner}",
-                    key.offset
-                ));
-                continue;
-            }
-            Some(attrs) if known_type(&attrs) && attrs.entry_kind() != EntryKind::File => {
-                problems.push(format!("{} {owner} has file extents", kind_name(&attrs)));
-                continue;
-            }
-            Some(attrs) => {
-                if key.offset + logical_len > attrs.size {
-                    problems.push(format!(
-                        "inode {owner}: extent at {} runs past the file size",
-                        key.offset
-                    ));
-                }
-                if *logical_len > scalefs_core::fs::FILE_DATA_CHUNK as u64 {
-                    problems.push(format!(
-                        "inode {owner}: extent at {} runs longer than one data chunk — \
-                         the bounded extent lookup would miss it silently",
-                        key.offset
-                    ));
-                }
-            }
-        }
-        for extent in extents {
-            let member = usize::from(extent.device_index);
-            let Some(allocator) = pool.allocator_for_member(extent.device_index) else {
-                if !pool.is_degraded() || member >= pool.member_count() {
-                    problems.push(format!(
-                        "inode {owner}: extent at {} names absent member {member}",
-                        key.offset
-                    ));
-                }
+            let MetadataValue::StripedRun(run) = value else {
                 continue;
             };
-            let geometry = allocator.geometry();
-            let zone_index = extent.offset / geometry.zone_size;
-            match allocator.zone(zone_index) {
-                Some(zone) if zone.class == Some(ZoneClass::Data) => {
-                    let zone_start = zone_index * geometry.zone_size;
-                    if extent.offset + extent.length > zone_start + zone.write_pointer {
-                        problems.push(format!(
-                            "inode {owner}: extent at {} lies past member {member} \
-                             zone {zone_index}'s write pointer",
-                            key.offset
-                        ));
-                    }
-                }
-                _ => problems.push(format!(
-                    "inode {owner}: extent at {} is not in a data zone",
+            let owner = key.object_id;
+            if !parity_pool {
+                problems.push(format!(
+                    "inode {owner}: striped extent at {} on a pool without the parity feature",
                     key.offset
-                )),
+                ));
             }
-            match pool
-                .read_extent(*extent)
-                .and_then(|bytes| decode_file_data(&bytes))
-            {
-                Ok(payload) => {
-                    if data_offset + logical_len > payload.len() as u64 {
-                        problems.push(format!(
-                            "inode {owner}: extent at {} references bytes outside its record",
-                            key.offset
-                        ));
-                    }
+            if !owner_takes_extents(&inode, &mut problems, owner, key.offset, run.logical_len) {
+                continue;
+            }
+            for (k, piece) in run.pieces.iter().enumerate() {
+                check_zone_placement(
+                    pool,
+                    &mut problems,
+                    owner,
+                    key.offset,
+                    piece,
+                    ZoneClass::Data,
+                );
+                if pool.allocator_for_member(piece.device_index).is_none() {
+                    continue;
                 }
-                Err(err) => problems.push(format!(
-                    "inode {owner}: copy on member {member} at {} fails verification: {err}",
-                    key.offset
-                )),
+                if let Err(err) = pool
+                    .read_extent(*piece)
+                    .and_then(|bytes| run.expect(k).verify(&bytes).map(|_| ()))
+                {
+                    problems.push(format!(
+                        "inode {owner}: stripe piece {k} on member {} at {} fails verification: {err}",
+                        piece.device_index, key.offset
+                    ));
+                }
+            }
+            for (row, parity) in run.parity.iter().enumerate() {
+                check_zone_placement(
+                    pool,
+                    &mut problems,
+                    owner,
+                    key.offset,
+                    parity,
+                    ZoneClass::Parity,
+                );
+                if pool.allocator_for_member(parity.device_index).is_none() {
+                    continue;
+                }
+                match pool.read_extent(*parity).and_then(|bytes| {
+                    run.parity_expect(row).verify(&bytes)?;
+                    decode_parity_record(&bytes)
+                }) {
+                    Ok(record) => {
+                        if usize::from(record.parity_index) != row {
+                            problems.push(format!(
+                                "inode {owner}: parity record at {} holds row {} where row {row} belongs",
+                                key.offset, record.parity_index
+                            ));
+                        }
+                        for (k, piece) in run.pieces.iter().enumerate() {
+                            let named = record
+                                .data_pieces
+                                .iter()
+                                .zip(&record.data_crcs)
+                                .any(|(named, crc)| named == piece && *crc == run.crcs[k]);
+                            if !named {
+                                problems.push(format!(
+                                    "inode {owner}: stripe descriptor at {} does not name piece {k}",
+                                    key.offset
+                                ));
+                            }
+                        }
+                        if record.parity_pieces != run.parity {
+                            problems.push(format!(
+                                "inode {owner}: stripe descriptor at {} disagrees with the \
+                                 reference's parity list",
+                                key.offset
+                            ));
+                        }
+                    }
+                    Err(err) => problems.push(format!(
+                        "inode {owner}: parity record on member {} at {} fails verification: {err}",
+                        parity.device_index, key.offset
+                    )),
+                }
+            }
+            if let Some(first) = run.parity.first()
+                && verified_stripes.insert((first.device_index, first.offset))
+                && let Some(problem) = stripe_math_problem(pool, &run.parity)
+            {
+                problems.push(problem);
             }
         }
     }
 
-    for snapshot in pool.snapshot_list() {
-        if let Err(err) = pool.snapshot_open(&snapshot.name) {
-            problems.push(format!(
-                "snapshot '{}' fails verification: {err}",
-                snapshot.name
-            ));
+    for leaf in pool.tree().leaves() {
+        let items = match leaf {
+            Ok(items) => items,
+            Err(err) => {
+                note_unreadable(&mut problems, &err);
+                break;
+            }
+        };
+        for (key, value) in &items {
+            if key.item_type != ITEM_FILE_EXTENT {
+                continue;
+            }
+            let MetadataValue::FileRun(run) = value else {
+                continue;
+            };
+            let owner = key.object_id;
+            if !owner_takes_extents(&inode, &mut problems, owner, key.offset, run.logical_len) {
+                continue;
+            }
+            for span in run.spans() {
+                let member = usize::from(span.device_index);
+                let Some(allocator) = pool.allocator_for_member(span.device_index) else {
+                    if !pool.is_degraded() || member >= pool.member_count() {
+                        problems.push(format!(
+                            "inode {owner}: extent at {} names absent member {member}",
+                            key.offset
+                        ));
+                    }
+                    continue;
+                };
+                let geometry = allocator.geometry();
+                let zone_index = span.offset / geometry.zone_size;
+                if (span.offset + span.length - 1) / geometry.zone_size != zone_index {
+                    problems.push(format!(
+                        "inode {owner}: run at {} crosses a zone boundary on member {member}",
+                        key.offset
+                    ));
+                }
+                match allocator.zone(zone_index) {
+                    Some(zone) if zone.class == Some(ZoneClass::Data) => {
+                        let zone_start = zone_index * geometry.zone_size;
+                        if span.offset + span.length > zone_start + zone.write_pointer {
+                            problems.push(format!(
+                                "inode {owner}: extent at {} lies past member {member} \
+                                 zone {zone_index}'s write pointer",
+                                key.offset
+                            ));
+                        }
+                    }
+                    _ => problems.push(format!(
+                        "inode {owner}: extent at {} is not in a data zone",
+                        key.offset
+                    )),
+                }
+                for k in 0..run.count() {
+                    let record = Extent {
+                        device_index: span.device_index,
+                        offset: span.offset + k as u64 * run.stride,
+                        length: run.record_len(k),
+                    };
+                    if let Err(err) = pool
+                        .read_extent(record)
+                        .and_then(|bytes| run.expect(k).verify(&bytes).map(|_| ()))
+                    {
+                        problems.push(format!(
+                            "inode {owner}: record {k} of the run at {} on member {member} \
+                             fails verification: {err}",
+                            key.offset
+                        ));
+                    }
+                }
+            }
         }
+    }
+
+    match pool.snapshot_list() {
+        Ok(snapshots) => {
+            for snapshot in snapshots {
+                if let Err(err) = pool
+                    .snapshot_open(&snapshot.name)
+                    .and_then(|open| open.item_count())
+                {
+                    problems.push(format!(
+                        "snapshot '{}' fails verification: {err}",
+                        snapshot.name
+                    ));
+                }
+            }
+        }
+        Err(err) => note_unreadable(&mut problems, &err),
     }
 
     if pool.is_multi() {
@@ -1522,7 +1575,7 @@ fn fsck_problems(pool: &Pool<AnyBlockDevice>) -> (usize, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scalefs_core::AllocPurpose;
+    use scalefs_core::{AllocPurpose, MetadataKey};
     use std::path::PathBuf;
 
     const NOW: i64 = 1_700_000_000_000_000_000;
@@ -1603,6 +1656,79 @@ mod tests {
         cmd_fsck(std::slice::from_ref(&image.to_string())).unwrap()
     }
 
+    const VERSION_ONE_SUPERBLOCK: &str = concat!(
+        "5363616c6546530001000000010000008e000000000000008ca8e6f700000000",
+        "1111111111111111111111111111111122222222222222222222222222222222",
+        "00002a36fe9c9717070000000000000000000000000000000000000000000000",
+        "0000000000000000001000000010000000000004000000000004000000000000",
+        "0100000001010000110001000df0fecaed5e0100000000000000040000000000",
+        "1000000000000000040074616e6b",
+    );
+
+    #[test]
+    fn fsck_flags_a_run_crossing_a_zone_boundary() {
+        let (dir, image, .., file) = special_pool("zone-crossing");
+        corrupt(&image, |pool| {
+            pool.write(file, 0, &[7u8; 100], NOW).unwrap();
+            pool.tree_mut()
+                .insert(
+                    MetadataKey {
+                        object_id: file,
+                        item_type: ITEM_FILE_EXTENT,
+                        offset: 0,
+                    },
+                    MetadataValue::FileRun(scalefs_core::FileRun {
+                        copies: vec![scalefs_core::Extent {
+                            device_index: 0,
+                            offset: 3 * 65536 + 32768,
+                            length: 32768,
+                        }],
+                        stride: 32768,
+                        last_len: 32768,
+                        tx: 1,
+                        crcs: vec![1, 2],
+                        data_offset: 0,
+                        logical_len: 100 + scalefs_core::FILE_DATA_CHUNK as u64,
+                    }),
+                )
+                .unwrap();
+        });
+        let pool = open_pool(&image).unwrap();
+        let (_, problems) = fsck_problems(&pool);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("crosses a zone boundary")),
+            "{problems:#?}"
+        );
+        drop(pool);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fsck_refuses_an_earlier_format_pool_with_the_recreate_message() {
+        let (dir, image, ..) = special_pool("earlier");
+        let v1: Vec<u8> = (0..VERSION_ONE_SUPERBLOCK.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&VERSION_ONE_SUPERBLOCK[i..i + 2], 16).unwrap())
+            .collect();
+        {
+            let view = scalefs_core::member_view(FileBlockDevice::open(Path::new(&image)).unwrap())
+                .unwrap();
+            for offset in scalefs_core::superblock_slots(view.len()) {
+                view.write_at(offset, &v1).unwrap();
+            }
+            view.flush().unwrap();
+        }
+        let err = cmd_fsck(std::slice::from_ref(&image)).unwrap_err();
+        assert!(
+            err.contains("created by an earlier preview of ScaleFS")
+                && err.contains("create a new pool and move the files"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn parity_pool(tag: &str) -> (PathBuf, String, u64) {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1670,14 +1796,15 @@ mod tests {
                     offset: u64::MAX,
                 },
             )
+            .unwrap()
             .iter()
-            .filter_map(|(_, value)| match value {
-                MetadataValue::StripedExtent {
-                    extent,
-                    parity_extents,
-                    ..
-                } => Some((*extent, parity_extents.clone())),
-                _ => None,
+            .flat_map(|(_, value)| match value {
+                MetadataValue::StripedRun(run) => run
+                    .pieces
+                    .iter()
+                    .map(|piece| (*piece, run.parity.clone()))
+                    .collect(),
+                _ => Vec::new(),
             })
             .collect()
     }
@@ -1697,7 +1824,7 @@ mod tests {
         let mut record =
             scalefs_core::decode_parity_record(&pool.read_extent(parity_extent).unwrap()).unwrap();
         record.parity[3] ^= 0x5A;
-        let forged = scalefs_core::encode_parity_record(&record).unwrap();
+        let forged = scalefs_core::encode_parity_record(&record, 1).unwrap();
         drop(pool);
         let image = dir.join(format!("{}.img", parity_extent.device_index));
         let file_handle = std::fs::OpenOptions::new()
@@ -1873,20 +2000,24 @@ mod tests {
                         item_type: ITEM_FILE_EXTENT,
                         offset: 0,
                     },
-                    MetadataValue::StripedExtent {
-                        extent: Extent {
+                    MetadataValue::StripedRun(scalefs_core::StripedRun {
+                        pieces: vec![Extent {
                             device_index: 0,
                             offset: 65536,
                             length: 100,
-                        },
-                        parity_extents: vec![Extent {
+                        }],
+                        crcs: vec![1],
+                        tx: 1,
+                        parity: vec![Extent {
                             device_index: 1,
                             offset: 65536,
                             length: 4096,
                         }],
+                        parity_crcs: vec![2],
+                        parity_tx: 1,
                         data_offset: 0,
                         logical_len: 20,
-                    },
+                    }),
                 )
                 .unwrap();
         });
@@ -1905,7 +2036,7 @@ mod tests {
 
         let (dir, image, link, ..) = special_pool("no-target");
         corrupt(&image, |pool| {
-            pool.tree_mut().remove(special_key(link));
+            pool.tree_mut().remove(special_key(link)).unwrap();
         });
         assert!(!fsck(&image), "a target-less symlink must be flagged");
         let _ = std::fs::remove_dir_all(dir);
@@ -1965,19 +2096,38 @@ mod tests {
                         item_type: ITEM_FILE_EXTENT,
                         offset: 0,
                     },
-                    MetadataValue::FileExtent {
-                        extents: vec![scalefs_core::Extent {
+                    MetadataValue::FileRun(scalefs_core::FileRun {
+                        copies: vec![scalefs_core::Extent {
                             device_index: 0,
                             offset: 65536,
                             length: 4096,
                         }],
+                        stride: 4096,
+                        last_len: 4096,
+                        tx: 1,
+                        crcs: vec![1],
                         data_offset: 0,
                         logical_len: 100,
-                    },
+                    }),
                 )
                 .unwrap();
         });
         assert!(!fsck(&image), "extents on a symlink must be flagged");
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn the_overwrite_guard_refuses_a_device_it_could_not_read() {
+        let path = if cfg!(windows) {
+            r"\\.\ScaleFSReviewNoSuchDevice"
+        } else {
+            "/dev/scalefs-review-no-such-device"
+        };
+        assert!(scalefs_core::is_device_path(Path::new(path)));
+        let verdict = refuse_accidental_overwrite(path, false);
+        assert!(
+            verdict.is_err(),
+            "an unreadable device was cleared for formatting without --force"
+        );
+        assert!(refuse_accidental_overwrite(path, true).is_ok());
     }
 }

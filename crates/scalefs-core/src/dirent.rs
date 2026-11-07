@@ -1,7 +1,7 @@
 use crate::error::{Result, ScaleFsError};
 use crate::layout::CaseSensitivity;
 use crate::tree::{
-    DirEntry, EntryKind, ITEM_DIRENT, MAX_NAME_LEN, MetadataKey, MetadataTree, MetadataValue,
+    DirEntry, EntryKind, ITEM_DIRENT, MAX_NAME_LEN, MetadataKey, MetadataValue, TreeMut, TreeRef,
 };
 use crate::unicode::UnicodeVersion;
 
@@ -52,7 +52,7 @@ fn names_equal(version: UnicodeVersion, case: CaseSensitivity, a: &str, b: &str)
 
 #[allow(clippy::too_many_arguments)]
 pub fn add_entry(
-    tree: &mut MetadataTree,
+    tree: TreeMut<'_>,
     seed: u64,
     version: UnicodeVersion,
     case: CaseSensitivity,
@@ -73,7 +73,7 @@ pub fn add_entry(
 
 #[allow(clippy::too_many_arguments)]
 fn add_entry_at_hash(
-    tree: &mut MetadataTree,
+    tree: TreeMut<'_>,
     version: UnicodeVersion,
     case: CaseSensitivity,
     dir: u64,
@@ -83,8 +83,8 @@ fn add_entry_at_hash(
     kind: EntryKind,
 ) -> Result<()> {
     let key = dirent_key(dir, hash);
-    let mut entries = match tree.get(key) {
-        Some(MetadataValue::DirEntries(entries)) => entries.clone(),
+    let mut entries = match tree.get(key)? {
+        Some(MetadataValue::DirEntries(entries)) => entries,
         Some(_) => return Err(ScaleFsError::Corrupt("non-bucket value at a dirent key")),
         None => Vec::new(),
     };
@@ -109,36 +109,36 @@ fn add_entry_at_hash(
 }
 
 pub fn lookup_entry(
-    tree: &MetadataTree,
+    tree: TreeRef<'_>,
     seed: u64,
     version: UnicodeVersion,
     case: CaseSensitivity,
     dir: u64,
     name: &str,
-) -> Option<DirEntry> {
+) -> Result<Option<DirEntry>> {
     let hash = dirent_hash(seed, &fold_name(version, case, name));
     lookup_entry_at_hash(tree, version, case, dir, hash, name)
 }
 
 fn lookup_entry_at_hash(
-    tree: &MetadataTree,
+    tree: TreeRef<'_>,
     version: UnicodeVersion,
     case: CaseSensitivity,
     dir: u64,
     hash: u64,
     name: &str,
-) -> Option<DirEntry> {
-    match tree.get(dirent_key(dir, hash)) {
+) -> Result<Option<DirEntry>> {
+    tree.get_with(dirent_key(dir, hash), |value| match value {
         Some(MetadataValue::DirEntries(entries)) => entries
             .iter()
             .find(|e| names_equal(version, case, &e.name, name))
             .cloned(),
         _ => None,
-    }
+    })
 }
 
 pub fn remove_entry(
-    tree: &mut MetadataTree,
+    tree: TreeMut<'_>,
     seed: u64,
     version: UnicodeVersion,
     case: CaseSensitivity,
@@ -150,7 +150,7 @@ pub fn remove_entry(
 }
 
 fn remove_entry_at_hash(
-    tree: &mut MetadataTree,
+    tree: TreeMut<'_>,
     version: UnicodeVersion,
     case: CaseSensitivity,
     dir: u64,
@@ -158,8 +158,8 @@ fn remove_entry_at_hash(
     name: &str,
 ) -> Result<DirEntry> {
     let key = dirent_key(dir, hash);
-    let mut entries = match tree.get(key) {
-        Some(MetadataValue::DirEntries(entries)) => entries.clone(),
+    let mut entries = match tree.get(key)? {
+        Some(MetadataValue::DirEntries(entries)) => entries,
         Some(_) => return Err(ScaleFsError::Corrupt("non-bucket value at a dirent key")),
         None => return Err(ScaleFsError::NotFound),
     };
@@ -169,24 +169,24 @@ fn remove_entry_at_hash(
         .ok_or(ScaleFsError::NotFound)?;
     let removed = entries.remove(index);
     if entries.is_empty() {
-        tree.remove(key);
+        tree.remove(key)?;
     } else {
         tree.insert(key, MetadataValue::DirEntries(entries))?;
     }
     Ok(removed)
 }
 
-pub fn list_entries(tree: &MetadataTree, dir: u64) -> Vec<DirEntry> {
+pub fn list_entries(tree: TreeRef<'_>, dir: u64) -> Result<Vec<DirEntry>> {
     let start = dirent_key(dir, 0);
     let end = dirent_key(dir, u64::MAX);
     let mut out = Vec::new();
-    for (_, value) in tree.range(start, end) {
+    for (_, value) in tree.range(start, end)? {
         if let MetadataValue::DirEntries(entries) = value {
-            out.extend(entries.iter().cloned());
+            out.extend(entries);
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -195,13 +195,13 @@ pub struct HashedEntry {
     pub entry: DirEntry,
 }
 
-pub fn list_entries_hashed(tree: &MetadataTree, dir: u64) -> Vec<HashedEntry> {
+pub fn list_entries_hashed(tree: TreeRef<'_>, dir: u64) -> Result<Vec<HashedEntry>> {
     let start = dirent_key(dir, 0);
     let end = dirent_key(dir, u64::MAX);
     let mut out = Vec::new();
-    for (key, value) in tree.range(start, end) {
+    for (key, value) in tree.range(start, end)? {
         if let MetadataValue::DirEntries(entries) = value {
-            let mut bucket = entries.clone();
+            let mut bucket = entries;
             bucket.sort_by(|a, b| a.name.cmp(&b.name));
             for entry in bucket {
                 out.push(HashedEntry {
@@ -211,24 +211,29 @@ pub fn list_entries_hashed(tree: &MetadataTree, dir: u64) -> Vec<HashedEntry> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
-pub fn entry_count(tree: &MetadataTree, dir: u64) -> usize {
+pub fn entry_count(tree: TreeRef<'_>, dir: u64) -> Result<usize> {
     let start = dirent_key(dir, 0);
     let end = dirent_key(dir, u64::MAX);
-    tree.range(start, end)
-        .iter()
-        .map(|(_, value)| match value {
-            MetadataValue::DirEntries(entries) => entries.len(),
-            _ => 0,
-        })
-        .sum()
+    let mut count = 0;
+    tree.scan(start, end, &mut |items| {
+        count += items
+            .iter()
+            .map(|(_, value)| match value {
+                MetadataValue::DirEntries(entries) => entries.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+    })?;
+    Ok(count)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::MetadataTree;
 
     const SEED: u64 = 0x5EED_CAFE_F00D_0001;
     const VER: UnicodeVersion = crate::unicode::V17_0_0;
@@ -242,11 +247,37 @@ mod tests {
         (MetadataTree::new(), CaseSensitivity::InsensitivePreserving)
     }
 
+    fn view(tree: &MetadataTree) -> crate::tree::TreeRef<'_> {
+        tree.view(&crate::tree::NoPages)
+    }
+
+    fn lookup(
+        tree: &MetadataTree,
+        seed: u64,
+        version: UnicodeVersion,
+        case: CaseSensitivity,
+        dir: u64,
+        name: &str,
+    ) -> Option<DirEntry> {
+        lookup_entry(view(tree), seed, version, case, dir, name).unwrap()
+    }
+
+    fn lookup_at_hash(
+        tree: &MetadataTree,
+        version: UnicodeVersion,
+        case: CaseSensitivity,
+        dir: u64,
+        hash: u64,
+        name: &str,
+    ) -> Option<DirEntry> {
+        lookup_entry_at_hash(view(tree), version, case, dir, hash, name).unwrap()
+    }
+
     #[test]
     fn add_lookup_remove_round_trip() {
         let (mut tree, case) = sensitive();
         add_entry(
-            &mut tree,
+            tree.in_memory(),
             SEED,
             VER,
             case,
@@ -256,13 +287,13 @@ mod tests {
             EntryKind::File,
         )
         .unwrap();
-        let entry = lookup_entry(&tree, SEED, VER, case, DIR, "hello.txt").unwrap();
+        let entry = lookup(&tree, SEED, VER, case, DIR, "hello.txt").unwrap();
         assert_eq!(entry.inode, 2);
         assert_eq!(entry.kind, EntryKind::File);
 
         assert!(matches!(
             add_entry(
-                &mut tree,
+                tree.in_memory(),
                 SEED,
                 VER,
                 case,
@@ -274,11 +305,11 @@ mod tests {
             Err(ScaleFsError::AlreadyExists)
         ));
 
-        let removed = remove_entry(&mut tree, SEED, VER, case, DIR, "hello.txt").unwrap();
+        let removed = remove_entry(tree.in_memory(), SEED, VER, case, DIR, "hello.txt").unwrap();
         assert_eq!(removed.inode, 2);
-        assert!(lookup_entry(&tree, SEED, VER, case, DIR, "hello.txt").is_none());
+        assert!(lookup(&tree, SEED, VER, case, DIR, "hello.txt").is_none());
         assert!(matches!(
-            remove_entry(&mut tree, SEED, VER, case, DIR, "hello.txt"),
+            remove_entry(tree.in_memory(), SEED, VER, case, DIR, "hello.txt"),
             Err(ScaleFsError::NotFound)
         ));
     }
@@ -287,7 +318,7 @@ mod tests {
     fn insensitive_pools_fold_ascii_case() {
         let (mut tree, case) = insensitive();
         add_entry(
-            &mut tree,
+            tree.in_memory(),
             SEED,
             VER,
             case,
@@ -297,12 +328,12 @@ mod tests {
             EntryKind::File,
         )
         .unwrap();
-        let entry = lookup_entry(&tree, SEED, VER, case, DIR, "readme.md").unwrap();
+        let entry = lookup(&tree, SEED, VER, case, DIR, "readme.md").unwrap();
         assert_eq!(entry.name, "ReadMe.MD");
-        assert!(lookup_entry(&tree, SEED, VER, case, DIR, "README.MD").is_some());
+        assert!(lookup(&tree, SEED, VER, case, DIR, "README.MD").is_some());
         assert!(matches!(
             add_entry(
-                &mut tree,
+                tree.in_memory(),
                 SEED,
                 VER,
                 case,
@@ -313,25 +344,41 @@ mod tests {
             ),
             Err(ScaleFsError::AlreadyExists)
         ));
-        remove_entry(&mut tree, SEED, VER, case, DIR, "rEaDmE.mD").unwrap();
-        assert!(lookup_entry(&tree, SEED, VER, case, DIR, "ReadMe.MD").is_none());
+        remove_entry(tree.in_memory(), SEED, VER, case, DIR, "rEaDmE.mD").unwrap();
+        assert!(lookup(&tree, SEED, VER, case, DIR, "ReadMe.MD").is_none());
     }
 
     #[test]
     fn sensitive_pools_keep_casings_distinct() {
         let (mut tree, case) = sensitive();
-        add_entry(&mut tree, SEED, VER, case, DIR, "File", 2, EntryKind::File).unwrap();
-        add_entry(&mut tree, SEED, VER, case, DIR, "file", 3, EntryKind::File).unwrap();
+        add_entry(
+            tree.in_memory(),
+            SEED,
+            VER,
+            case,
+            DIR,
+            "File",
+            2,
+            EntryKind::File,
+        )
+        .unwrap();
+        add_entry(
+            tree.in_memory(),
+            SEED,
+            VER,
+            case,
+            DIR,
+            "file",
+            3,
+            EntryKind::File,
+        )
+        .unwrap();
         assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, "File")
-                .unwrap()
-                .inode,
+            lookup(&tree, SEED, VER, case, DIR, "File").unwrap().inode,
             2
         );
         assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, "file")
-                .unwrap()
-                .inode,
+            lookup(&tree, SEED, VER, case, DIR, "file").unwrap().inode,
             3
         );
     }
@@ -339,37 +386,54 @@ mod tests {
     #[test]
     fn insensitive_pools_fold_full_unicode_case() {
         let (mut tree, case) = insensitive();
-        add_entry(&mut tree, SEED, VER, case, DIR, "café", 2, EntryKind::File).unwrap();
+        add_entry(
+            tree.in_memory(),
+            SEED,
+            VER,
+            case,
+            DIR,
+            "café",
+            2,
+            EntryKind::File,
+        )
+        .unwrap();
         assert!(matches!(
-            add_entry(&mut tree, SEED, VER, case, DIR, "CAFÉ", 3, EntryKind::File),
+            add_entry(
+                tree.in_memory(),
+                SEED,
+                VER,
+                case,
+                DIR,
+                "CAFÉ",
+                3,
+                EntryKind::File
+            ),
             Err(ScaleFsError::AlreadyExists)
         ));
         assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, "CAFÉ")
-                .unwrap()
-                .name,
+            lookup(&tree, SEED, VER, case, DIR, "CAFÉ").unwrap().name,
             "café"
         );
-        add_entry(&mut tree, SEED, VER, case, DIR, "Σ", 4, EntryKind::File).unwrap();
-        assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, "σ")
-                .unwrap()
-                .inode,
-            4
-        );
-        assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, "ς")
-                .unwrap()
-                .inode,
-            4
-        );
+        add_entry(
+            tree.in_memory(),
+            SEED,
+            VER,
+            case,
+            DIR,
+            "Σ",
+            4,
+            EntryKind::File,
+        )
+        .unwrap();
+        assert_eq!(lookup(&tree, SEED, VER, case, DIR, "σ").unwrap().inode, 4);
+        assert_eq!(lookup(&tree, SEED, VER, case, DIR, "ς").unwrap().inode, 4);
     }
 
     #[test]
     fn normalization_aliases_on_both_pool_kinds() {
         for (mut tree, case) in [sensitive(), insensitive()] {
             add_entry(
-                &mut tree,
+                tree.in_memory(),
                 SEED,
                 VER,
                 case,
@@ -381,7 +445,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 add_entry(
-                    &mut tree,
+                    tree.in_memory(),
                     SEED,
                     VER,
                     case,
@@ -392,7 +456,7 @@ mod tests {
                 ),
                 Err(ScaleFsError::AlreadyExists)
             ));
-            assert!(lookup_entry(&tree, SEED, VER, case, DIR, "cafe\u{301}").is_some());
+            assert!(lookup(&tree, SEED, VER, case, DIR, "cafe\u{301}").is_some());
         }
     }
 
@@ -400,7 +464,7 @@ mod tests {
     fn straße_and_strasse_stay_distinct_on_insensitive_pools() {
         let (mut tree, case) = insensitive();
         add_entry(
-            &mut tree,
+            tree.in_memory(),
             SEED,
             VER,
             case,
@@ -411,7 +475,7 @@ mod tests {
         )
         .unwrap();
         add_entry(
-            &mut tree,
+            tree.in_memory(),
             SEED,
             VER,
             case,
@@ -422,13 +486,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, "straße")
-                .unwrap()
-                .inode,
+            lookup(&tree, SEED, VER, case, DIR, "straße").unwrap().inode,
             2
         );
         assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, "strasse")
+            lookup(&tree, SEED, VER, case, DIR, "strasse")
                 .unwrap()
                 .inode,
             3
@@ -440,23 +502,38 @@ mod tests {
         let (mut tree, case) = insensitive();
         let name = "Å".repeat(90);
         assert!(name.len() <= 255);
-        add_entry(&mut tree, SEED, VER, case, DIR, &name, 2, EntryKind::File).unwrap();
-        assert_eq!(
-            lookup_entry(&tree, SEED, VER, case, DIR, &name)
-                .unwrap()
-                .inode,
-            2
-        );
-        assert!(lookup_entry(&tree, SEED, VER, case, DIR, &"a\u{30A}".repeat(90)).is_some());
+        add_entry(
+            tree.in_memory(),
+            SEED,
+            VER,
+            case,
+            DIR,
+            &name,
+            2,
+            EntryKind::File,
+        )
+        .unwrap();
+        assert_eq!(lookup(&tree, SEED, VER, case, DIR, &name).unwrap().inode, 2);
+        assert!(lookup(&tree, SEED, VER, case, DIR, &"a\u{30A}".repeat(90)).is_some());
     }
 
     #[test]
     fn colliding_hashes_share_a_bucket_correctly() {
         let (mut tree, case) = sensitive();
         let hash = 42;
-        add_entry_at_hash(&mut tree, VER, case, DIR, hash, "first", 2, EntryKind::File).unwrap();
         add_entry_at_hash(
-            &mut tree,
+            tree.in_memory(),
+            VER,
+            case,
+            DIR,
+            hash,
+            "first",
+            2,
+            EntryKind::File,
+        )
+        .unwrap();
+        add_entry_at_hash(
+            tree.in_memory(),
             VER,
             case,
             DIR,
@@ -467,21 +544,21 @@ mod tests {
         )
         .unwrap();
 
-        let first = lookup_entry_at_hash(&tree, VER, case, DIR, hash, "first").unwrap();
-        let second = lookup_entry_at_hash(&tree, VER, case, DIR, hash, "second").unwrap();
+        let first = lookup_at_hash(&tree, VER, case, DIR, hash, "first").unwrap();
+        let second = lookup_at_hash(&tree, VER, case, DIR, hash, "second").unwrap();
         assert_eq!((first.inode, second.inode), (2, 3));
 
-        remove_entry_at_hash(&mut tree, VER, case, DIR, hash, "first").unwrap();
-        assert!(lookup_entry_at_hash(&tree, VER, case, DIR, hash, "first").is_none());
+        remove_entry_at_hash(tree.in_memory(), VER, case, DIR, hash, "first").unwrap();
+        assert!(lookup_at_hash(&tree, VER, case, DIR, hash, "first").is_none());
         assert_eq!(
-            lookup_entry_at_hash(&tree, VER, case, DIR, hash, "second")
+            lookup_at_hash(&tree, VER, case, DIR, hash, "second")
                 .unwrap()
                 .inode,
             3
         );
 
-        remove_entry_at_hash(&mut tree, VER, case, DIR, hash, "second").unwrap();
-        assert_eq!(tree.item_count(), 0);
+        remove_entry_at_hash(tree.in_memory(), VER, case, DIR, hash, "second").unwrap();
+        assert_eq!(view(&tree).item_count().unwrap(), 0);
     }
 
     #[test]
@@ -489,7 +566,7 @@ mod tests {
         let (mut tree, case) = sensitive();
         for (name, inode) in [("zeta", 5), ("alpha", 2), ("midway", 3)] {
             add_entry(
-                &mut tree,
+                tree.in_memory(),
                 SEED,
                 VER,
                 case,
@@ -501,7 +578,7 @@ mod tests {
             .unwrap();
         }
         add_entry(
-            &mut tree,
+            tree.in_memory(),
             SEED,
             VER,
             case,
@@ -512,14 +589,15 @@ mod tests {
         )
         .unwrap();
 
-        let names: Vec<String> = list_entries(&tree, DIR)
+        let names: Vec<String> = list_entries(view(&tree), DIR)
+            .unwrap()
             .into_iter()
             .map(|e| e.name)
             .collect();
         assert_eq!(names, ["alpha", "midway", "zeta"]);
-        assert_eq!(entry_count(&tree, DIR), 3);
-        assert_eq!(entry_count(&tree, 9), 1);
-        assert_eq!(entry_count(&tree, 8), 0);
+        assert_eq!(entry_count(view(&tree), DIR).unwrap(), 3);
+        assert_eq!(entry_count(view(&tree), 9).unwrap(), 1);
+        assert_eq!(entry_count(view(&tree), 8).unwrap(), 0);
     }
 
     #[test]

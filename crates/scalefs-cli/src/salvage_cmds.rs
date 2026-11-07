@@ -172,7 +172,16 @@ fn cmd_copy_out(args: &[String]) -> Result<bool, String> {
     };
     let mut session = session;
     let mut tally = CopyTally::default();
-    copy_dir(&session, ROOT_INODE, dest, "", &mut manifest, &mut tally)?;
+    let mut copied_dirs = std::collections::HashSet::from([ROOT_INODE]);
+    copy_dir(
+        &session,
+        ROOT_INODE,
+        dest,
+        "",
+        &mut manifest,
+        &mut tally,
+        &mut copied_dirs,
+    )?;
     if opts.flag("snapshots") {
         let (snapshots, damage) = session
             .snapshots()
@@ -209,6 +218,7 @@ fn cmd_copy_out(args: &[String]) -> Result<bool, String> {
                         &prefix,
                         &mut manifest,
                         &mut tally,
+                        &mut std::collections::HashSet::from([ROOT_INODE]),
                     )?;
                 }
                 Err(error) => {
@@ -277,6 +287,8 @@ fn cmd_copy_out(args: &[String]) -> Result<bool, String> {
         && survey.disconnected.is_empty())
 }
 
+const MAX_COPY_DEPTH: usize = 128;
+
 fn copy_dir(
     session: &Salvage<RawBlockDevice>,
     dir: u64,
@@ -284,6 +296,7 @@ fn copy_dir(
     prefix: &str,
     manifest: &mut dyn Write,
     tally: &mut CopyTally,
+    copied_dirs: &mut std::collections::HashSet<u64>,
 ) -> Result<(), String> {
     let listing = session
         .read_dir(dir)
@@ -319,6 +332,26 @@ fn copy_dir(
         let target = dest.join(saved.as_ref());
         match entry.kind {
             EntryKind::Directory => {
+                if !copied_dirs.insert(entry.inode) {
+                    tally.notes += 1;
+                    writeln!(
+                        manifest,
+                        "# /{shown}: directory (inode {}) already copied — a cycle or a \
+                         second name — not descended",
+                        entry.inode
+                    )
+                    .map_err(|error| error.to_string())?;
+                    continue;
+                }
+                if rel.matches('/').count() >= MAX_COPY_DEPTH {
+                    tally.notes += 1;
+                    writeln!(
+                        manifest,
+                        "# /{shown}: deeper than {MAX_COPY_DEPTH} levels, not descended"
+                    )
+                    .map_err(|error| error.to_string())?;
+                    continue;
+                }
                 match std::fs::create_dir(&target) {
                     Ok(()) => {}
                     Err(error)
@@ -328,7 +361,15 @@ fn copy_dir(
                     Err(error) => return Err(format!("cannot create {target:?}: {error}")),
                 }
                 writeln!(manifest, "dir\t-\t/{shown}").map_err(|error| error.to_string())?;
-                copy_dir(session, entry.inode, &target, &rel, manifest, tally)?;
+                copy_dir(
+                    session,
+                    entry.inode,
+                    &target,
+                    &rel,
+                    manifest,
+                    tally,
+                    copied_dirs,
+                )?;
             }
             EntryKind::File => {
                 let created = std::fs::OpenOptions::new()
@@ -491,7 +532,7 @@ fn open_session(
         devices.push(device);
     }
     let session = Salvage::assemble_with(devices, options)
-        .map_err(|error| format!("nothing to salvage: {error:?}"))?;
+        .map_err(|error| format!("nothing to salvage: {error}"))?;
     Ok((paths, session))
 }
 
@@ -1067,5 +1108,125 @@ mod tests {
         cmd_copy_out(&[image_arg, dest_arg, "--force".to_string()]).unwrap();
         assert_eq!(std::fs::read(file_entry.path()).unwrap(), b"payload");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+    #[test]
+    fn copy_out_finishes_on_an_image_with_a_directory_cycle() {
+        const CHILD: &str = "SCALEFS_SALVAGE_CYCLE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let log = std::env::temp_dir()
+                .join(format!("scalefs-salvage-cycle-{}.log", std::process::id()));
+            let output = std::fs::File::create(&log).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "salvage_cmds::tests::copy_out_finishes_on_an_image_with_a_directory_cycle",
+                    "--exact",
+                    "--include-ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(output.try_clone().unwrap())
+                .stderr(output)
+                .spawn()
+                .unwrap();
+            let started = std::time::Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if started.elapsed() > std::time::Duration::from_secs(120) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            let tail: Vec<&str> = text.lines().rev().take(8).collect();
+            assert!(
+                status.is_some_and(|status| status.success())
+                    && text.contains("test result: ok. 1 passed"),
+                "the copy-out child ended {status:?}:\n{}",
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+            return;
+        }
+        let scratch =
+            std::env::temp_dir().join(format!("scalefs-salvage-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let image = scratch.join("pool.img");
+        let geometry = Geometry {
+            logical_block_size: 4096,
+            physical_block_size: 4096,
+            zone_size: 64 * 1024,
+            zone_count: 64,
+            erase_granularity_zones: 1,
+            sequential_write_required: false,
+        };
+        let now = 1_700_000_000_000_000_000;
+        {
+            let device =
+                FileBlockDevice::create(&image, member_image_len(geometry.capacity_bytes()))
+                    .unwrap();
+            let mut pool = Pool::create(
+                device,
+                CreateParams {
+                    pool_id: PoolId([0x6C; 16]),
+                    device_id: DeviceId([0x02; 16]),
+                    geometry,
+                    case_sensitivity: CaseSensitivity::InsensitivePreserving,
+                    dirent_hash_seed: 1,
+                    label: "cycle".to_string(),
+                    created_at_ns: now,
+                },
+            )
+            .unwrap();
+            let file = pool
+                .create_file(ROOT_INODE, "keep.txt", 0o644, now)
+                .unwrap();
+            pool.write(file, 0, b"recover me", now).unwrap();
+            let (seed, version, case) = {
+                let superblock = pool.superblock();
+                (
+                    superblock.dirent_hash_seed,
+                    superblock.unicode_version,
+                    superblock.case_sensitivity,
+                )
+            };
+            scalefs_core::dirent::add_entry(
+                pool.tree_mut(),
+                seed,
+                version,
+                case,
+                ROOT_INODE,
+                "loop",
+                ROOT_INODE,
+                scalefs_core::EntryKind::Directory,
+            )
+            .unwrap();
+            pool.commit(AllocPurpose::Normal, now).unwrap();
+        }
+
+        let dest = scratch.join("out");
+        let manifest_path = scratch.join("manifest.txt");
+        let copied = cmd_copy_out(&[
+            image.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+            "--manifest".to_string(),
+            manifest_path.to_string_lossy().into_owned(),
+        ]);
+        let nested = dest.join("loop").join("loop").exists();
+        let kept = std::fs::read(dest.join("keep.txt")).ok();
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(copied.is_ok(), "copy-out failed: {copied:?}");
+        assert!(!nested, "copy-out followed the cycle into loop/loop");
+        assert_eq!(kept.as_deref(), Some(&b"recover me"[..]));
+        assert!(
+            manifest.contains("keep.txt"),
+            "the manifest is complete: {manifest}"
+        );
     }
 }

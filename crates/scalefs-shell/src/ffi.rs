@@ -47,6 +47,9 @@ unsafe extern "system" {
     ) -> i32;
     pub fn OutputDebugStringW(text: *const u16);
     pub fn GetModuleHandleW(name: *const u16) -> isize;
+    pub fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut isize) -> i32;
+    pub fn FreeLibrary(module: isize) -> i32;
+    pub fn FreeLibraryAndExitThread(module: isize, exit_code: u32) -> !;
     pub fn CreateFileW(
         name: *const u16,
         access: u32,
@@ -162,20 +165,44 @@ unsafe extern "system" {
         data: *const u8,
         len: u32,
     ) -> i32;
-    pub fn RegGetValueW(
+    pub fn RegDeleteTreeW(key: isize, subkey: *const u16) -> i32;
+    pub fn RegDeleteValueW(key: isize, value_name: *const u16) -> i32;
+    pub fn RegCloseKey(key: isize) -> i32;
+    pub fn RegOpenKeyExW(
         key: isize,
         subkey: *const u16,
-        value: *const u16,
-        flags: u32,
+        options: u32,
+        desired: u32,
+        result: *mut isize,
+    ) -> i32;
+    pub fn RegQueryValueExW(
+        key: isize,
+        value_name: *const u16,
+        reserved: *mut u32,
         kind: *mut u32,
-        data: *mut c_void,
+        data: *mut u8,
         len: *mut u32,
     ) -> i32;
-    pub fn RegDeleteTreeW(key: isize, subkey: *const u16) -> i32;
-    pub fn RegCloseKey(key: isize) -> i32;
+    pub fn RegQueryInfoKeyW(
+        key: isize,
+        class: *mut u16,
+        class_len: *mut u32,
+        reserved: *mut u32,
+        subkeys: *mut u32,
+        max_subkey_len: *mut u32,
+        max_class_len: *mut u32,
+        values: *mut u32,
+        max_value_name_len: *mut u32,
+        max_value_len: *mut u32,
+        security_descriptor_len: *mut u32,
+        last_write: *mut c_void,
+    ) -> i32;
+    pub fn RegCopyTreeW(source: isize, subkey: *const u16, destination: isize) -> i32;
 }
 
 pub const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+#[cfg(test)]
+pub const HKEY_CURRENT_USER: isize = 0x8000_0001_u32 as i32 as isize;
 
 pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()

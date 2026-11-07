@@ -1,5 +1,24 @@
 use crate::endpoint::Stream;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerIdentity {
+    Daemon,
+    Account(String),
+}
+
+pub const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+pub fn own_account() -> std::io::Result<String> {
+    #[cfg(windows)]
+    {
+        windows::own_account()
+    }
+    #[cfg(unix)]
+    {
+        Ok(unix::geteuid().to_string())
+    }
+}
+
 pub fn process_is_privileged() -> bool {
     #[cfg(windows)]
     {
@@ -24,16 +43,39 @@ impl Stream {
     }
 
     pub fn server_is_trusted(&self) -> std::io::Result<bool> {
+        self.server_is(&ServerIdentity::Daemon)
+    }
+
+    pub fn server_is(&self, identity: &ServerIdentity) -> std::io::Result<bool> {
         #[cfg(windows)]
         {
-            windows::pipe_server_is_trusted(self.raw_handle())
+            match identity {
+                ServerIdentity::Daemon => windows::pipe_server_is_trusted(self.raw_handle()),
+                ServerIdentity::Account(sid) => windows::owner_is(self.raw_handle(), sid),
+            }
         }
         #[cfg(unix)]
         {
             let peer = unix::peer_euid(self.raw_fd())?;
-            Ok(peer == 0 || peer == unix::geteuid())
+            match identity {
+                ServerIdentity::Daemon => Ok(peer == 0 || peer == unix::geteuid()),
+                ServerIdentity::Account(uid) => {
+                    let uid: u32 = uid.parse().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("'{uid}' is not a uid"),
+                        )
+                    })?;
+                    Ok(peer == uid)
+                }
+            }
         }
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn handle_owner_is(handle: isize, sid: &str) -> std::io::Result<bool> {
+    windows::owner_is(handle, sid)
 }
 
 #[cfg(unix)]
@@ -154,6 +196,8 @@ mod windows {
                 sid_size: *mut u32,
             ) -> i32;
             pub fn EqualSid(sid1: *const c_void, sid2: *const c_void) -> i32;
+            pub fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut c_void) -> i32;
+            pub fn ConvertSidToStringSidW(sid: *mut c_void, string_sid: *mut *mut u16) -> i32;
             pub fn GetSecurityInfo(
                 handle: isize,
                 object_type: u32,
@@ -349,49 +393,105 @@ mod windows {
         usize::from_ne_bytes(sid_ptr_bytes) as *mut core::ffi::c_void
     }
 
-    pub fn pipe_server_is_trusted(pipe: isize) -> std::io::Result<bool> {
-        let mut owner: *mut core::ffi::c_void = std::ptr::null_mut();
-        let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
-        #[allow(unsafe_code)]
-        let status = unsafe {
-            ffi::GetSecurityInfo(
-                pipe,
-                SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        if status != 0 {
-            return Err(std::io::Error::from_raw_os_error(status as i32));
-        }
-        struct Descriptor(*mut core::ffi::c_void);
-        impl Drop for Descriptor {
-            fn drop(&mut self) {
-                #[allow(unsafe_code)]
-                unsafe {
-                    ffi::LocalFree(self.0);
-                }
-            }
-        }
-        let _descriptor = Descriptor(descriptor);
+    struct LocalMemory(*mut core::ffi::c_void);
 
-        let equals = |sid: *mut core::ffi::c_void| -> bool {
+    impl Drop for LocalMemory {
+        fn drop(&mut self) {
             #[allow(unsafe_code)]
             unsafe {
-                ffi::EqualSid(owner, sid) != 0
+                ffi::LocalFree(self.0);
             }
-        };
-        if equals(Sid::well_known(WIN_LOCAL_SYSTEM_SID)?.as_ptr())
-            || equals(Sid::well_known(WIN_BUILTIN_ADMINISTRATORS_SID)?.as_ptr())
+        }
+    }
+
+    struct ObjectOwner {
+        _descriptor: LocalMemory,
+        sid: *mut core::ffi::c_void,
+    }
+
+    impl ObjectOwner {
+        fn read(handle: isize) -> std::io::Result<ObjectOwner> {
+            let mut owner: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+            #[allow(unsafe_code)]
+            let status = unsafe {
+                ffi::GetSecurityInfo(
+                    handle,
+                    SE_KERNEL_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            if status != 0 {
+                return Err(std::io::Error::from_raw_os_error(status as i32));
+            }
+            Ok(ObjectOwner {
+                _descriptor: LocalMemory(descriptor),
+                sid: owner,
+            })
+        }
+
+        fn equals(&self, sid: *mut core::ffi::c_void) -> bool {
+            #[allow(unsafe_code)]
+            unsafe {
+                ffi::EqualSid(self.sid, sid) != 0
+            }
+        }
+    }
+
+    pub fn pipe_server_is_trusted(pipe: isize) -> std::io::Result<bool> {
+        let owner = ObjectOwner::read(pipe)?;
+        if owner.equals(Sid::well_known(WIN_LOCAL_SYSTEM_SID)?.as_ptr())
+            || owner.equals(Sid::well_known(WIN_BUILTIN_ADMINISTRATORS_SID)?.as_ptr())
         {
             return Ok(true);
         }
         let own = own_user_sid()?;
-        Ok(equals(token_user_sid(&own)))
+        Ok(owner.equals(token_user_sid(&own)))
+    }
+
+    pub fn owner_is(handle: isize, sid: &str) -> std::io::Result<bool> {
+        let wide: Vec<u16> = sid.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut required: *mut core::ffi::c_void = std::ptr::null_mut();
+        #[allow(unsafe_code)]
+        let ok = unsafe { ffi::ConvertStringSidToSidW(wide.as_ptr(), &mut required) };
+        if ok == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "'{sid}' is not an account SID ({})",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        let required = LocalMemory(required);
+        Ok(ObjectOwner::read(handle)?.equals(required.0))
+    }
+
+    pub fn own_account() -> std::io::Result<String> {
+        let own = own_user_sid()?;
+        let mut text: *mut u16 = std::ptr::null_mut();
+        #[allow(unsafe_code)]
+        let ok = unsafe { ffi::ConvertSidToStringSidW(token_user_sid(&own), &mut text) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let text = LocalMemory(text.cast());
+        Ok(wide_string(text.0 as *const u16))
+    }
+
+    #[allow(unsafe_code)]
+    fn wide_string(start: *const u16) -> String {
+        let mut len = 0usize;
+        while unsafe { *start.add(len) } != 0 {
+            len += 1;
+        }
+        let units = unsafe { std::slice::from_raw_parts(start, len) };
+        String::from_utf16_lossy(units)
     }
 }
 

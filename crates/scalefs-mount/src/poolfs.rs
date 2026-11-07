@@ -262,8 +262,12 @@ impl<D: SharedDevice> Filesystem for PoolFilesystem<D> {
         {
             return Ok(out);
         }
-        for hashed in &entries {
-            let d_off = hashed.hash.saturating_add(3);
+        for (index, hashed) in entries.iter().enumerate() {
+            let after = entries[index + 1..]
+                .iter()
+                .take_while(|next| next.hash == hashed.hash)
+                .count() as u64;
+            let d_off = hashed.hash.saturating_add(3).saturating_sub(after).max(3);
             if d_off <= offset {
                 continue;
             }

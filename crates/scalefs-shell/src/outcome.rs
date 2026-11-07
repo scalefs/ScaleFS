@@ -43,23 +43,39 @@ impl Record {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Serving {
-    pub pool: String,
-    pub pool_id: String,
+pub fn instance_id(pool_id: &str) -> String {
+    format!("SCALEFS\\VOLUME\\{}", pool_id.to_ascii_uppercase())
 }
 
-impl Serving {
-    pub fn from_reply(reply: &Value) -> Option<Serving> {
-        Some(Serving {
-            pool: reply.get("pool")?.as_str()?.to_string(),
-            pool_id: reply.get("pool_id")?.as_str()?.to_string(),
-        })
+pub fn companion_account(recorded: Option<String>) -> String {
+    recorded
+        .map(|account| account.trim().to_string())
+        .filter(|account| !account.is_empty())
+        .unwrap_or_else(|| scalefs_ipc::trust::LOCAL_SYSTEM_SID.to_string())
+}
+
+pub fn for_pool(reply: Value, pool_id: &str) -> Result<Value, String> {
+    match reply.get("pool_id").and_then(Value::as_str) {
+        Some(named) if named == pool_id => Ok(reply),
+        named => Err(format!(
+            "the daemon answered for pool {}, not for this volume's pool {pool_id}",
+            named.unwrap_or("(none)")
+        )),
     }
 }
 
-pub fn instance_id(pool_id: &str) -> String {
-    format!("SCALEFS\\VOLUME\\{}", pool_id.to_ascii_uppercase())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub instance: String,
+    pub before: Record,
+}
+
+pub fn plan(volume_pool: &str, reply: Value) -> Result<Plan, String> {
+    let reply = for_pool(reply, volume_pool)?;
+    Ok(Plan {
+        instance: instance_id(volume_pool),
+        before: Record::from_reply(&reply),
+    })
 }
 
 pub fn pool_id_from_device_name(name: &str) -> Option<String> {
@@ -242,20 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn the_serving_and_its_device_come_from_the_reply() {
-        let reply = parse(
-            r#"{"pool_id":"887409c8","phase":"none","generation":0,"pool":"dl","mount":"P:","holders":[]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            Serving::from_reply(&reply),
-            Some(Serving {
-                pool: "dl".into(),
-                pool_id: "887409c8".into()
-            })
-        );
-        let gone = parse(r#"{"pool_id":"887409c8","phase":"ejected","generation":2}"#).unwrap();
-        assert_eq!(Serving::from_reply(&gone), None);
+    fn the_device_instance_is_the_pool_in_upper_hex() {
         assert_eq!(instance_id("887409c8"), "SCALEFS\\VOLUME\\887409C8");
     }
 
@@ -336,6 +339,44 @@ mod tests {
         ] {
             assert_eq!(pool_id_from_device_name(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn the_companion_account_is_the_recorded_one_else_local_system() {
+        assert_eq!(companion_account(None), "S-1-5-18");
+        assert_eq!(companion_account(Some(" ".into())), "S-1-5-18");
+        assert_eq!(
+            companion_account(Some("S-1-5-21-1-2-3-1001".into())),
+            "S-1-5-21-1-2-3-1001"
+        );
+    }
+
+    #[test]
+    fn a_reply_naming_another_pool_never_plans_an_eject() {
+        let ours = "0123456789abcdef0123456789abcdef";
+        let theirs = "fedcba9876543210fedcba9876543210";
+        let reply = |pool_id: &str| {
+            parse(&format!(
+                r#"{{"pool_id":"{pool_id}","phase":"none","generation":0,"holders":[]}}"#
+            ))
+            .unwrap()
+        };
+        let refused = plan(ours, reply(theirs)).unwrap_err();
+        assert!(
+            refused.contains(theirs) && refused.contains(ours),
+            "{refused}"
+        );
+        assert!(plan(ours, parse(r#"{"phase":"none"}"#).unwrap()).is_err());
+        assert!(plan(ours, reply(&ours.to_ascii_uppercase())).is_err());
+        assert_eq!(
+            plan(ours, reply(ours)),
+            Ok(Plan {
+                instance: "SCALEFS\\VOLUME\\0123456789ABCDEF0123456789ABCDEF".into(),
+                before: record(Phase::None, 0),
+            })
+        );
+        assert!(for_pool(reply(theirs), ours).is_err());
+        assert!(for_pool(reply(ours), ours).is_ok());
     }
 
     #[test]

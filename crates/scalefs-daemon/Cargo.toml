@@ -17,6 +17,8 @@ scalefs-ipc = { path = "../scalefs-ipc" }
 scalefs-mount = { path = "../scalefs-mount" }
 
 [target.'cfg(windows)'.dependencies]
+# Explorer integration: the Eject command's registration and the session
+# announcements (in-tree, no external crates).
 scalefs-shell = { path = "../scalefs-shell" }
 
 [dev-dependencies]

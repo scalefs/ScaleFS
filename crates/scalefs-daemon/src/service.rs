@@ -21,7 +21,14 @@ pub fn default_state_dir() -> PathBuf {
 }
 
 #[cfg(windows)]
-pub fn shell_register(endpoint: &Endpoint) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellTrust {
+    Service,
+    RegisteringUser,
+}
+
+#[cfg(windows)]
+pub fn shell_register(endpoint: &Endpoint, trust: ShellTrust, replace: bool) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot resolve this executable's path: {error}"))?;
     let dll = exe.with_file_name(scalefs_shell::register::DLL_NAME);
@@ -32,12 +39,29 @@ pub fn shell_register(endpoint: &Endpoint) -> Result<(), String> {
             dll.display()
         ));
     }
+    let account = match trust {
+        ShellTrust::Service => scalefs_ipc::trust::LOCAL_SYSTEM_SID.to_string(),
+        ShellTrust::RegisteringUser => scalefs_ipc::trust::own_account()
+            .map_err(|error| format!("cannot read this account's identity: {error}"))?,
+    };
     let recorded = (*endpoint != Endpoint::default_endpoint()).then(|| endpoint.as_str());
-    scalefs_shell::register::register(&dll, recorded)?;
+    scalefs_shell::register::register(&scalefs_shell::register::Registration {
+        dll: &dll,
+        endpoint: recorded,
+        account: &account,
+        replace,
+    })?;
     println!(
         "registered Explorer's Eject command for ScaleFS volumes ({})",
         dll.display()
     );
+    if trust == ShellTrust::RegisteringUser {
+        eprintln!(
+            "warning: the command trusts a daemon running as this account ({account}), not \
+             the service: any program running as this account could stand in for the \
+             daemon. Use this only for a daemon you run yourself as this account."
+        );
+    }
     Ok(())
 }
 
@@ -482,7 +506,7 @@ mod windows {
         println!("installed service '{SERVICE_NAME}' ({DISPLAY_NAME})");
         println!("  runs: {binary_path}");
         println!("  account: LocalSystem, start: automatic (boot)");
-        if let Err(why) = super::shell_register(endpoint) {
+        if let Err(why) = super::shell_register(endpoint, super::ShellTrust::Service, false) {
             println!("  Explorer's Eject command not registered: {why}");
         }
         println!("start it now with: net start {SERVICE_NAME}");
